@@ -132,6 +132,15 @@ class CarInterface(CarInterfaceBase):
 
     ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+
+    # G80 RG3 2021 HDA2 retrofit: stock SCC + sunnypilot lateral only.
+    # Never disable/take over the radar/ADAS longitudinal path on this dedicated build.
+    if candidate == CAR.GENESIS_G80_2ND_GEN_FL:
+      ret.alphaLongitudinalAvailable = False
+      ret.openpilotLongitudinalControl = False
+      ret.pcmCruise = True
+      ret.dashcamOnly = False
+
     ret.pcmCruise = not ret.openpilotLongitudinalControl
     ret.longitudinalActuatorDelay = 0.5
 
