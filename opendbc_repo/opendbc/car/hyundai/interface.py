@@ -132,6 +132,15 @@ class CarInterface(CarInterfaceBase):
 
     ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+
+    # G80 RG3 HDA2 retrofit: keep factory SCC/longitudinal control and use sunnypilot for lateral control.
+    # This also prevents ADAS/radar ECU disable logic from running for this platform.
+    if candidate == CAR.GENESIS_G80_2ND_GEN_FL:
+      ret.alphaLongitudinalAvailable = False
+      ret.openpilotLongitudinalControl = False
+      ret.pcmCruise = True
+      ret.dashcamOnly = False
+
     ret.pcmCruise = not ret.openpilotLongitudinalControl
     ret.startingState = True
     ret.vEgoStarting = 0.1
@@ -232,8 +241,9 @@ class CarInterface(CarInterfaceBase):
     if communication_control is None:
       communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.DISABLE_RX_DISABLE_TX, uds.MESSAGE_TYPE.NORMAL])
 
-    if CP.openpilotLongitudinalControl and not ((CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)) or
-                                                (CP_SP.flags & HyundaiFlagsSP.ENHANCED_SCC)):
+    enhanced_scc = CP_SP is not None and (CP_SP.flags & HyundaiFlagsSP.ENHANCED_SCC)
+
+    if CP.openpilotLongitudinalControl and not ((CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)) or enhanced_scc):
       addr, bus = 0x7d0, CanBus(CP).ECAN if CP.flags & HyundaiFlags.CANFD else 0
       if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
         addr, bus = 0x730, CanBus(CP).ECAN
@@ -246,4 +256,4 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def deinit(CP, can_recv, can_send):
     communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.ENABLE_RX_ENABLE_TX, uds.MESSAGE_TYPE.NORMAL])
-    CarInterface.init(CP, can_recv, can_send, communication_control)
+    CarInterface.init(CP, None, can_recv, can_send, communication_control)
