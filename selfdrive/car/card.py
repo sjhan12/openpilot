@@ -105,7 +105,10 @@ class Car:
         with car.CarParams.from_bytes(cached_params_raw) as _cached_params:
           cached_params = _cached_params
 
-      fixed_fingerprint = (self.params.get("CarPlatformBundle") or {}).get("platform", None)
+      # G80 RG3 HDA2 retrofit: force the known CAN-FD platform because this vehicle/retrofit
+      # is not covered by the stock fingerprint set.
+      # fixed_fingerprint = (self.params.get("CarPlatformBundle") or {}).get("platform", None)
+      fixed_fingerprint = "GENESIS_G80_2ND_GEN_FL"
       init_params_list_sp = sunnypilot_interfaces.initialize_params(self.params)
 
       self.CI = get_car(*self.can_callbacks, obd_callback(self.params), alpha_long_allowed, is_release, cached_params,
