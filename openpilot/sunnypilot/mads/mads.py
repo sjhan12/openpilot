@@ -182,10 +182,7 @@ class ModularAssistiveDrivingSystem:
 
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
-      # Keep MADS independent from the factory SCC main switch when
-      # "Toggle with Main Cruise" is disabled. Longitudinal engagement stays
-      # blocked while SCC main is off, but lateral control remains unchanged.
-      if self.main_enabled_toggle and self.selfdrive.CS_prev.cruiseState.available:
+      if self.selfdrive.CS_prev.cruiseState.available:
         self.events_sp.add(EventNameSP.lkasDisable)
 
     if self.steering_mode_on_brake == MadsSteeringModeOnBrake.DISENGAGE:
