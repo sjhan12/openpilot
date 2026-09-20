@@ -38,6 +38,8 @@ TETHERING_IP_ADDRESS = "192.168.43.1"
 DEFAULT_TETHERING_PASSWORD = "swagswagcomma"
 SIGNAL_QUEUE_SIZE = 10
 SCAN_PERIOD_SECONDS = 5
+TETHERING_WATCHDOG_SECONDS = 10
+TETHERING_SUBNET = "192.168.43.0/24"
 
 DEBUG = False
 _dbus_call_idx = 0
@@ -185,6 +187,8 @@ class WifiManager:
     self._ipv4_forward = False
 
     self._last_network_scan: float = 0.0
+    self._last_tethering_check: float = 0.0
+    self._tethering_nat_lock = threading.Lock()
     self._callback_queue: list[Callable] = []
 
     self._tethering_ssid = "weedle"
@@ -217,8 +221,16 @@ class WifiManager:
       self._init_connections()
       if Params is not None and self._tethering_ssid not in self._connections:
         self._add_tethering_connection()
+      else:
+        # Keep an existing hotspot profile persistent across reboots.
+        self._ensure_tethering_profile()
 
       self._init_wifi_state()
+
+      # NetworkManager may have autoconnected the hotspot before the state
+      # monitor saw the ACTIVATED event. Repair forwarding/NAT at startup too.
+      if self.is_tethering_active():
+        self._ensure_tethering_nat()
 
       self._tethering_password = self._get_tethering_password()
       cloudlog.debug("WifiManager initialized")
@@ -368,6 +380,7 @@ class WifiManager:
         try:
           self._conn_monitor.recv_messages(timeout=1)
         except TimeoutError:
+          self._tethering_watchdog_tick()
           continue
 
         # Connection added/removed
@@ -389,6 +402,17 @@ class WifiManager:
           new_state, previous_state, change_reason = state_q.popleft().body
 
           self._handle_state_change(new_state, previous_state, change_reason)
+
+        self._tethering_watchdog_tick()
+
+  def _tethering_watchdog_tick(self):
+    now = time.monotonic()
+    if now - self._last_tethering_check < TETHERING_WATCHDOG_SECONDS:
+      return
+
+    self._last_tethering_check = now
+    if self.is_tethering_active():
+      self._ensure_tethering_nat()
 
   def _handle_state_change(self, new_state: int, prev_state: int, change_reason: int):
     # Thread safety: _wifi_state is read/written by both the monitor thread (this handler)
@@ -480,6 +504,10 @@ class WifiManager:
       self._wifi_state = wifi_state
       self._enqueue_callbacks(self._activated)
       self._update_active_connection_info()
+
+      # Repair hotspot forwarding/NAT on every activation, including boot autoconnect.
+      if self._wifi_state.ssid == self._tethering_ssid:
+        self._ensure_tethering_nat()
 
       # Persist volatile connections (created by AddAndActivateConnection2) to disk
       if conn_path is not None:
@@ -593,6 +621,84 @@ class WifiManager:
       return {}
     return dict(reply.body[0])
 
+  def _ensure_tethering_profile(self):
+    """Persist hotspot autoconnect settings for the existing NetworkManager profile."""
+    conn_path = self._connections.get(self._tethering_ssid, None)
+    if conn_path is None:
+      return
+
+    settings = self._get_connection_settings(conn_path)
+    if len(settings) == 0 or 'connection' not in settings:
+      return
+
+    conn_settings = settings['connection']
+    changed = False
+
+    if not bool(conn_settings.get('autoconnect', ('b', False))[1]):
+      conn_settings['autoconnect'] = ('b', True)
+      changed = True
+
+    if int(conn_settings.get('autoconnect-priority', ('i', 0))[1]) < 100:
+      conn_settings['autoconnect-priority'] = ('i', 100)
+      changed = True
+
+    if not changed:
+      return
+
+    conn_addr = DBusAddress(conn_path, bus_name=NM, interface=NM_CONNECTION_IFACE)
+    reply = self._router_main.send_and_get_reply(
+      new_method_call(conn_addr, 'Update', 'a{sa{sv}}', (settings,))
+    )
+    if reply.header.message_type == MessageType.error:
+      cloudlog.warning(f'Failed to persist tethering autoconnect settings: {reply}')
+
+  def _ensure_tethering_nat(self):
+    """Keep LTE hotspot IPv4 forwarding and legacy MASQUERADE alive."""
+    with self._tethering_nat_lock:
+      try:
+        with open('/proc/sys/net/ipv4/ip_forward') as f:
+          forwarding_enabled = f.read().strip() == '1'
+      except OSError:
+        forwarding_enabled = False
+
+      if not forwarding_enabled:
+        forward = subprocess.run(
+          ["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.PIPE,
+          text=True,
+          check=False,
+        )
+        if forward.returncode != 0:
+          cloudlog.warning(f"Failed to enable hotspot IPv4 forwarding: {forward.stderr.strip()}")
+
+      nat_rule = [
+        "POSTROUTING",
+        "-s", TETHERING_SUBNET,
+        "-o", "ppp0",
+        "-j", "MASQUERADE",
+      ]
+
+      nat_check = subprocess.run(
+        ["sudo", "/usr/sbin/iptables-legacy", "-t", "nat", "-C"] + nat_rule,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+      )
+
+      if nat_check.returncode == 0:
+        return
+
+      nat_add = subprocess.run(
+        ["sudo", "/usr/sbin/iptables-legacy", "-t", "nat", "-A"] + nat_rule,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+      )
+      if nat_add.returncode != 0:
+        cloudlog.warning(f"Failed to add hotspot legacy NAT rule: {nat_add.stderr.strip()}")
+
   def _add_tethering_connection(self):
     connection = {
       'connection': {
@@ -601,7 +707,8 @@ class WifiManager:
         'id': ('s', 'Hotspot'),
         'autoconnect-retries': ('i', 0),
         'interface-name': ('s', 'wlan0'),
-        'autoconnect': ('b', False),
+        'autoconnect': ('b', True),
+        'autoconnect-priority': ('i', 100),
       },
       '802-11-wireless': {
         'band': ('s', 'bg'),
@@ -803,11 +910,9 @@ class WifiManager:
     def worker():
       if active:
         self.activate_connection(self._tethering_ssid, block=True)
-
-        if not self._ipv4_forward:
-          time.sleep(5)
-          cloudlog.warning("net.ipv4.ip_forward = 0")
-          subprocess.run(["sudo", "sysctl", "net.ipv4.ip_forward=0"], check=False)
+        # This custom build intentionally keeps forwarding enabled while the
+        # Comma hotspot is active so clients can use the cellular PPP link.
+        self._ensure_tethering_nat()
       else:
         self._deactivate_connection(self._tethering_ssid)
 
