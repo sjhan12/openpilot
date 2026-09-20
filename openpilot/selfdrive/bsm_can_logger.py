@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""BSD-triggered CAN logger for comma/openpilot/sunnypilot.
+"""BSD + SCC-triggered CAN logger for comma/openpilot/sunnypilot.
 
-Captures raw CAN from bus 0, bus 1, and bus 2 around stock blind-spot events:
+BSD capture:
+  - raw CAN bus 0/1/2
   - 5 s before BSD turns on
   - whole BSD active interval
   - 10 s after BSD turns off
 
-Output example:
+SCC capture:
+  - detects CarState ButtonEvent.Type.mainCruise press
+  - treats alternating mainCruise presses as ON/OFF, starting from OFF at logger start
+  - on SCC Main ON, records raw CAN bus 0/1/2 for exactly 10 s from the trigger
+  - fallback: if no mainCruise ButtonEvent has ever been seen, cruiseState.enabled
+    rising edge can trigger the 10 s SCC capture
+
+Output examples:
   /data/radar/2026-09-20_14-21-05/
     R_radar_bus0_14_21_05.csv
     R_radar_bus1_14_21_05.csv
     R_radar_bus2_14_21_05.csv
 
-The directory timestamp intentionally uses '_' and '-' rather than ':' so that
-files can be copied to Windows via WinSCP without filename problems.
+  /data/radar/2026-09-20_14-30-15_SCC/
+    scc_bus0_14_30_15.csv
+    scc_bus1_14_30_15.csv
+    scc_bus2_14_30_15.csv
+
+Directory timestamps intentionally avoid ':' so files copy cleanly to Windows.
 """
 
 from __future__ import annotations
@@ -29,16 +41,20 @@ from pathlib import Path
 from typing import Deque, Dict, Optional, TextIO
 
 from openpilot.cereal import messaging
+from opendbc.car.structs import car
 
 
 ROOT_DIR = Path("/data/radar")
 BUS_IDS = (0, 1, 2)
 PRE_TRIGGER_S = 5.0
 POST_TRIGGER_S = 10.0
+SCC_CAPTURE_S = 10.0
 CAN_SOCKET_TIMEOUT_MS = 20
 FLUSH_INTERVAL_S = 1.0
-BSD_POLL_INTERVAL_S = 0.05  # 20 Hz; enough for BSM trigger detection with lower overhead
+CARSTATE_POLL_INTERVAL_S = 0.05  # 20 Hz
 STATUS_LOG = ROOT_DIR / "bsm_can_logger.log"
+
+ButtonType = car.CarState.ButtonEvent.Type
 
 
 @dataclass(slots=True)
@@ -53,7 +69,7 @@ class CanRow:
   right_bsd: bool
 
 
-class Capture:
+class CsvCaptureBase:
   HEADER = [
     "wall_time",
     "recv_mono_ns",
@@ -68,55 +84,11 @@ class Capture:
     "right_bsd",
   ]
 
-  def __init__(self, side: str, trigger_dt: datetime, trigger_mono_ns: int,
-               prebuffer: Deque[CanRow]):
-    self.side = side  # 'L' or 'R'
-    self.trigger_dt = trigger_dt
+  def __init__(self, trigger_mono_ns: int):
     self.trigger_mono_ns = trigger_mono_ns
-    self.tail_deadline_ns: Optional[int] = None
     self.last_flush_ns = trigger_mono_ns
-
-    self.event_dir = self._make_unique_event_dir(trigger_dt, side)
-    self.event_dir.mkdir(parents=True, exist_ok=True)
-
-    hhmmss = trigger_dt.strftime("%H_%M_%S")
     self.files: Dict[int, TextIO] = {}
     self.writers: Dict[int, csv.writer] = {}
-
-    for bus in BUS_IDS:
-      path = self.event_dir / f"{side}_radar_bus{bus}_{hhmmss}.csv"
-      f = open(path, "w", newline="", buffering=1024 * 1024)
-      writer = csv.writer(f)
-      writer.writerow(self.HEADER)
-      self.files[bus] = f
-      self.writers[bus] = writer
-
-    # Snapshot the already-collected 5 second history.
-    for row in prebuffer:
-      self.write_row(row)
-
-    self.flush(force=True)
-
-  @staticmethod
-  def _make_unique_event_dir(trigger_dt: datetime, side: str) -> Path:
-    # Windows-safe timestamp. If another event happened in the same second,
-    # add _01, _02, ... rather than overwriting it.
-    base = ROOT_DIR / trigger_dt.strftime("%Y-%m-%d_%H-%M-%S")
-    if not base.exists():
-      return base
-
-    # If the opposite side triggers essentially simultaneously, sharing the
-    # same directory is convenient as long as our side's files do not exist.
-    hhmmss = trigger_dt.strftime("%H_%M_%S")
-    side_probe = base / f"{side}_radar_bus0_{hhmmss}.csv"
-    if not side_probe.exists():
-      return base
-
-    for idx in range(1, 1000):
-      candidate = ROOT_DIR / f"{trigger_dt.strftime('%Y-%m-%d_%H-%M-%S')}_{idx:02d}"
-      if not candidate.exists():
-        return candidate
-    raise RuntimeError("Could not allocate a unique radar event directory")
 
   def write_row(self, row: CanRow) -> None:
     writer = self.writers.get(row.bus)
@@ -139,16 +111,6 @@ class Capture:
       int(row.right_bsd),
     ])
 
-  def set_bsd_state(self, active: bool, now_mono_ns: int) -> None:
-    if active:
-      # BSD reactivated during the post-trigger tail: keep the same capture.
-      self.tail_deadline_ns = None
-    elif self.tail_deadline_ns is None:
-      self.tail_deadline_ns = now_mono_ns + int(POST_TRIGGER_S * 1e9)
-
-  def should_close(self, now_mono_ns: int) -> bool:
-    return self.tail_deadline_ns is not None and now_mono_ns >= self.tail_deadline_ns
-
   def flush(self, now_mono_ns: Optional[int] = None, force: bool = False) -> None:
     if now_mono_ns is None:
       now_mono_ns = time.monotonic_ns()
@@ -170,6 +132,98 @@ class Capture:
         f.close()
       except OSError:
         pass
+
+
+class BsdCapture(CsvCaptureBase):
+  def __init__(self, side: str, trigger_dt: datetime, trigger_mono_ns: int,
+               prebuffer: Deque[CanRow]):
+    super().__init__(trigger_mono_ns)
+    self.side = side  # 'L' or 'R'
+    self.trigger_dt = trigger_dt
+    self.tail_deadline_ns: Optional[int] = None
+
+    self.event_dir = self._make_unique_event_dir(trigger_dt, side)
+    self.event_dir.mkdir(parents=True, exist_ok=True)
+
+    hhmmss = trigger_dt.strftime("%H_%M_%S")
+    for bus in BUS_IDS:
+      path = self.event_dir / f"{side}_radar_bus{bus}_{hhmmss}.csv"
+      f = open(path, "w", newline="", buffering=1024 * 1024)
+      writer = csv.writer(f)
+      writer.writerow(self.HEADER)
+      self.files[bus] = f
+      self.writers[bus] = writer
+
+    # Snapshot the already-collected 5 second history.
+    for row in prebuffer:
+      self.write_row(row)
+
+    self.flush(force=True)
+
+  @staticmethod
+  def _make_unique_event_dir(trigger_dt: datetime, side: str) -> Path:
+    base = ROOT_DIR / trigger_dt.strftime("%Y-%m-%d_%H-%M-%S")
+    if not base.exists():
+      return base
+
+    # Opposite side may share the same event directory.
+    hhmmss = trigger_dt.strftime("%H_%M_%S")
+    side_probe = base / f"{side}_radar_bus0_{hhmmss}.csv"
+    if not side_probe.exists():
+      return base
+
+    for idx in range(1, 1000):
+      candidate = ROOT_DIR / f"{trigger_dt.strftime('%Y-%m-%d_%H-%M-%S')}_{idx:02d}"
+      if not candidate.exists():
+        return candidate
+    raise RuntimeError("Could not allocate a unique radar event directory")
+
+  def set_bsd_state(self, active: bool, now_mono_ns: int) -> None:
+    if active:
+      self.tail_deadline_ns = None
+    elif self.tail_deadline_ns is None:
+      self.tail_deadline_ns = now_mono_ns + int(POST_TRIGGER_S * 1e9)
+
+  def should_close(self, now_mono_ns: int) -> bool:
+    return self.tail_deadline_ns is not None and now_mono_ns >= self.tail_deadline_ns
+
+
+class SccCapture(CsvCaptureBase):
+  def __init__(self, trigger_dt: datetime, trigger_mono_ns: int, trigger_reason: str):
+    super().__init__(trigger_mono_ns)
+    self.trigger_dt = trigger_dt
+    self.trigger_reason = trigger_reason
+    self.deadline_ns = trigger_mono_ns + int(SCC_CAPTURE_S * 1e9)
+
+    self.event_dir = self._make_unique_event_dir(trigger_dt)
+    self.event_dir.mkdir(parents=True, exist_ok=True)
+
+    hhmmss = trigger_dt.strftime("%H_%M_%S")
+    for bus in BUS_IDS:
+      path = self.event_dir / f"scc_bus{bus}_{hhmmss}.csv"
+      f = open(path, "w", newline="", buffering=1024 * 1024)
+      writer = csv.writer(f)
+      writer.writerow(self.HEADER)
+      self.files[bus] = f
+      self.writers[bus] = writer
+
+    self.flush(force=True)
+
+  @staticmethod
+  def _make_unique_event_dir(trigger_dt: datetime) -> Path:
+    stem = trigger_dt.strftime("%Y-%m-%d_%H-%M-%S") + "_SCC"
+    base = ROOT_DIR / stem
+    if not base.exists():
+      return base
+
+    for idx in range(1, 1000):
+      candidate = ROOT_DIR / f"{stem}_{idx:02d}"
+      if not candidate.exists():
+        return candidate
+    raise RuntimeError("Could not allocate a unique SCC event directory")
+
+  def should_close(self, now_mono_ns: int) -> bool:
+    return now_mono_ns >= self.deadline_ns
 
 
 running = True
@@ -203,27 +257,35 @@ def main() -> None:
   # Raw CAN must not be conflated: every published CAN Event is relevant.
   can_sock = messaging.sub_sock("can", timeout=CAN_SOCKET_TIMEOUT_MS, conflate=False)
 
-  # BSD state only needs edge detection. Read the newest carState at 20 Hz to
-  # reduce subscriber/polling overhead on sunnypilot.
+  # State only needs edge detection. Read the newest carState at 20 Hz.
   carstate_sock = messaging.sub_sock("carState", conflate=True)
 
   prebuffer: Deque[CanRow] = deque()
-  captures: Dict[str, Capture] = {}
+  bsd_captures: Dict[str, BsdCapture] = {}
+  scc_capture: Optional[SccCapture] = None
 
   prev_left = False
   prev_right = False
   cur_left = False
   cur_right = False
-  last_bsd_poll_ns = 0
+  last_carstate_poll_ns = 0
+
+  # mainCruise is a momentary ButtonEvent, not a latched state. Track the
+  # ON/OFF toggle locally; logger normally starts with ignition/onroad and SCC Main OFF.
+  scc_main_on = False
+  saw_main_button_event = False
+
+  # Fallback for ports that do not publish mainCruise ButtonEvent.
+  carstate_initialized = False
+  prev_cruise_enabled = False
 
   log_status(
-    f"START buses={BUS_IDS} pre={PRE_TRIGGER_S:.1f}s post={POST_TRIGGER_S:.1f}s root={ROOT_DIR}"
+    f"START buses={BUS_IDS} BSD(pre={PRE_TRIGGER_S:.1f}s post={POST_TRIGGER_S:.1f}s) "
+    f"SCC={SCC_CAPTURE_S:.1f}s root={ROOT_DIR}"
   )
 
   try:
     while running:
-      # Receive one raw CAN Event. The socket timeout lets the loop still
-      # service BSD polling and capture closing if CAN traffic pauses.
       msg = messaging.recv_one(can_sock)
       recv_mono_ns = time.monotonic_ns()
       wall_time_ns = time.time_ns()
@@ -247,60 +309,103 @@ def main() -> None:
           )
 
           prebuffer.append(row)
-          for cap in captures.values():
+          for cap in bsd_captures.values():
             cap.write_row(row)
+          if scc_capture is not None:
+            scc_capture.write_row(row)
 
-      # Keep only approximately the latest PRE_TRIGGER_S seconds.
+      # Keep only approximately the latest PRE_TRIGGER_S seconds for BSD.
       cutoff_ns = recv_mono_ns - int(PRE_TRIGGER_S * 1e9)
       while prebuffer and prebuffer[0].recv_mono_ns < cutoff_ns:
         prebuffer.popleft()
 
-      # Poll only the newest carState at 20 Hz. A trigger detected a few tens
-      # of milliseconds late is harmless because the raw-CAN prebuffer has
-      # already retained the complete preceding interval.
-      if (recv_mono_ns - last_bsd_poll_ns) >= int(BSD_POLL_INTERVAL_S * 1e9):
-        last_bsd_poll_ns = recv_mono_ns
+      if (recv_mono_ns - last_carstate_poll_ns) >= int(CARSTATE_POLL_INTERVAL_S * 1e9):
+        last_carstate_poll_ns = recv_mono_ns
         cs_msg = messaging.recv_one_or_none(carstate_sock)
         if cs_msg is not None:
           cs = cs_msg.carState
           cur_left = bool(cs.leftBlindspot)
           cur_right = bool(cs.rightBlindspot)
+          cruise_enabled = bool(cs.cruiseState.enabled)
 
-          # Rising edges open independent left/right captures.
-          if cur_left and not prev_left and "L" not in captures:
-            cap = Capture("L", datetime.now(), recv_mono_ns, prebuffer)
-            captures["L"] = cap
+          # BSD rising edges open independent left/right captures.
+          if cur_left and not prev_left and "L" not in bsd_captures:
+            cap = BsdCapture("L", datetime.now(), recv_mono_ns, prebuffer)
+            bsd_captures["L"] = cap
             log_status(f"L BSD ON -> capture opened: {cap.event_dir}")
 
-          if cur_right and not prev_right and "R" not in captures:
-            cap = Capture("R", datetime.now(), recv_mono_ns, prebuffer)
-            captures["R"] = cap
+          if cur_right and not prev_right and "R" not in bsd_captures:
+            cap = BsdCapture("R", datetime.now(), recv_mono_ns, prebuffer)
+            bsd_captures["R"] = cap
             log_status(f"R BSD ON -> capture opened: {cap.event_dir}")
 
-          # Active BSD cancels a pending close. Falling state starts/maintains
-          # the 10 second post-trigger tail.
-          if "L" in captures:
-            captures["L"].set_bsd_state(cur_left, recv_mono_ns)
-          if "R" in captures:
-            captures["R"].set_bsd_state(cur_right, recv_mono_ns)
+          if "L" in bsd_captures:
+            bsd_captures["L"].set_bsd_state(cur_left, recv_mono_ns)
+          if "R" in bsd_captures:
+            bsd_captures["R"].set_bsd_state(cur_right, recv_mono_ns)
 
           prev_left = cur_left
           prev_right = cur_right
 
-      # Flush and close completed captures.
-      for side, cap in list(captures.items()):
+          # SCC Main button: create_button_events() publishes a pressed event
+          # for the physical mainCruise button. The button itself is momentary,
+          # so alternate presses are treated as ON / OFF.
+          main_pressed = any(
+            bool(b.pressed) and b.type.raw == ButtonType.mainCruise
+            for b in cs.buttonEvents
+          )
+
+          if main_pressed:
+            saw_main_button_event = True
+            scc_main_on = not scc_main_on
+            if scc_main_on:
+              if scc_capture is None:
+                cap = SccCapture(datetime.now(), recv_mono_ns, "mainCruise ON")
+                scc_capture = cap
+                log_status(f"SCC MAIN ON -> 10s capture opened: {cap.event_dir}")
+              else:
+                log_status("SCC MAIN ON while SCC capture already active -> existing capture kept")
+            else:
+              log_status("SCC MAIN OFF -> no SCC capture started")
+
+          # Fallback only when this car/port has never exposed mainCruise
+          # ButtonEvent. This catches a clean SCC engagement rising edge.
+          if carstate_initialized and (not saw_main_button_event):
+            if cruise_enabled and not prev_cruise_enabled and scc_capture is None:
+              cap = SccCapture(datetime.now(), recv_mono_ns, "cruiseState.enabled rising fallback")
+              scc_capture = cap
+              log_status(f"SCC ENABLED rising fallback -> 10s capture opened: {cap.event_dir}")
+
+          prev_cruise_enabled = cruise_enabled
+          carstate_initialized = True
+
+      # Flush and close completed BSD captures.
+      for side, cap in list(bsd_captures.items()):
         cap.flush(recv_mono_ns)
         if cap.should_close(recv_mono_ns):
           event_dir = cap.event_dir
           cap.close()
-          del captures[side]
+          del bsd_captures[side]
           log_status(f"{side} BSD tail complete -> capture closed: {event_dir}")
 
+      # Flush and close the fixed 10 second SCC capture.
+      if scc_capture is not None:
+        scc_capture.flush(recv_mono_ns)
+        if scc_capture.should_close(recv_mono_ns):
+          event_dir = scc_capture.event_dir
+          scc_capture.close()
+          scc_capture = None
+          log_status(f"SCC 10s capture complete -> capture closed: {event_dir}")
+
   finally:
-    for side, cap in list(captures.items()):
+    for side, cap in list(bsd_captures.items()):
       event_dir = cap.event_dir
       cap.close()
       log_status(f"{side} forced close: {event_dir}")
+    if scc_capture is not None:
+      event_dir = scc_capture.event_dir
+      scc_capture.close()
+      log_status(f"SCC forced close: {event_dir}")
     log_status("STOP")
 
 
