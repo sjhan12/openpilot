@@ -3,14 +3,14 @@
 
 BSD capture:
   - raw CAN bus 0/1/2
-  - 5 s before BSD turns on
+  - 20 s before BSD turns on
   - whole BSD active interval
-  - 10 s after BSD turns off
+  - 20 s after BSD turns off
 
 SCC capture:
   - detects CarState ButtonEvent.Type.mainCruise press
   - treats alternating mainCruise presses as ON/OFF, starting from OFF at logger start
-  - on SCC Main ON, records raw CAN bus 0/1/2 for exactly 10 s from the trigger
+  - on SCC Main ON, records raw CAN bus 0/1/2 for exactly 60 s from the trigger
   - fallback: if no mainCruise ButtonEvent has ever been seen, cruiseState.enabled
     rising edge can trigger the 10 s SCC capture
 
@@ -46,9 +46,9 @@ from opendbc.car.structs import car
 
 ROOT_DIR = Path("/data/radar")
 BUS_IDS = (0, 1, 2)
-PRE_TRIGGER_S = 5.0
-POST_TRIGGER_S = 10.0
-SCC_CAPTURE_S = 10.0
+PRE_TRIGGER_S = 20.0
+POST_TRIGGER_S = 20.0
+SCC_CAPTURE_S = 60.0
 CAN_SOCKET_TIMEOUT_MS = 20
 FLUSH_INTERVAL_S = 1.0
 CARSTATE_POLL_INTERVAL_S = 0.05  # 20 Hz
@@ -154,7 +154,7 @@ class BsdCapture(CsvCaptureBase):
       self.files[bus] = f
       self.writers[bus] = writer
 
-    # Snapshot the already-collected 5 second history.
+    # Snapshot the already-collected PRE_TRIGGER_S history.
     for row in prebuffer:
       self.write_row(row)
 
@@ -362,7 +362,7 @@ def main() -> None:
               if scc_capture is None:
                 cap = SccCapture(datetime.now(), recv_mono_ns, "mainCruise ON")
                 scc_capture = cap
-                log_status(f"SCC MAIN ON -> 10s capture opened: {cap.event_dir}")
+                log_status(f"SCC MAIN ON -> {SCC_CAPTURE_S:.0f}s capture opened: {cap.event_dir}")
               else:
                 log_status("SCC MAIN ON while SCC capture already active -> existing capture kept")
             else:
@@ -388,14 +388,14 @@ def main() -> None:
           del bsd_captures[side]
           log_status(f"{side} BSD tail complete -> capture closed: {event_dir}")
 
-      # Flush and close the fixed 10 second SCC capture.
+      # Flush and close the fixed-duration SCC capture.
       if scc_capture is not None:
         scc_capture.flush(recv_mono_ns)
         if scc_capture.should_close(recv_mono_ns):
           event_dir = scc_capture.event_dir
           scc_capture.close()
           scc_capture = None
-          log_status(f"SCC 10s capture complete -> capture closed: {event_dir}")
+          log_status(f"SCC {SCC_CAPTURE_S:.0f}s capture complete -> capture closed: {event_dir}")
 
   finally:
     for side, cap in list(bsd_captures.items()):
