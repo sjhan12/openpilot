@@ -7,12 +7,20 @@ BSD capture:
   - whole BSD active interval
   - 20 s after BSD turns off
 
-SCC capture:
+SCC/HDA2 capture:
   - detects CarState ButtonEvent.Type.mainCruise press
   - treats alternating mainCruise presses as ON/OFF, starting from OFF at logger start
   - on SCC Main ON, records raw CAN bus 0/1/2 for exactly 60 s from the trigger
   - fallback: if no mainCruise ButtonEvent has ever been seen, cruiseState.enabled
-    rising edge can trigger the 10 s SCC capture
+    rising edge can trigger the SCC capture
+
+HDA2 state markers recorded in every CSV row:
+  - scc_main_on: local SCC-M toggle state seen by the logger
+  - cruise_enabled: carState.cruiseState.enabled
+  - ego_speed_mps: carState.vEgo, useful for absolute target speed/validation
+  - hda_mode2_raw: raw HDA_MODE2 from CAN 0x1EA
+  - hda_cntrl_mod_raw: raw HDA_CntrlModSta from CAN 0x1E0
+  - raw HDA values are intentionally not mapped to ACTIVE/INACTIVE until validated on this G80
 
 Output examples:
   /data/radar/2026-09-20_14-21-05/
@@ -67,6 +75,11 @@ class CanRow:
   data: bytes
   left_bsd: bool
   right_bsd: bool
+  scc_main_on: bool
+  cruise_enabled: bool
+  ego_speed_mps: float
+  hda_mode2_raw: int
+  hda_cntrl_mod_raw: int
 
 
 class CsvCaptureBase:
@@ -82,6 +95,11 @@ class CsvCaptureBase:
     "data_hex",
     "left_bsd",
     "right_bsd",
+    "scc_main_on",
+    "cruise_enabled",
+    "ego_speed_mps",
+    "hda_mode2_raw",
+    "hda_cntrl_mod_raw",
   ]
 
   def __init__(self, trigger_mono_ns: int):
@@ -109,6 +127,11 @@ class CsvCaptureBase:
       row.data.hex().upper(),
       int(row.left_bsd),
       int(row.right_bsd),
+      int(row.scc_main_on),
+      int(row.cruise_enabled),
+      f"{row.ego_speed_mps:.3f}",
+      row.hda_mode2_raw,
+      row.hda_cntrl_mod_raw,
     ])
 
   def flush(self, now_mono_ns: Optional[int] = None, force: bool = False) -> None:
@@ -268,6 +291,16 @@ def main() -> None:
   prev_right = False
   cur_left = False
   cur_right = False
+  cur_cruise_enabled = False
+  cur_ego_speed_mps = 0.0
+
+  # HDA state hints decoded directly from raw CAN.
+  # 0x1EA ADRV_0x1ea: HDA_MODE2 = start bit 32, length 3, little-endian.
+  # 0x1E0 LFAHDA_CLUSTER: HDA_CntrlModSta = start bit 30, length 2, little-endian.
+  # Keep raw numeric states instead of assuming which value means fully ACTIVE.
+  hda_mode2_raw = -1
+  hda_cntrl_mod_raw = -1
+
   last_carstate_poll_ns = 0
 
   # mainCruise is a momentary ButtonEvent, not a latched state. Track the
@@ -281,7 +314,7 @@ def main() -> None:
 
   log_status(
     f"START buses={BUS_IDS} BSD(pre={PRE_TRIGGER_S:.1f}s post={POST_TRIGGER_S:.1f}s) "
-    f"SCC={SCC_CAPTURE_S:.1f}s root={ROOT_DIR}"
+    f"SCC={SCC_CAPTURE_S:.1f}s HDAraw=(0x1EA.HDA_MODE2,0x1E0.HDA_CntrlModSta) root={ROOT_DIR}"
   )
 
   try:
@@ -297,15 +330,30 @@ def main() -> None:
           if bus not in BUS_IDS:
             continue
 
+          address = int(can.address)
+          data = bytes(can.dat)
+
+          # Decode HDA-related raw states from the messages themselves.
+          # These are logged as RAW values; no ACTIVE mapping is assumed.
+          if address == 0x1EA and len(data) >= 5:
+            hda_mode2_raw = data[4] & 0x07
+          elif address == 0x1E0 and len(data) >= 4:
+            hda_cntrl_mod_raw = (data[3] >> 6) & 0x03
+
           row = CanRow(
             recv_mono_ns=recv_mono_ns,
             log_mono_ns=log_mono_ns,
             wall_time_ns=wall_time_ns,
             bus=bus,
-            address=int(can.address),
-            data=bytes(can.dat),
+            address=address,
+            data=data,
             left_bsd=cur_left,
             right_bsd=cur_right,
+            scc_main_on=scc_main_on,
+            cruise_enabled=cur_cruise_enabled,
+            ego_speed_mps=cur_ego_speed_mps,
+            hda_mode2_raw=hda_mode2_raw,
+            hda_cntrl_mod_raw=hda_cntrl_mod_raw,
           )
 
           prebuffer.append(row)
@@ -327,6 +375,8 @@ def main() -> None:
           cur_left = bool(cs.leftBlindspot)
           cur_right = bool(cs.rightBlindspot)
           cruise_enabled = bool(cs.cruiseState.enabled)
+          cur_cruise_enabled = cruise_enabled
+          cur_ego_speed_mps = float(cs.vEgo)
 
           # BSD rising edges open independent left/right captures.
           if cur_left and not prev_left and "L" not in bsd_captures:
