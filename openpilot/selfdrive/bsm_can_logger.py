@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """G80 RG3 HDA2 radar logger + empirical live decoder for sunnypilot/openpilot.
 
-Revision: 2026-09-23 v4 (Astra v2 reverse-engineering results integrated)
+Revision: 2026-09-23 v5 (Astra v2 + community cross-check fields integrated)
 
 What this logger records
 ------------------------
@@ -11,9 +11,11 @@ What this logger records
      group A: 0x241-0x24F (left-side display teacher matches primarily y > 0)
      group B: 0x279-0x287 (right-side display teacher matches primarily y < 0)
    IMPORTANT: side is determined from decoded y sign, NOT from bank/address alone.
-4) Rear 0x1EA LR/RR teacher candidates on bus1.
-5) Previous FR_CMR front-object candidates on bus2 for cross-sensor track matching.
-6) Unresolved repeated-record banks 0x270-0x277 and 0x288-0x28F for the next decode step.
+4) Rear 0x1EA LR/RR teacher candidates on bus1, including community-DBC lateral fields.
+5) Previous FR_CMR/front-corner object candidates on bus2, including age/vy/ax fields
+   cross-checked against the community Hyundai CAN-FD corner-radar DBC.
+6) Raw focus coverage widened to include 0x235-0x24F for protocol-family comparison.
+7) Unresolved repeated-record banks 0x270-0x277 and 0x288-0x28F for the next decode step.
 
 Current empirical fields for 24-byte object slots
 --------------------------------------------------
@@ -31,7 +33,7 @@ geometry or confirmed ADAS latency. This logger does NOT delay raw decoding by 0
 
 Still unresolved and intentionally preserved as raw data
 --------------------------------------------------------
-- lateral velocity vy, acceleration, class/quality/size/state fields
+- 24-byte-bank lateral velocity vy, acceleration, class/quality/size/state fields
 - full invalid/CRC rules
 - exact physical sensor/ECU ownership
 - 0x270-0x277 / 0x288-0x28F repeated record physical meaning
@@ -81,7 +83,7 @@ from openpilot.cereal import messaging
 from opendbc.car.structs import car
 
 
-VERSION = "2026-09-23-v4-astra-v2"
+VERSION = "2026-09-23-v5-astra-v2-community-check"
 ROOT_DIR = Path("/data/radar")
 BUS_IDS = (0, 1, 2)
 PRE_TRIGGER_S = 20.0
@@ -107,7 +109,7 @@ FOCUS_IDS = (
   FR_OBJECT_ADDRS |
   {0x1E0, 0x1EA} |
   set(range(0x210, 0x220)) |
-  set(range(0x240, 0x250)) |
+  set(range(0x235, 0x250)) |
   set(range(0x270, 0x290)) |
   set(range(0x2BA, 0x2BF))
 )
@@ -173,18 +175,28 @@ def decode_object(address: int, data: bytes) -> Optional[dict]:
 
 
 def decode_teacher_rear(data: bytes) -> list[dict]:
-  """Decode empirical bus1 0x1EA LR/RR teacher values."""
+  """Decode bus1 0x1EA LR/RR teacher values.
+
+  Distance/state handling preserves the Astra-v2 empirical mapping used for the
+  2026-09-23 validation. Lateral fields are additionally exposed from the
+  community Hyundai CAN-FD DBC for independent y-coordinate cross-checking.
+  """
   if len(data) != 32:
     return []
 
   out = []
-  for sector, dist_start, state_start in (("LR", 139, 160), ("RR", 163, 184)):
+  for sector, dist_start, lateral_start, state_start in (
+      ("LR", 139, 152, 160),
+      ("RR", 163, 172, 184),
+  ):
     status = bits_le(data, state_start, 3)
     distance = bits_le(data, dist_start, 8) * 0.1
+    lateral = bits_le(data, lateral_start, 6) * 0.1
     out.append({
       "sector": sector,
       "status_raw": status,
       "distance_candidate_m": round(distance, 3),
+      "lateral_dbc_candidate_m": round(lateral, 3),
       "teacher_usable": int(status == 1 and 0.5 <= distance <= 19.5),
       "ceiling_candidate": int(distance >= 20.0),
     })
@@ -207,19 +219,28 @@ def decode_front_pair(address: int, data: bytes) -> list[dict]:
   for sub in (0, 1):
     off = sub * 128
     quality = bits_le(data, off + 24, 7)
+    age = bits_le(data, off + 32, 8)
     x = bits_le(data, off + 64, 13) * 0.05
     y = bits_le(data, off + 78, 12) * 0.05 - 102.4
     vx = bits_le(data, off + 91, 12) * 0.05 - 100.0
+    vy = bits_le(data, off + 104, 10) * 0.05 - 25.0
+    ax = signed_value(bits_le(data, off + 115, 9), 9) * 0.05
     if not (quality > 0 and 0 <= x < 180 and abs(y) < 40 and vx > -99):
       continue
     out.append({
       "slot": addr_index * 2 + sub + 1,
       "object_id_raw": bits_le(data, off + 44, 7),
       "quality": quality,
-      "class_id": bits_le(data, off + 60, 3),
+      "age": age,
+      # This 3-bit field existed in the previous empirical mapping but is not
+      # confirmed as an object class by the community DBC. Preserve it only
+      # as a candidate for offline comparison.
+      "class_id_candidate": bits_le(data, off + 60, 3),
       "x_candidate_m": round(x, 3),
       "y_left_candidate_m": round(y, 3),
       "vx_candidate_mps": round(vx, 3),
+      "vy_candidate_mps": round(vy, 3),
+      "ax_candidate_mps2": round(ax, 3),
       "geometric_side": "LEFT" if y > 0 else "RIGHT" if y < 0 else "CENTER",
     })
   return out
@@ -288,14 +309,16 @@ class CsvCaptureBase:
   ]
 
   TEACHER_HEADER = BASE_DECODE_HEADER + [
-    "sector", "status_raw", "distance_candidate_m", "teacher_usable",
+    "sector", "status_raw", "distance_candidate_m",
+    "lateral_dbc_candidate_m", "teacher_usable",
     "ceiling_candidate", "teacher_delay_s_observed",
     "teacher_offset_m_observed",
   ]
 
   FRONT_HEADER = BASE_DECODE_HEADER + [
-    "slot", "object_id_raw", "quality", "class_id", "x_candidate_m",
-    "y_left_candidate_m", "vx_candidate_mps", "geometric_side",
+    "slot", "object_id_raw", "quality", "age", "class_id_candidate",
+    "x_candidate_m", "y_left_candidate_m", "vx_candidate_mps",
+    "vy_candidate_mps", "ax_candidate_mps2", "geometric_side",
   ]
 
   REPEATED_HEADER = BASE_DECODE_HEADER + [
@@ -407,8 +430,12 @@ class CsvCaptureBase:
         f.write("inactive_x_raw=0x7FF\n")
         f.write(f"teacher_offset_m_observed={TEACHER_OFFSET_M}\n")
         f.write(f"teacher_delay_s_observed={TEACHER_DELAY_S_OBSERVED}\n")
-        f.write("teacher=bus1:0x1EA LR/RR empirical\n")
-        f.write("unresolved=vy,class,quality,size,state,full_invalid_crc,sensor_ownership,global_track_fusion,repeated_bank_units\n")
+        f.write("teacher=bus1:0x1EA LR/RR empirical distance/state + community-DBC lateral\n")
+        f.write("teacher_lateral=LR bit152 width6 scale0.1; RR bit172 width6 scale0.1\n")
+        f.write("front_180_184=quality,age,id,x,y,vx,vy,ax community-DBC cross-check fields\n")
+        f.write("front_class_id=unconfirmed candidate only\n")
+        f.write("focus_extra=0x235-0x23F retained for 32-byte corner-radar family comparison\n")
+        f.write("unresolved=24B_vy,class,quality,size,state,full_invalid_crc,sensor_ownership,global_track_fusion,repeated_bank_units\n")
 
   def write_row(self, row: CanRow) -> None:
     raw_values = self._raw_values(row)
