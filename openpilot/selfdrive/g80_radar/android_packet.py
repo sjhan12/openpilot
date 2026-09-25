@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 
 def _obj(o: dict) -> dict:
   d={'id':o.get('key'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx'),'source':o.get('source')}
@@ -24,6 +24,7 @@ def build_render_packet(state: dict) -> dict:
     'camera':[_obj(o) for o in state.get('camera_leads',[])],
     'camera_matches':state.get('camera_fusion_matches',[]),
     'camera_fusion_stats':state.get('camera_fusion_stats',{}),
+    'shadow_leads':state.get('shadow_leads',{}),
     'zones':state.get('zones',{}),
     'rear_teacher':state.get('teacher_rear',[]),
     'scc_teacher':state.get('scc_teacher',{}),
