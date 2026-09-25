@@ -146,3 +146,43 @@ class SccFrontTeacherMatcher:
             "aligned_teacher_distance_m":round(float(teacher["distance_m"])+self.distance_bias_m,3),
         })
         return out,status
+
+
+def choose_scc_teacher(by_bus: dict, preferred_bus: int | None, now_ns: int, fresh_ns: int = 500_000_000):
+    """
+    Select SCC teacher:
+      1) preferred bus if fresh + usable
+      2) freshest usable any bus
+      3) preferred bus fresh raw
+      4) freshest raw any bus
+
+    Raw/inactive state is returned intentionally so the UI can show what
+    SCC_CONTROL is transmitting even when strict validity is false.
+    """
+    items = []
+    for bus, t in by_bus.items():
+        if not t:
+            continue
+        age = now_ns - int(t.get("recv_ns", 0))
+        if -50_000_000 <= age <= fresh_ns:
+            items.append((int(bus), t, age))
+    if not items:
+        return None
+
+    if preferred_bus is not None:
+        for bus, t, _ in items:
+            if bus == preferred_bus and t.get("teacher_usable"):
+                return dict(t)
+
+    usable = [(bus, t, age) for bus, t, age in items if t.get("teacher_usable")]
+    if usable:
+        usable.sort(key=lambda x: x[2])
+        return dict(usable[0][1])
+
+    if preferred_bus is not None:
+        for bus, t, _ in items:
+            if bus == preferred_bus:
+                return dict(t)
+
+    items.sort(key=lambda x: x[2])
+    return dict(items[0][1])
