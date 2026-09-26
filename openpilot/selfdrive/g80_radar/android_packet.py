@@ -6,7 +6,10 @@ def _obj(o: dict) -> dict:
   d={'id':o.get('key'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx'),'source':o.get('source')}
   for k in ('sector','front_sector','corner_fused_id','member_count','teacher_match','scc_teacher_confirmed',
             'front_link','corner_link_id','confidence','camera_confirmed','camera_prob','camera_id','camera_key',
-            'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps'):
+            'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps',
+            'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
+            'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
+            'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 

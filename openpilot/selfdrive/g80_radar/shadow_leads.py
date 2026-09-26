@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-G80 v16 receive-only shadow leadOne/leadTwo verifier.
+G80 v17 receive-only shadow leadOne/leadTwo verifier.
 
 HARD SEPARATION:
 - NEVER publishes radarState
@@ -38,8 +38,12 @@ HISTORY_S = 1.60
 HISTORY_STALE_S = 0.80
 STATIONARY_SHADOW_MIN_GAP_M = 3.0
 
-DUP_DX_M = 3.0
-DUP_DY_M = 1.2
+# Same-vehicle guard aligned with the upstream passenger-car footprint fusion.
+DUP_DX_M = 4.8
+DUP_DY_M = 2.1
+DUP_DV_MPS = 3.0
+LEAD_REID_MAX_AGE_S = 0.65
+RADAR_ONLY_MAX_DREL_M = 100.0
 
 
 def _finite(v, default=0.0):
@@ -161,16 +165,52 @@ class ShadowLeadVerifier:
     self.hist: dict[str, Hist] = {}
     self.last_l1_key = None
     self.last_l2_key = None
+    self.last_l1_state = None
+    self.last_l2_state = None
 
   @staticmethod
   def _identity(o):
-    return str(o.get('key') or o.get('front_key') or 'unknown')
+    return str(o.get('vehicle_key') or o.get('key') or o.get('front_key') or 'unknown')
 
   @staticmethod
   def _same_physical(a, b):
     if a is None or b is None:
       return False
-    return abs(float(a['x']) - float(b['x'])) < DUP_DX_M and abs(float(a['y']) - float(b['y'])) < DUP_DY_M
+    if abs(float(a['x']) - float(b['x'])) > DUP_DX_M or abs(float(a['y']) - float(b['y'])) > DUP_DY_M:
+      return False
+    av=a.get('vx'); bv=b.get('vx')
+    if av is not None and bv is not None and abs(float(av)-float(bv)) > DUP_DV_MPS:
+      return False
+    return True
+
+  @staticmethod
+  def _reidentify(candidates, previous, now_s):
+    """Keep lead identity through a radar/camera/corner key hand-over.
+
+    The previous relative-x is propagated with vRel.  No stale lead is emitted;
+    this is used only to select among *fresh* current candidates.
+    """
+    if not previous:
+      return None
+    dt=max(0.0,now_s-float(previous.get('t',now_s)))
+    if dt > LEAD_REID_MAX_AGE_S:
+      return None
+    px=float(previous['x']) + float(previous.get('vx') or 0.0)*dt
+    py=float(previous['y'])
+    pv=previous.get('vx')
+    best=None
+    for c in candidates:
+      dx=abs(float(c['x'])-px); dy=abs(float(c['y'])-py)
+      if dx>DUP_DX_M or dy>DUP_DY_M:
+        continue
+      if pv is not None and c.get('vx') is not None and abs(float(c['vx'])-float(pv))>DUP_DV_MPS:
+        continue
+      cost=(dx/DUP_DX_M)**2+(dy/DUP_DY_M)**2
+      if pv is not None and c.get('vx') is not None:
+        cost += .35*(abs(float(c['vx'])-float(pv))/DUP_DV_MPS)**2
+      if best is None or cost<best[0]:
+        best=(cost,c)
+    return None if best is None else best[1]
 
   @staticmethod
   def _fresh(o, now_ns):
@@ -235,7 +275,7 @@ class ShadowLeadVerifier:
     o = c['obj']
     return {
       'status':True,'validationState':'candidate','role':role,
-      'key':o.get('key'),'source':o.get('source'),
+      'key':c['key'],'sourceKey':o.get('key'),'vehicleKey':o.get('vehicle_key'),'source':o.get('source'),
       'dRel':round(c['x'],3),'yRel':round(c['y'],3),'dPath':round(c['dpath'],3),
       'vRel':None if c['vx'] is None else round(c['vx'],3),
       'vLead':None if c['vlead'] is None else round(c['vlead'],3),
@@ -252,6 +292,9 @@ class ShadowLeadVerifier:
       'historyS':round(float(c['motion']['span_s']),3),
       'inwardRate':round(float(c['motion']['inward_rate']),3),
       'ageMs':round(float(c['age_ms']),1),
+      'vehicleMemberCount':int(o.get('vehicle_member_count',1) or 1),
+      'vehicleClusterKeys':list(o.get('vehicle_cluster_keys',[o.get('key')])) if isinstance(o.get('vehicle_cluster_keys',[o.get('key')]),list) else [o.get('key')],
+      'reidentified':bool(c.get('reidentified',False)),
       'reason':reason,'score':round(float(score),3),
       'controlConnected':False,
     }
@@ -334,8 +377,15 @@ class ShadowLeadVerifier:
         and motion['span_s'] >= STATIONARY_CONFIRM_S
         and (ev['camera'] or ev['scc'] or bool(o.get('front_link')))
       )
+      # Shadow-log review found occasional 100-120 m physical_in_path fallbacks
+      # with no independent confirmation. Keep them visible as candidates but do
+      # not promote them to leadOne until camera/SCC/corner-front evidence exists.
+      far_unconfirmed = (
+        physical and x > RADAR_ONLY_MAX_DREL_M
+        and not (ev['camera'] or ev['scc'] or bool(o.get('front_link')))
+      )
       moving_supported = (
-        stationary is not True and path_occ
+        stationary is not True and path_occ and not far_unconfirmed
         and (physical or camera_prob >= CAMERA_ONLY_MIN_PROB)
         and (motion['span_s'] >= MOVING_CONFIRM_S or ev['cross_sensor'] or o.get('source')=='front_track')
       )
@@ -349,13 +399,19 @@ class ShadowLeadVerifier:
         'stationary_supported':stationary_supported,'moving_supported':moving_supported,
         'camera_only_supported':camera_only_supported,'path_occupied':path_occ,
         'cutin_confirmed':cutin_confirmed,'cutin_score':cutin_score,
-        'cutout_score':cutout_score,'age_ms':age_ms,
+        'cutout_score':cutout_score,'age_ms':age_ms,'far_unconfirmed':far_unconfirmed,
       })
 
     eligible = [c for c in candidates if c['path_occupied'] and
                 (c['moving_supported'] or c['stationary_supported'] or c['camera_only_supported'])]
 
     l1c = next((c for c in eligible if c['key']==self.last_l1_key),None)
+    l1_reidentified = False
+    if l1c is None:
+      l1c = self._reidentify(eligible,self.last_l1_state,now_s)
+      if l1c is not None:
+        l1c['reidentified']=True
+        l1_reidentified=True
     if l1c is None:
       scored = []
       for c in eligible:
@@ -364,6 +420,8 @@ class ShadowLeadVerifier:
         scored.append((c['x']-1.5*reliability,c))
       l1c = min(scored,key=lambda z:z[0])[1] if scored else None
     self.last_l1_key = l1c['key'] if l1c else None
+    if l1c is not None:
+      self.last_l1_state={'x':l1c['x'],'y':l1c['y'],'vx':l1c.get('vx'),'t':now_s,'key':l1c['key']}
 
     lead1 = None
     if l1c:
@@ -391,8 +449,14 @@ class ShadowLeadVerifier:
 
     l2c = None
     l2reason = None
+    l2_reidentified = False
     if cutins:
       l2c = next((c for c in cutins if c['key']==self.last_l2_key),None)
+      if l2c is None:
+        l2c = self._reidentify(cutins,self.last_l2_state,now_s)
+        if l2c is not None:
+          l2c['reidentified']=True
+          l2_reidentified=True
       if l2c is None:
         l2c = max(cutins,key=lambda c:(c['cutin_score'],-c['x']))
       l2reason = 'physical_dpath_cutin'
@@ -413,6 +477,8 @@ class ShadowLeadVerifier:
         l2reason = 'stationary_shadow_behind_cutout'
 
     self.last_l2_key = l2c['key'] if l2c else None
+    if l2c is not None:
+      self.last_l2_state={'x':l2c['x'],'y':l2c['y'],'vx':l2c.get('vx'),'t':now_s,'key':l2c['key']}
     lead2 = self._lead_dict(l2c,'leadTwo',l2reason,80.0-l2c['x']) if l2c else None
 
     prod1 = production.get('leadOne',{'status':False}) if production_valid else {'status':False}
@@ -422,7 +488,7 @@ class ShadowLeadVerifier:
     display = []
     for c in sorted(candidates,key=lambda x:x['x'])[:32]:
       display.append({
-        'key':c['key'],'source':c['obj'].get('source'),'x':round(c['x'],3),'y':round(c['y'],3),
+        'key':c['key'],'source_key':c['obj'].get('key'),'vehicle_key':c['obj'].get('vehicle_key'),'source':c['obj'].get('source'),'x':round(c['x'],3),'y':round(c['y'],3),
         'vx':None if c['vx'] is None else round(c['vx'],3),'d_path':round(c['dpath'],3),
         'v_lead':None if c['vlead'] is None else round(c['vlead'],3),'age_ms':round(c['age_ms'],1),
         'path_occupied':c['path_occupied'],'stationary':c['stationary'],
@@ -430,6 +496,10 @@ class ShadowLeadVerifier:
         'cutin_score':round(c['cutin_score'],3),'cutout_score':round(c['cutout_score'],3),
         'camera_confirmed':c['evidence']['camera'],'scc_teacher_confirmed':c['evidence']['scc'],
         'front_link':c['obj'].get('front_link'),
+        'vehicle_member_count':int(c['obj'].get('vehicle_member_count',1) or 1),
+        'vehicle_cluster_keys':c['obj'].get('vehicle_cluster_keys',[c['key']]),
+        'far_unconfirmed':bool(c.get('far_unconfirmed',False)),
+        'reidentified':bool(c.get('reidentified',False)),
         'shadow_role':'L1' if lead1 and lead1.get('key')==c['key'] else ('L2' if lead2 and lead2.get('key')==c['key'] else ''),
       })
 
@@ -437,7 +507,7 @@ class ShadowLeadVerifier:
     vego_age = None if not v_ego_recv_ns else round((int(now_ns)-int(v_ego_recv_ns))/1e6,1)
 
     return {
-      'version':2,'mode':'shadow_only','control_connected':False,'publishes_radarState':False,'can_tx':False,
+      'version':3,'mode':'shadow_only','control_connected':False,'publishes_radarState':False,'can_tx':False,
       'leadOne':lead1 or {'status':False,'validationState':'unavailable','role':'leadOne','controlConnected':False},
       'leadTwo':lead2 or {'status':False,'validationState':'unavailable','role':'leadTwo','controlConnected':False},
       'stockLeadOne':prod1,'stockLeadTwo':prod2,
@@ -455,6 +525,9 @@ class ShadowLeadVerifier:
         'confirmed_cutin_count':sum(1 for c in candidates if c['cutin_confirmed']),
         'stationary_supported_count':sum(1 for c in candidates if c['stationary_supported']),
         'duplicate_suppressed_count':duplicate_suppressed,
+        'far_unconfirmed_rejected_count':sum(1 for c in candidates if c.get('far_unconfirmed')),
+        'leadOne_reidentified':l1_reidentified,'leadTwo_reidentified':l2_reidentified,
+        'duplicate_gate_m':[DUP_DX_M,DUP_DY_M,DUP_DV_MPS],
         'path_valid':path_valid,'path_age_ms':path_age,
         'v_ego_valid':v_ego_valid,'v_ego_age_ms':vego_age,
       },
@@ -462,5 +535,7 @@ class ShadowLeadVerifier:
         'shadow only: never drives radarState/planner/CAN',
         'cut-in lateral rate derives from dPath position history',
         'stationary confirmation requires fresh path/vEgo plus cross-sensor support',
+        'leadTwo is a cut-in/stationary-shadow candidate, not simply the second-nearest car',
+        'unconfirmed radar-only objects beyond 100 m are not promoted to leadOne',
       ],
     }

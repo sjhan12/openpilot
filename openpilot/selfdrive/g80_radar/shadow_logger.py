@@ -36,7 +36,10 @@ def _compact_obj(o: dict) -> dict:
     'member_count','teacher_match','scc_teacher_confirmed','front_link',
     'corner_link_id','camera_confirmed','camera_prob','camera_id','camera_key',
     'camera_only','sensor_fusion','camera_match_cost','camera_dx_m',
-    'camera_dy_m','camera_dv_mps','recv_ns','log_ns'
+    'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
+    'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
+    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
+    'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged'
   )
   return {k:o.get(k) for k in keys if k in o and o.get(k) is not None}
 
@@ -97,7 +100,7 @@ class ShadowLogger:
       header = {
         'type':'header',
         'format':'g80_shadow_log',
-        'format_version':1,
+        'format_version':2,
         'service_version':17,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
@@ -106,6 +109,8 @@ class ShadowLogger:
           'max_mb':round(self.max_bytes/1024/1024,1),
           'flush_sec':self.flush_sec,
           'log_dir':str(self.log_dir),
+          'vehicle_footprint_m':[4.8,2.1],
+          'vehicle_vrel_gate_mps':3.0,
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -159,8 +164,12 @@ class ShadowLogger:
       'shadow':shadow,
       'sensor_fused_objects':[_compact_obj(o) for o in core.get('sensor_fused_objects',[])],
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],
+      'corner_fused_objects':[_compact_obj(o) for o in core.get('corner_fused_objects',[])],
+      'front_sensor_objects':[_compact_obj(o) for o in core.get('front_sensor_objects',[])],
       'camera_leads':[_compact_obj(o) for o in core.get('camera_leads',[])],
       'camera_matches':core.get('camera_fusion_matches',[]),
+      'camera_fusion_stats':core.get('camera_fusion_stats',{}),
+      'corner_fusion_stats':core.get('corner_fusion_stats',{}),
       'scc_teacher':core.get('scc_teacher',{}),
       'rear_teacher':core.get('teacher_rear',[]),
       'corner_front_associations':core.get('corner_front_associations',[]),
