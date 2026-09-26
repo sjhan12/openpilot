@@ -1,3 +1,1 @@
-"""G80 5-radar monitor/shadow package."""
-G80_RADAR_PACKAGE_VERSION = 20
-MONITOR_ONLY = True
+# G80 5-radar monitor-only package V21: C4 curved road, perspective UI, corner-sector colors.

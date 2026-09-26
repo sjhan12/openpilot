@@ -104,8 +104,20 @@ def filtered_objects(raw,teacher_rear):
 def occupied_zones(objects):
     zones={k:{"occupied":False,"nearest":None} for k in ("left2","left1","ego","right1","right2")}
     for o in objects:
-        lane_y=float(o.get("road_d",o["y"]))
-        name=lane_name(lane_index(lane_y))
+        # V21: forward targets outside the C4 path horizon are intentionally
+        # unclassified. Do not re-introduce a raw-y lane label here.
+        if o.get("road_lane_source") in ("c4_path_out_of_range", "c4_path_no_projection"):
+            continue
+        if o.get("road_lane") in zones:
+            name=o.get("road_lane")
+        else:
+            rd=o.get("road_d")
+            if rd is None:
+                rd=o.get("y")
+            try:
+                name=lane_name(lane_index(float(rd)))
+            except Exception:
+                continue
         if name not in zones:continue
         x=float(o["x"])
         if -30<=x<=60:

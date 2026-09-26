@@ -39,7 +39,9 @@ def _compact_obj(o: dict) -> dict:
     'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
     'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
     'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
-    'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged'
+    'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
+    'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid',
+    'preview_quality'
   )
   return {k:o.get(k) for k in keys if k in o and o.get(k) is not None}
 
@@ -102,8 +104,8 @@ class ShadowLogger:
       header = {
         'type':'header',
         'format':'g80_shadow_log',
-        'format_version':3,
-        'service_version':20,
+        'format_version':4,
+        'service_version':21,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
           'hz':self.hz,
@@ -163,6 +165,18 @@ class ShadowLogger:
       'v_ego_recv_ns':int(v_ego_recv_ns or 0),
       'model_path_recv_ns':int(model_path_recv_ns or 0),
       'model_path':[[round(float(x),3),round(float(y),3)] for x,y in (model_path or [])],
+      'road_model_summary':{
+        'fresh':(core.get('road_model',{}) or {}).get('fresh'),
+        'age_ms':(core.get('road_model',{}) or {}).get('age_ms'),
+        'curve_direction':(core.get('road_model',{}) or {}).get('curve_direction'),
+        'path_x_min_m':(core.get('road_model',{}) or {}).get('path_x_min_m'),
+        'path_x_max_m':(core.get('road_model',{}) or {}).get('path_x_max_m'),
+        'path_y_20m':(core.get('road_model',{}) or {}).get('path_y_20m'),
+        'path_y_40m':(core.get('road_model',{}) or {}).get('path_y_40m'),
+        'path_y_60m':(core.get('road_model',{}) or {}).get('path_y_60m'),
+        'lane_line_probs':(core.get('road_model',{}) or {}).get('lane_line_probs',[]),
+        'confident_lane_lines':(core.get('road_model',{}) or {}).get('confident_lane_lines'),
+      },
       'shadow':shadow,
       'sensor_fused_objects':[_compact_obj(o) for o in core.get('sensor_fused_objects',[])],
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],

@@ -1,16 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
+
+def _sector_color_key(o: dict) -> str | None:
+  src = str(o.get('source',''))
+  sources = o.get('vehicle_cluster_sources') or []
+  has_corner = src.startswith('corner') or o.get('corner_link_id') is not None or any(str(v).startswith('corner') for v in sources)
+  if not has_corner:
+    return None
+  sec = o.get('sector')
+  if sec in ('FL','FR','RL','RR'):
+    return sec
+  try:
+    x, y = float(o.get('x')), float(o.get('y'))
+    if x > 0.5 and y > 1.2: return 'FL'
+    if x > 0.5 and y < -1.2: return 'FR'
+    if x < -0.5 and y > 1.2: return 'RL'
+    if x < -0.5 and y < -1.2: return 'RR'
+  except Exception:
+    pass
+  return None
 
 def _obj(o: dict) -> dict:
   d={'id':o.get('key'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx'),'source':o.get('source')}
+  ck=_sector_color_key(o)
+  if ck is not None:d['corner_color_key']=ck
   for k in ('sector','front_sector','corner_fused_id','member_count','teacher_match','scc_teacher_confirmed',
             'front_link','corner_link_id','confidence','camera_confirmed','camera_prob','camera_id','camera_key',
             'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps',
             'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
             'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
             'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
-            'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source'):
+            'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','preview_quality'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 
@@ -42,6 +63,6 @@ def build_render_packet(state: dict) -> dict:
       'short':{'rear_m':-15,'front_m':35,'metric_1to1':True},
       'long':{'rear_m':-50,'front_m':100,'metric_1to1':True},
       'wide':{'rear_m':-30,'front_m':70,'lateral_m':12.6,'metric_1to1':False},
-      'drive':{'rear_m':-15,'front_m':45,'lateral_m':5.8,'lanes_total':3,'metric_1to1':False},
+      'drive':{'rear_m':-12,'front_m':40,'lateral_m':7.2,'lanes_total':3,'metric_1to1':False,'perspective':True},
     },
   }

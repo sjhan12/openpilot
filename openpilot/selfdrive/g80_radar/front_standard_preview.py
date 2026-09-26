@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Future standard-radard FRONT adapter preview for G80 V20.
+"""Future standard-radard FRONT adapter preview for G80 V21.
 
 MONITOR-ONLY CONTRACT
 ---------------------
@@ -36,6 +36,7 @@ REID_DV_MPS = 3.0
 FRESH_MS = 180.0
 MIN_CONSECUTIVE = 2
 TRACK_TTL_NS = 450_000_000
+INVALID_SENTINEL_X_M = 204.75  # 0xFFF * 0.05 m; observed default/no-target pattern
 
 
 def _f(v, default=None):
@@ -53,6 +54,10 @@ def _valid_raw(o: dict) -> bool:
   if x is None or y is None or vx is None:
     return False
   if not (0.5 <= x <= 220.0 and abs(y) <= 12.0 and abs(vx) <= 80.0):
+    return False
+  # New 2026-09-26 log: x=204.75m (=0xFFF*0.05), y=0, vRel=0, OID=00
+  # repeated nearly every frame. Treat it as an invalid/no-target sentinel.
+  if abs(x - INVALID_SENTINEL_X_M) <= 0.03 and abs(y) <= 0.05 and abs(vx) <= 0.05:
     return False
   if float(o.get('display_age_ms', 1e9) or 1e9) > FRESH_MS:
     return False
@@ -76,7 +81,13 @@ def _cluster_ok(group: list[dict]) -> bool:
 
 def dedup_group1(objects: list[dict]) -> tuple[list[dict], dict]:
   """Complete-link de-dup inside one passenger-car-sized front return group."""
-  cand = [dict(o) for o in objects if _valid_raw(o)]
+  source_objs = [dict(o) for o in objects if o.get('source') == SOURCE]
+  sentinel_count = 0
+  for o in source_objs:
+    x, y, vx = _f(o.get('x')), _f(o.get('y')), _f(o.get('vx'))
+    if x is not None and y is not None and vx is not None and abs(x-INVALID_SENTINEL_X_M)<=0.03 and abs(y)<=0.05 and abs(vx)<=0.05:
+      sentinel_count += 1
+  cand = [o for o in source_objs if _valid_raw(o)]
   order = sorted(range(len(cand)), key=lambda i:(
     int(cand[i].get('track_consecutive', 0) or 0),
     -abs(float(cand[i]['y'])),
@@ -111,6 +122,7 @@ def dedup_group1(objects: list[dict]) -> tuple[list[dict], dict]:
     'group1_fresh_before_dedup': len(cand),
     'group1_after_dedup': len(out),
     'group1_duplicates_merged': max(0, len(cand)-len(out)),
+    'group1_invalid_sentinel_rejected': sentinel_count,
   }
 
 
@@ -223,6 +235,13 @@ class StandardFrontPreview:
         p.update({'camera_match':True,'camera_key':c.get('key'),
                   'camera_dx_m':round(dx,3),'camera_dy_m':round(dy,3),'camera_dv_mps':round(dv,3),
                   'camera_prob':c.get('camera_prob',c.get('prob'))})
+      # Monitor-only confidence label. This does not gate control because V21 has no control path.
+      if p.get('reference_match') and p.get('camera_match'):
+        p['preview_quality'] = 'CONFIRMED'
+      elif p.get('reference_match') or p.get('camera_match'):
+        p['preview_quality'] = 'CORROBORATED'
+      else:
+        p['preview_quality'] = 'CANDIDATE'
       points.append(p)
 
     teacher_error = None
@@ -246,11 +265,16 @@ class StandardFrontPreview:
         p['scc_teacher_candidate'] = True
         p['scc_teacher_dx_m'] = round(dx,3)
         p['scc_teacher_dv_mps'] = round(dv,3)
+        if dx <= 5.0 and (tv is None or dv <= 5.0):
+          p['preview_quality'] = 'CONFIRMED'
 
     stats.update({
       'preview_track_count':len(points),
       'reference_match_count':sum(1 for p in points if p.get('reference_match')),
       'camera_match_count':sum(1 for p in points if p.get('camera_match')),
+      'confirmed_count':sum(1 for p in points if p.get('preview_quality') == 'CONFIRMED'),
+      'corroborated_count':sum(1 for p in points if p.get('preview_quality') == 'CORROBORATED'),
+      'candidate_count':sum(1 for p in points if p.get('preview_quality') == 'CANDIDATE'),
       'scc_teacher_candidate':teacher_key,
       'scc_teacher_dx_m':teacher_error,
       'publishes_radarTracks':False,
