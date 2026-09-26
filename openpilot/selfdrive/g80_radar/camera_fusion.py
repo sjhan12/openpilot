@@ -96,7 +96,7 @@ class CameraRadarFusion:
     if r.get('scc_teacher_confirmed') and abs(float(cam['y']))<1.8: cost-=.20
     return cost,dx,dy,dv
 
-  def update(self,radar_objects,camera_leads,now_ns):
+  def update(self,radar_objects,camera_leads,now_ns,front_objects=None):
     radar=[dict(o) for o in radar_objects]
     fresh=[dict(c) for c in camera_leads if -50_000_000 <= now_ns-int(c.get('recv_ns',0)) <= CAM_MAX_AGE_NS]
 
@@ -146,7 +146,22 @@ class CameraRadarFusion:
       self.sticky.pop(k,None)
 
     all_objs=radar+camera_only
-    front=[dict(o) for o in all_objs if float(o.get('x',-999))>=-.5 and abs(float(o.get('y',999)))<=5.8]
+    # Keep the FRONT view in the front-radar domain. The fused radar list also
+    # contains corner tracks; spatial filtering alone used to copy them here.
+    front_source = front_objects if front_objects is not None else [
+      o for o in radar if o.get('source') in ('front_track','fr_cmr_reference')]
+    front=[]
+    for o in front_source:
+      if float(o.get('x',-999)) < -.5 or abs(float(o.get('y',999))) > 5.8: continue
+      item=dict(o)
+      match=next((r for r in radar if r.get('key')==item.get('key') or
+                  r.get('front_link')==item.get('front_key',item.get('key'))),None)
+      if match and match.get('camera_confirmed'):
+        for k in ('camera_confirmed','camera_id','camera_key','camera_prob',
+                  'camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps','sensor_fusion'):
+          if k in match: item[k]=match[k]
+      front.append(item)
+    front.extend(dict(o) for o in camera_only if abs(float(o.get('y',999)))<=5.8)
     return {
       'sensor_fused_objects':all_objs,
       'front_sensor_objects':front,
