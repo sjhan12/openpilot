@@ -103,7 +103,7 @@ class ShadowLogger:
         'type':'header',
         'format':'g80_shadow_log',
         'format_version':3,
-        'service_version':19,
+        'service_version':20,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
           'hz':self.hz,

@@ -104,7 +104,8 @@ def filtered_objects(raw,teacher_rear):
 def occupied_zones(objects):
     zones={k:{"occupied":False,"nearest":None} for k in ("left2","left1","ego","right1","right2")}
     for o in objects:
-        name=lane_name(lane_index(float(o["y"])))
+        lane_y=float(o.get("road_d",o["y"]))
+        name=lane_name(lane_index(lane_y))
         if name not in zones:continue
         x=float(o["x"])
         if -30<=x<=60:

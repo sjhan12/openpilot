@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 def _obj(o: dict) -> dict:
   d={'id':o.get('key'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx'),'source':o.get('source')}
@@ -9,7 +9,8 @@ def _obj(o: dict) -> dict:
             'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps',
             'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
             'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
-            'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged'):
+            'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
+            'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 
@@ -33,6 +34,7 @@ def build_render_packet(state: dict) -> dict:
     'rear_teacher':state.get('teacher_rear',[]),
     'scc_teacher':state.get('scc_teacher',{}),
     'scc_front_match':state.get('scc_front_match',{}),
+    'road_model':state.get('road_model',{}),
     'scc_teacher_by_bus':state.get('scc_teacher_by_bus',{}),
     'associations':state.get('corner_front_associations',[]),
     'fusion_stats':state.get('corner_fusion_stats',{}),

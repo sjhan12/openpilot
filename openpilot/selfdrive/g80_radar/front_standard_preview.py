@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Future standard-radard FRONT adapter preview for G80 V19.
+"""Future standard-radard FRONT adapter preview for G80 V20.
 
 MONITOR-ONLY CONTRACT
 ---------------------
