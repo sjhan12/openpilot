@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 
 def _sector_color_key(o: dict) -> str | None:
   src = str(o.get('source',''))
@@ -31,7 +31,10 @@ def _obj(o: dict) -> dict:
             'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
             'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
             'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
-            'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','preview_quality'):
+            'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','preview_quality',
+            'kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma',
+            'kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot','kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane',
+            'kf_ttlc_s','kf_lateral_motion','kf_motion_confident','kf_cutin_candidate','kalman_trajectory'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 
@@ -56,6 +59,7 @@ def build_render_packet(state: dict) -> dict:
     'scc_teacher':state.get('scc_teacher',{}),
     'scc_front_match':state.get('scc_front_match',{}),
     'road_model':state.get('road_model',{}),
+    'kalman_motion_stats':state.get('kalman_motion_stats',{}),
     'scc_teacher_by_bus':state.get('scc_teacher_by_bus',{}),
     'associations':state.get('corner_front_associations',[]),
     'fusion_stats':state.get('corner_fusion_stats',{}),

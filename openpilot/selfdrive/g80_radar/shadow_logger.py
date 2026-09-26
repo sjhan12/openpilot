@@ -41,7 +41,10 @@ def _compact_obj(o: dict) -> dict:
     'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid',
-    'preview_quality'
+    'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s',
+    'kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma','kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot',
+    'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident','kf_cutin_candidate',
+    'kalman_trajectory'
   )
   return {k:o.get(k) for k in keys if k in o and o.get(k) is not None}
 
@@ -104,8 +107,8 @@ class ShadowLogger:
       header = {
         'type':'header',
         'format':'g80_shadow_log',
-        'format_version':4,
-        'service_version':21,
+        'format_version':5,
+        'service_version':22,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
           'hz':self.hz,
@@ -115,6 +118,8 @@ class ShadowLogger:
           'log_dir':str(self.log_dir),
           'vehicle_footprint_m':[4.8,2.1],
           'vehicle_vrel_gate_mps':3.0,
+          'kalman_model':'CA-6D Cartesian + CA-6D Frenet',
+          'kalman_horizons_s':[0.5,1.0,2.0,3.0],
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -134,7 +139,7 @@ class ShadowLogger:
     self.fp.write(s + '\n')
     self.uncompressed_bytes += len(s.encode('utf-8')) + 1
 
-  def _signature(self, shadow: dict):
+  def _signature(self, shadow: dict, kalman_stats: dict | None = None):
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
     st = shadow.get('stats', {}) or {}
@@ -144,6 +149,7 @@ class ShadowLogger:
       int(st.get('confirmed_cutin_count', 0) or 0),
       int(st.get('stationary_supported_count', 0) or 0),
       bool(st.get('path_valid')), bool(st.get('v_ego_valid')),
+      int((kalman_stats or {}).get('cutin_candidates', 0) or 0),
     )
 
   def _rotate_due(self, now_mono: float) -> bool:
@@ -184,6 +190,9 @@ class ShadowLogger:
       'front_sensor_objects':[_compact_obj(o) for o in core.get('front_sensor_objects',[])],
       'standard_front_preview':core.get('standard_front_preview',[]),
       'standard_front_preview_stats':core.get('standard_front_preview_stats',{}),
+      'kalman_motion_stats':core.get('kalman_motion_stats',{}),
+      'corner_kalman_motion_stats':core.get('corner_kalman_motion_stats',{}),
+      'front_kalman_motion_stats':core.get('front_kalman_motion_stats',{}),
       'camera_leads':[_compact_obj(o) for o in core.get('camera_leads',[])],
       'camera_matches':core.get('camera_fusion_matches',[]),
       'camera_fusion_stats':core.get('camera_fusion_stats',{}),
@@ -209,7 +218,7 @@ class ShadowLogger:
 
     now_mono = time.monotonic()
     shadow = core.get('shadow_leads', {}) or {}
-    sig = self._signature(shadow)
+    sig = self._signature(shadow, core.get('kalman_motion_stats', {}))
     event = self.last_signature is not None and sig != self.last_signature
     self.last_signature = sig
 

@@ -1,1 +1,1 @@
-# G80 5-radar monitor-only package V21: C4 curved road, perspective UI, corner-sector colors.
+# G80 5-radar monitor-only package V22: C4 road model + CA Kalman trajectory prediction.

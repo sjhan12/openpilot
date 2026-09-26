@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Future standard-radard FRONT adapter preview for G80 V21.
+"""Future standard-radard FRONT adapter preview for G80 V22.
 
 MONITOR-ONLY CONTRACT
 ---------------------
@@ -235,7 +235,7 @@ class StandardFrontPreview:
         p.update({'camera_match':True,'camera_key':c.get('key'),
                   'camera_dx_m':round(dx,3),'camera_dy_m':round(dy,3),'camera_dv_mps':round(dv,3),
                   'camera_prob':c.get('camera_prob',c.get('prob'))})
-      # Monitor-only confidence label. This does not gate control because V21 has no control path.
+      # Monitor-only confidence label. This does not gate control because V22 has no control path.
       if p.get('reference_match') and p.get('camera_match'):
         p['preview_quality'] = 'CONFIRMED'
       elif p.get('reference_match') or p.get('camera_match'):

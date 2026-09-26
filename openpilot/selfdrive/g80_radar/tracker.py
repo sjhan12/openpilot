@@ -104,7 +104,7 @@ def filtered_objects(raw,teacher_rear):
 def occupied_zones(objects):
     zones={k:{"occupied":False,"nearest":None} for k in ("left2","left1","ego","right1","right2")}
     for o in objects:
-        # V21: forward targets outside the C4 path horizon are intentionally
+        # V22: forward targets outside the C4 path horizon are intentionally
         # unclassified. Do not re-introduce a raw-y lane label here.
         if o.get("road_lane_source") in ("c4_path_out_of_range", "c4_path_no_projection"):
             continue

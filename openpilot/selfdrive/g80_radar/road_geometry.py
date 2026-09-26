@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C4 modelV2 road geometry helpers for G80 radar monitor V21.
+"""C4 modelV2 road geometry helpers for G80 radar monitor V22.
 
 MONITOR-ONLY: this module only reads modelV2 geometry and annotates display
 objects. It does not publish radarTracks/radarState and never sends CAN.
@@ -167,7 +167,7 @@ def _path_coverage(path: list[dict]) -> tuple[float, float] | None:
 def project_to_path(x: float, y: float, road_model: dict | None) -> dict | None:
   """Project a radar Cartesian point onto the C4 path and return Frenet-like s,d.
 
-  V21 refuses projection outside the C4 path horizon (except a small margin),
+  V22 refuses projection outside the C4 path horizon (except a small margin),
   preventing far targets from being snapped onto the last path endpoint.
   d is positive to the left. s is arc length from the first model point.
   """
@@ -218,6 +218,39 @@ def project_to_path(x: float, y: float, road_model: dict | None) -> dict | None:
     'distance_to_path_m': round(math.sqrt(dist2), 3),
     'segment': int(seg_i),
   }
+
+
+def frenet_to_xy(s: float, d: float, road_model: dict | None) -> tuple[float, float] | None:
+  """Convert Frenet-like path coordinates back to ego Cartesian x/y.
+
+  Returns None when s is outside the observed C4 path horizon. No extrapolation
+  beyond the camera path is performed; trajectory points then keep Cartesian KF
+  prediction instead of inventing road curvature.
+  """
+  if not road_model or not road_model.get('fresh', road_model.get('valid', False)):
+    return None
+  path = road_model.get('path', [])
+  if len(path) < 2:
+    return None
+  target = float(s)
+  s_acc = 0.0
+  for i in range(len(path) - 1):
+    x0, y0 = float(path[i]['x']), float(path[i]['y'])
+    x1, y1 = float(path[i + 1]['x']), float(path[i + 1]['y'])
+    dx, dy = x1 - x0, y1 - y0
+    seg = math.hypot(dx, dy)
+    if seg < 1e-8:
+      continue
+    if target <= s_acc + seg:
+      if target < s_acc - 1e-6:
+        return None
+      t = max(0.0, min(1.0, (target - s_acc) / seg))
+      qx, qy = x0 + t * dx, y0 + t * dy
+      # Unit normal points to vehicle-left, consistent with project_to_path d.
+      nx, ny = -dy / seg, dx / seg
+      return qx + nx * float(d), qy + ny * float(d)
+    s_acc += seg
+  return None
 
 
 def lane_index_from_d(d: float) -> int:
