@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-G80 RG3 2021 radar decoder - v5 FUSED build.
+G80 RG3 2021 radar decoder - V19 MONITOR build.
 
 Receive-only decoder.
 A/B corner empirical mapping:

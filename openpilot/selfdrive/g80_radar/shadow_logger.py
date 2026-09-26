@@ -61,6 +61,7 @@ class ShadowLogger:
 
     self.fp = None
     self.path: Path | None = None
+    self.final_path: Path | None = None
     self.file_start_mono = 0.0
     self.next_periodic_mono = 0.0
     self.next_flush_mono = 0.0
@@ -77,12 +78,12 @@ class ShadowLogger:
   def _filename(self) -> Path:
     stamp = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
     base = self.log_dir / f'shadow_{stamp}.jsonl.gz'
-    if not base.exists():
+    if not base.exists() and not Path(str(base) + '.part').exists():
       return base
     i = 1
     while True:
       p = self.log_dir / f'shadow_{stamp}_{i:02d}.jsonl.gz'
-      if not p.exists():
+      if not p.exists() and not Path(str(p) + '.part').exists():
         return p
       i += 1
 
@@ -91,7 +92,8 @@ class ShadowLogger:
       return
     try:
       self.log_dir.mkdir(parents=True, exist_ok=True)
-      self.path = self._filename()
+      self.final_path = self._filename()
+      self.path = Path(str(self.final_path) + '.part')
       self.fp = gzip.open(self.path, 'at', encoding='utf-8', compresslevel=5)
       self.file_start_mono = now_mono
       self.next_flush_mono = now_mono + self.flush_sec
@@ -100,8 +102,8 @@ class ShadowLogger:
       header = {
         'type':'header',
         'format':'g80_shadow_log',
-        'format_version':2,
-        'service_version':17,
+        'format_version':3,
+        'service_version':19,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
           'hz':self.hz,
@@ -166,6 +168,8 @@ class ShadowLogger:
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],
       'corner_fused_objects':[_compact_obj(o) for o in core.get('corner_fused_objects',[])],
       'front_sensor_objects':[_compact_obj(o) for o in core.get('front_sensor_objects',[])],
+      'standard_front_preview':core.get('standard_front_preview',[]),
+      'standard_front_preview_stats':core.get('standard_front_preview_stats',{}),
       'camera_leads':[_compact_obj(o) for o in core.get('camera_leads',[])],
       'camera_matches':core.get('camera_fusion_matches',[]),
       'camera_fusion_stats':core.get('camera_fusion_stats',{}),
@@ -256,6 +260,8 @@ class ShadowLogger:
 
   def close(self):
     fp = self.fp
+    part = self.path
+    final = self.final_path
     self.fp = None
     if fp is not None:
       try:
@@ -266,3 +272,11 @@ class ShadowLogger:
         fp.close()
       except Exception:
         pass
+      # Only a cleanly closed gzip stream receives the final .jsonl.gz name.
+      # Abrupt power loss leaves *.part, clearly marking a possibly truncated log.
+      if part is not None and final is not None:
+        try:
+          part.replace(final)
+          self.path = final
+        except Exception as e:
+          self.last_error = f'finalize: {type(e).__name__}: {e}'
