@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C4 modelV2 road geometry helpers for G80 radar monitor V22.
+"""C4 modelV2 road geometry helpers for G80 radar monitor V29.
 
 MONITOR-ONLY: this module only reads modelV2 geometry and annotates display
 objects. It does not publish radarTracks/radarState and never sends CAN.
@@ -21,8 +21,8 @@ MAX_MODEL_POINTS = 65
 ROAD_MODEL_MAX_AGE_NS = 700_000_000
 # Do not project a radar object far beyond the C4 path horizon. V20 used the
 # last path segment endpoint and could create impossible lane-28/lane-40 tags.
-PATH_PROJECTION_MARGIN_M = 4.0
-PATH_BACK_MARGIN_M = 2.0
+PATH_PROJECTION_MARGIN_M = 0.75
+PATH_BACK_MARGIN_M = 1.0
 MAX_PROJECTION_D_M = 12.5
 
 
@@ -200,14 +200,24 @@ def project_to_path(x: float, y: float, road_model: dict | None) -> dict | None:
     cross = dx * ey - dy * ex
     d = math.copysign(math.sqrt(dist2), cross) if dist2 > 0.0 else 0.0
     s = s_acc + tc * seg
-    candidate = (dist2, s, d, qx, qy, i)
+    candidate = (dist2, s, d, qx, qy, i, t, seg)
     if best is None or candidate[0] < best[0]:
       best = candidate
     s_acc += seg
 
   if best is None:
     return None
-  dist2, s, d, qx, qy, seg_i = best
+  dist2, s, d, qx, qy, seg_i, raw_t, best_seg = best
+  # V29 endpoint guard: do not convert longitudinal overshoot beyond the observed
+  # C4 path endpoint into a large lateral Frenet d. A small 0.75 m tolerance
+  # absorbs sampling/latency only; there is no geometric extrapolation.
+  endpoint_overshoot_m = 0.0
+  if seg_i == len(path) - 2 and raw_t > 1.0:
+    endpoint_overshoot_m = (raw_t - 1.0) * best_seg
+  elif seg_i == 0 and raw_t < 0.0:
+    endpoint_overshoot_m = (-raw_t) * best_seg
+  if endpoint_overshoot_m > PATH_PROJECTION_MARGIN_M:
+    return None
   if math.sqrt(dist2) > MAX_PROJECTION_D_M:
     return None
   return {
@@ -217,6 +227,7 @@ def project_to_path(x: float, y: float, road_model: dict | None) -> dict | None:
     'path_y': round(qy, 3),
     'distance_to_path_m': round(math.sqrt(dist2), 3),
     'segment': int(seg_i),
+    'endpoint_overshoot_m': round(endpoint_overshoot_m, 3),
   }
 
 
@@ -289,6 +300,7 @@ def annotate_object(o: dict, road_model: dict | None) -> dict:
     dct['road_lane_index'] = lane_index_from_d(projection['d'])
     dct['road_lane'] = lane_name(dct['road_lane_index'])
     dct['road_lane_source'] = 'c4_path'
+    dct['road_projection_endpoint_overshoot_m'] = projection.get('endpoint_overshoot_m', 0.0)
     dct['road_projection_valid'] = True
     return dct
 

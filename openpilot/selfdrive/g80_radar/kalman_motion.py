@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""V24 monitor-only 360-degree motion Kalman tracker.
+"""V29 monitor-only 360-degree motion Kalman tracker.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
 state and short-horizon trajectory predictions for validation.
 
-Two constant-acceleration (CA) filters are maintained per persistent vehicle:
-  Cartesian: [x, vx, ax] and [y, vy, ay]
-  Frenet:    [s, ds, dds] and [d, dd, ddd]
+CA state filters are maintained per persistent vehicle, but V29 deliberately
+uses asymmetric prediction models:
+  longitudinal s/x: constant acceleration (CA)
+  lateral d/y:      CA for the first 0.5 s, then bounded constant velocity (CV)
 
-Frenet is updated only when C4 road projection is valid. Rear objects
-and points outside the C4 path horizon keep Cartesian prediction only.
+This prevents noisy lateral acceleration from exploding 2-3 s predictions.
+Frenet is updated only when C4 road projection is valid. Rear objects and
+points outside the C4 path horizon keep Cartesian prediction only.
 """
 from __future__ import annotations
 
@@ -40,6 +42,13 @@ R_VX = float(os.getenv('G80_KF_R_VX', '0.64'))     # variance, ~0.8 m/s sigma
 R_S = float(os.getenv('G80_KF_R_S', '0.49'))       # projection adds some noise
 R_D = float(os.getenv('G80_KF_R_D', '0.20'))       # ~0.45 m sigma
 R_DS = float(os.getenv('G80_KF_R_DS', '1.00'))
+
+# V29 lateral prediction stabilization. Filter state is left untouched for
+# diagnostics; only future trajectory extrapolation is bounded/damped.
+LATERAL_CA_HORIZON_S = float(os.getenv('G80_KF_LAT_CA_HORIZON_S', '0.5'))
+LATERAL_PRED_MAX_SPEED_MPS = float(os.getenv('G80_KF_LAT_PRED_MAX_SPEED_MPS', '2.0'))
+LATERAL_PRED_MAX_ACCEL_MPS2 = float(os.getenv('G80_KF_LAT_PRED_MAX_ACCEL_MPS2', '1.5'))
+HIGHWAY_CUTIN_MIN_VEGO_MPS = float(os.getenv('G80_KF_HIGHWAY_CUTIN_MIN_VEGO_MPS', '5.0'))
 
 
 def _finite(v, default=None):
@@ -200,7 +209,29 @@ class KalmanMotionTracker:
       return None
     return t if 0.0 <= t <= 10.0 else None
 
-  def _decorate(self, o: dict, t: MotionTrack, road_model: dict | None, now_ns: int) -> dict:
+  @staticmethod
+  def _predict_lateral(axis: AxisCAKalman, horizon_s: float) -> tuple[float, float, float, bool]:
+    """V29 short-CA then bounded-CV lateral prediction.
+
+    The KF state itself remains unmodified. This only constrains trajectory
+    extrapolation used for display/cut-in validation.
+    """
+    h = max(0.0, float(horizon_s))
+    d0, v0, a0 = map(float, axis.x)
+    v = max(-LATERAL_PRED_MAX_SPEED_MPS, min(LATERAL_PRED_MAX_SPEED_MPS, v0))
+    a = max(-LATERAL_PRED_MAX_ACCEL_MPS2, min(LATERAL_PRED_MAX_ACCEL_MPS2, a0))
+    limited = abs(v-v0) > 1e-9 or abs(a-a0) > 1e-9
+    ca_h = min(h, max(0.0, LATERAL_CA_HORIZON_S))
+    d = d0 + v * ca_h + 0.5 * a * ca_h * ca_h
+    v_after = v + a * ca_h
+    v_limited = max(-LATERAL_PRED_MAX_SPEED_MPS, min(LATERAL_PRED_MAX_SPEED_MPS, v_after))
+    limited = limited or abs(v_limited-v_after) > 1e-9
+    if h > ca_h:
+      d += v_limited * (h - ca_h)
+      return float(d), float(v_limited), 0.0, bool(limited)
+    return float(d), float(v_after), float(a), bool(limited)
+
+  def _decorate(self, o: dict, t: MotionTrack, road_model: dict | None, now_ns: int, v_ego: float = 0.0) -> dict:
     dct = dict(o)
     assert t.xk is not None and t.yk is not None
     x, vx, ax = map(float, t.xk.x)
@@ -244,12 +275,14 @@ class KalmanMotionTracker:
     traj = []
     for h in HORIZONS_S:
       cx, cvx, _ = t.xk.predicted(h)
-      cy, cvy, _ = t.yk.predicted(h)
-      item = {'t': h, 'x': round(cx, 3), 'y': round(cy, 3), 'mode': 'cartesian'}
+      cy, cvy, _, y_limited = self._predict_lateral(t.yk, h)
+      item = {'t': h, 'x': round(cx, 3), 'y': round(cy, 3), 'mode': 'cartesian',
+              'lateral_prediction':'ca0.5_cv', 'lateral_limited': bool(y_limited)}
       if frenet_valid:
         ps, pds, _ = t.sk.predicted(h)
-        pd, pdd, _ = t.dk.predicted(h)
+        pd, pdd, _, d_limited = self._predict_lateral(t.dk, h)
         item.update({'s': round(ps, 3), 'd': round(pd, 3), 's_dot': round(pds, 3), 'd_dot': round(pdd, 3),
+                     'lateral_limited': bool(d_limited),
                      'lane_index': lane_index_from_d(pd), 'lane': lane_name(lane_index_from_d(pd))})
         xy = frenet_to_xy(ps, pd, road_model)
         if xy is not None:
@@ -257,6 +290,8 @@ class KalmanMotionTracker:
           item['mode'] = 'frenet'
       traj.append(item)
     dct['kalman_trajectory'] = traj
+    dct['kf_lateral_prediction_mode'] = 'ca0.5_cv'
+    dct['kf_lateral_prediction_limited'] = any(bool(p.get('lateral_limited')) for p in traj)
 
     lane_now = dct.get('kf_lane')
     future_ego = any(p.get('lane') == 'ego' for p in traj if p.get('lane') is not None)
@@ -274,13 +309,16 @@ class KalmanMotionTracker:
       and d_dot is not None and abs(d_dot) <= 3.0
     )
     adjacent_lane = lane_now in ('left1', 'right1')
-    strict_candidate = bool(
+    base_lateral_candidate = bool(
       motion_confident and adjacent_lane and future_ego and ttlc is not None
       and 0.20 <= float(ttlc) <= 3.0
       and d_sig <= 0.70 and dv_sig <= 1.80
       and d_dot is not None and 0.30 <= abs(d_dot) <= 2.50
       and (int(now_ns) - int(t.first_ns)) >= 800_000_000
     )
+    v_ego_f = max(0.0, _finite(v_ego, 0.0) or 0.0)
+    strict_candidate = bool(base_lateral_candidate and v_ego_f >= HIGHWAY_CUTIN_MIN_VEGO_MPS)
+    low_speed_candidate = bool(base_lateral_candidate and v_ego_f < HIGHWAY_CUTIN_MIN_VEGO_MPS)
 
     if strict_candidate:
       if t.cutin_candidate_since_ns == 0 or (t.cutin_last_candidate_ns and int(now_ns) - int(t.cutin_last_candidate_ns) > 350_000_000):
@@ -303,13 +341,16 @@ class KalmanMotionTracker:
       score = 0.45 * ttlc_term + 0.25 * sig_term + 0.30 * persist_term
 
     dct['kf_motion_confident'] = motion_confident
+    dct['kf_lateral_candidate'] = base_lateral_candidate
+    dct['kf_low_speed_lateral_candidate'] = low_speed_candidate
+    dct['kf_cutin_speed_class'] = 'HIGHWAY' if strict_candidate else ('LOW_SPEED' if low_speed_candidate else 'NONE')
     dct['kf_cutin_candidate'] = strict_candidate
     dct['kf_cutin_confirmed'] = confirmed
     dct['kf_cutin_persistence_s'] = round(persistence_s, 3)
     dct['kf_cutin_score'] = round(score, 3)
     return dct
 
-  def update(self, objects: list[dict], road_model: dict | None, now_ns: int) -> tuple[list[dict], dict]:
+  def update(self, objects: list[dict], road_model: dict | None, now_ns: int, v_ego: float = 0.0) -> tuple[list[dict], dict]:
     now_ns = int(now_ns)
     # Predict all live tracks to this publication instant exactly once.
     for t in self.tracks.values():
@@ -357,7 +398,7 @@ class KalmanMotionTracker:
         t.source_keys |= self._source_keys(o)
         updates += 1
       t.last_seen_ns = now_ns
-      out.append(self._decorate(o, t, road_model, now_ns))
+      out.append(self._decorate(o, t, road_model, now_ns, v_ego))
 
     stale = [k for k, t in self.tracks.items() if now_ns - int(t.last_seen_ns) > TRACK_TTL_NS]
     for k in stale:
@@ -365,6 +406,8 @@ class KalmanMotionTracker:
 
     cutins = sum(1 for o in out if o.get('kf_cutin_candidate'))
     confirmed_cutins = sum(1 for o in out if o.get('kf_cutin_confirmed'))
+    low_speed_lateral = sum(1 for o in out if o.get('kf_low_speed_lateral_candidate'))
+    prediction_limited = sum(1 for o in out if o.get('kf_lateral_prediction_limited'))
     frenet_valid = sum(1 for o in out if o.get('kf_frenet_valid'))
     confident = sum(1 for o in out if o.get('kf_motion_confident'))
     lateral_unstable = sum(1 for o in out if o.get('kf_d_dot') is not None and abs(float(o.get('kf_d_dot'))) > 3.0)
@@ -378,7 +421,10 @@ class KalmanMotionTracker:
       'lateral_unstable_tracks': lateral_unstable,
       'cutin_candidates': cutins,
       'cutin_confirmed': confirmed_cutins,
-      'cutin_rule': 'adjacent lane + TTLC 0.2..3.0s + low covariance + >=0.25s persistence',
+      'low_speed_lateral_candidates': low_speed_lateral,
+      'lateral_prediction_limited_tracks': prediction_limited,
+      'cutin_rule': 'vEgo>=5m/s + adjacent lane + TTLC 0.2..3.0s + low covariance + >=0.25s persistence',
+      'lateral_prediction_model': 'CA <=0.5s then bounded CV',
       'model': 'CA-6D cartesian + CA-6D Frenet',
       'horizons_s': list(HORIZONS_S),
       'control_connected': False,

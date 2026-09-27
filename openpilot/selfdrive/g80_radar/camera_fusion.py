@@ -15,7 +15,7 @@ CAM_MAX_AGE_NS = 350_000_000
 PASSENGER_CAR_LENGTH_M = 4.8
 PASSENGER_CAR_WIDTH_M = 2.1
 PASSENGER_CAR_VREL_GATE_MPS = 2.5
-# V28 retains V27 explicit proximity + relative-speed de-dup. Cross-sensor returns from the
+# V29 retains V27 explicit proximity + relative-speed de-dup. Cross-sensor returns from the
 # same physical car may land on different body surfaces, so they get a slightly
 # wider proximity gate. Same-source detections stay tighter to avoid merging two
 # genuine vehicles following closely.
@@ -29,6 +29,8 @@ SAME_CORNER_LENGTH_M = 3.4
 SAME_CORNER_WIDTH_M = 1.8
 SAME_FRONT_LENGTH_M = 2.8
 SAME_FRONT_WIDTH_M = 1.6
+CONTROL_SAFE_FALLBACK_LENGTH_M = 4.0
+CONTROL_SAFE_FALLBACK_WIDTH_M = 1.8
 
 
 def _f0(v, default=None):
@@ -130,6 +132,19 @@ def _near_speed_duplicate(a, b):
   return True
 
 
+def _strong_cross_sensor_evidence(a, b):
+  if _source_identity(a) == _source_identity(b):
+    return False
+  evidence_keys = ('scc_teacher_confirmed','camera_confirmed','teacher_match','rear_teacher_confirmed')
+  if any(bool(a.get(k)) or bool(b.get(k)) for k in evidence_keys):
+    return True
+  if a.get('front_link') or b.get('front_link'):
+    return True
+  if a.get('corner_link_id') is not None or b.get('corner_link_id') is not None:
+    return True
+  return False
+
+
 def _pair_vehicle_compatible(a, b):
   """True when two detections can fit inside one passenger-car footprint.
 
@@ -151,7 +166,13 @@ def _pair_vehicle_compatible(a, b):
     return dx <= SAME_FRONT_LENGTH_M and dy <= SAME_FRONT_WIDTH_M
   if sa==sb=='c4_camera':
     return dx <= PASSENGER_CAR_LENGTH_M and dy <= PASSENGER_CAR_WIDTH_M
-  return dx <= PASSENGER_CAR_LENGTH_M and dy <= PASSENGER_CAR_WIDTH_M
+  # V29 control-safety guard: near+speed duplicates still merge immediately.
+  # For the wider 4.8 x 2.1 m fallback, require independent sensor evidence;
+  # otherwise use a conservative 4.0 x 1.8 m envelope to avoid joining two
+  # tightly spaced real vehicles.
+  if _strong_cross_sensor_evidence(a,b):
+    return dx <= PASSENGER_CAR_LENGTH_M and dy <= PASSENGER_CAR_WIDTH_M
+  return dx <= CONTROL_SAFE_FALLBACK_LENGTH_M and dy <= CONTROL_SAFE_FALLBACK_WIDTH_M
 
 
 def _cluster_envelope_ok(members):
@@ -200,7 +221,13 @@ def _aggregate_vehicle_group(group):
   out['vehicle_span_x_m']=round(max(xs)-min(xs),3)
   out['vehicle_span_y_m']=round(max(ys)-min(ys),3)
   if len(group)>1:
-    out['vehicle_merge_reason']='near_speed' if any(_near_speed_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))) else 'vehicle_footprint'
+    
+    if any(_near_speed_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
+      out['vehicle_merge_reason']='near_speed'
+    elif any(_strong_cross_sensor_evidence(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
+      out['vehicle_merge_reason']='evidence_footprint'
+    else:
+      out['vehicle_merge_reason']='conservative_footprint'
   out['recv_ns']=max(int(o.get('recv_ns',0) or 0) for o in group)
 
   # Evidence is OR/max aggregated so removing duplicate rectangles never removes
@@ -292,6 +319,8 @@ def fuse_vehicle_footprints(objects):
     'near_cross_source_dist_m':NEAR_CROSS_SOURCE_DIST_M,
     'near_same_source_dv_mps':NEAR_SAME_SOURCE_DV_MPS,
     'near_cross_source_dv_mps':NEAR_CROSS_SOURCE_DV_MPS,
+    'control_safe_fallback_length_m':CONTROL_SAFE_FALLBACK_LENGTH_M,
+    'control_safe_fallback_width_m':CONTROL_SAFE_FALLBACK_WIDTH_M,
   }
 
 
