@@ -14,11 +14,21 @@ CAM_MAX_AGE_NS = 350_000_000
 # radar tracks use a tighter envelope to avoid joining two real vehicles.
 PASSENGER_CAR_LENGTH_M = 4.8
 PASSENGER_CAR_WIDTH_M = 2.1
-PASSENGER_CAR_VREL_GATE_MPS = 3.0
-SAME_CORNER_LENGTH_M = 3.2
-SAME_CORNER_WIDTH_M = 1.7
-SAME_FRONT_LENGTH_M = 2.6
-SAME_FRONT_WIDTH_M = 1.5
+PASSENGER_CAR_VREL_GATE_MPS = 2.5
+# V28 retains V27 explicit proximity + relative-speed de-dup. Cross-sensor returns from the
+# same physical car may land on different body surfaces, so they get a slightly
+# wider proximity gate. Same-source detections stay tighter to avoid merging two
+# genuine vehicles following closely.
+NEAR_SAME_SOURCE_DIST_M = 2.2
+NEAR_CROSS_SOURCE_DIST_M = 3.5
+NEAR_SAME_SOURCE_DY_M = 1.5
+NEAR_CROSS_SOURCE_DY_M = 2.0
+NEAR_SAME_SOURCE_DV_MPS = 1.5
+NEAR_CROSS_SOURCE_DV_MPS = 2.0
+SAME_CORNER_LENGTH_M = 3.4
+SAME_CORNER_WIDTH_M = 1.8
+SAME_FRONT_LENGTH_M = 2.8
+SAME_FRONT_WIDTH_M = 1.6
 
 
 def _f0(v, default=None):
@@ -91,6 +101,35 @@ def _speed_compatible(a, b, gate=PASSENGER_CAR_VREL_GATE_MPS):
   return av is None or bv is None or abs(av-bv) <= gate
 
 
+def _source_identity(o):
+  src=str(o.get('source',''))
+  sensor=str(o.get('sensor',''))
+  return (src,sensor)
+
+
+def _near_speed_duplicate(a, b):
+  """V28 (retains V27) hard de-dup gate: nearby + similar relative velocity => one car.
+
+  Same-source detections stay tighter; cross-sensor/camera representations get
+  a wider gate. The lateral cap prevents abreast adjacent-lane cars merging.
+  """
+  ax=_finite(a.get('x')); ay=_finite(a.get('y'))
+  bx=_finite(b.get('x')); by=_finite(b.get('y'))
+  if None in (ax,ay,bx,by):
+    return False
+  same=_source_identity(a)==_source_identity(b)
+  dist_gate=NEAR_SAME_SOURCE_DIST_M if same else NEAR_CROSS_SOURCE_DIST_M
+  dy_gate=NEAR_SAME_SOURCE_DY_M if same else NEAR_CROSS_SOURCE_DY_M
+  dv_gate=NEAR_SAME_SOURCE_DV_MPS if same else NEAR_CROSS_SOURCE_DV_MPS
+  dx=ax-bx; dy=ay-by
+  if abs(dy)>dy_gate or math.hypot(dx,dy)>dist_gate:
+    return False
+  av=_finite(a.get('vx')); bv=_finite(b.get('vx'))
+  if av is not None and bv is not None and abs(av-bv)>dv_gate:
+    return False
+  return True
+
+
 def _pair_vehicle_compatible(a, b):
   """True when two detections can fit inside one passenger-car footprint.
 
@@ -103,6 +142,8 @@ def _pair_vehicle_compatible(a, b):
   if None in (ax,ay,bx,by) or not _speed_compatible(a,b):
     return False
   dx=abs(ax-bx); dy=abs(ay-by)
+  if _near_speed_duplicate(a,b):
+    return True
   sa=str(a.get('source','')); sb=str(b.get('source',''))
   if sa==sb=='corner_fused':
     return dx <= SAME_CORNER_LENGTH_M and dy <= SAME_CORNER_WIDTH_M
@@ -158,12 +199,19 @@ def _aggregate_vehicle_group(group):
   out['vehicle_footprint_merged']=len(group)>1
   out['vehicle_span_x_m']=round(max(xs)-min(xs),3)
   out['vehicle_span_y_m']=round(max(ys)-min(ys),3)
+  if len(group)>1:
+    out['vehicle_merge_reason']='near_speed' if any(_near_speed_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))) else 'vehicle_footprint'
   out['recv_ns']=max(int(o.get('recv_ns',0) or 0) for o in group)
 
   # Evidence is OR/max aggregated so removing duplicate rectangles never removes
   # a useful camera/SCC/front/rear confirmation carried by another member.
-  for k in ('teacher_match','scc_teacher_confirmed','camera_confirmed'):
+  for k in ('teacher_match','rear_teacher_confirmed','scc_teacher_confirmed','camera_confirmed'):
     if any(bool(o.get(k)) for o in group): out[k]=True
+  rear_members=[o for o in group if o.get('teacher_match') or o.get('rear_teacher_confirmed')]
+  if rear_members:
+    best_rear=min(rear_members,key=lambda o:float(o.get('teacher_error_m',999.0) or 999.0))
+    for k in ('teacher_error_m','rear_teacher_sector','rear_teacher_distance_m','rear_teacher_predicted_distance_m','rear_teacher_match_gate_m'):
+      if best_rear.get(k) is not None: out[k]=best_rear.get(k)
   if any(o.get('front_link') for o in group):
     out['front_link']=next(o.get('front_link') for o in group if o.get('front_link'))
   if any(o.get('corner_link_id') is not None for o in group):
@@ -240,6 +288,10 @@ def fuse_vehicle_footprints(objects):
     'vehicle_clusters_merged':sum(1 for g in groups if len(g)>1),
     'passenger_car_length_m':PASSENGER_CAR_LENGTH_M,
     'passenger_car_width_m':PASSENGER_CAR_WIDTH_M,
+    'near_same_source_dist_m':NEAR_SAME_SOURCE_DIST_M,
+    'near_cross_source_dist_m':NEAR_CROSS_SOURCE_DIST_M,
+    'near_same_source_dv_mps':NEAR_SAME_SOURCE_DV_MPS,
+    'near_cross_source_dv_mps':NEAR_CROSS_SOURCE_DV_MPS,
   }
 
 

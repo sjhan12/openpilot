@@ -3,6 +3,8 @@ from __future__ import annotations
 import time, math
 
 LANE_W=3.6
+REAR_TEACHER_MATCH_GATE_M=0.8
+REAR_TEACHER_VX_COMP_S=0.20
 
 def lane_index(y: float)->int:
     return int(round(y/LANE_W))
@@ -44,17 +46,53 @@ def _teacher_for_side(teacher_rear,left:bool):
     return None
 
 def mark_teacher_matches(objects,teacher_rear):
+    """One-to-one LR/RR teacher association for rear corner tracks.
+
+    V26 logs showed 0x1EA rear-teacher distance agrees very closely with a
+    matched corner track, but the old per-object test could mark two tracks on
+    the same side in the same frame.  Since 0x1EA exposes one teacher target per
+    side, choose exactly one best candidate per LR/RR side.
+    """
     out=[]
-    for o in objects:
-        d=dict(o);d["teacher_match"]=False;d["teacher_error_m"]=None
-        if d.get("source")=="corner24" and float(d["x"])<-0.5 and abs(float(d["y"]))>0.8:
-            td=_teacher_for_side(teacher_rear,float(d["y"])>0)
+    targets={}
+    for t in teacher_rear or []:
+        if t.get("teacher_usable") and t.get("sector") in ("LR","RR"):
+            try: targets[str(t["sector"])]=float(t["distance_candidate_m"])
+            except Exception: pass
+
+    best={}
+    for idx,o in enumerate(objects):
+        d=dict(o)
+        d["teacher_match"]=False
+        d["rear_teacher_confirmed"]=False
+        d["teacher_error_m"]=None
+        d["rear_teacher_sector"]=None
+        d["rear_teacher_distance_m"]=None
+        d["rear_teacher_predicted_distance_m"]=None
+        if d.get("source")=="corner24" and float(d["x"])<-.5 and abs(float(d["y"]))>.8:
+            side="LR" if float(d["y"])>0 else "RR"
+            td=targets.get(side)
             if td is not None:
-                vx=d.get("vx");pred=-float(d["x"])
-                if vx is not None: pred+=0.20*float(vx)
-                err=abs(pred-td);d["teacher_error_m"]=round(err,3)
-                if err<=1.0:d["teacher_match"]=True
+                vx=d.get("vx")
+                pred=-float(d["x"])
+                if vx is not None: pred+=REAR_TEACHER_VX_COMP_S*float(vx)
+                err=abs(pred-td)
+                d["rear_teacher_sector"]=side
+                d["rear_teacher_distance_m"]=round(td,3)
+                d["rear_teacher_predicted_distance_m"]=round(pred,3)
+                d["teacher_error_m"]=round(err,3)
+                coast=int(d.get("coast_count",0) or 0)
+                consecutive=int(d.get("track_consecutive",0) or 0)
+                score=(err,coast,-consecutive,abs(float(d["y"])))
+                if side not in best or score<best[side][0]:
+                    best[side]=(score,idx)
         out.append(d)
+
+    for side,(score,idx) in best.items():
+        if score[0] <= REAR_TEACHER_MATCH_GATE_M:
+            out[idx]["teacher_match"]=True
+            out[idx]["rear_teacher_confirmed"]=True
+            out[idx]["rear_teacher_match_gate_m"]=REAR_TEACHER_MATCH_GATE_M
     return out
 
 def _corner_pass(o):

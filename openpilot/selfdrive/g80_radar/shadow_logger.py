@@ -37,12 +37,12 @@ def _env_bool(name: str, default: bool) -> bool:
 def _compact_obj(o: dict) -> dict:
   keys = (
     'key','source','x','y','vx','front_sector','sector','corner_fused_id',
-    'member_count','teacher_match','scc_teacher_confirmed','front_link',
+    'member_count','teacher_match','rear_teacher_confirmed','teacher_error_m','rear_teacher_sector','rear_teacher_distance_m','rear_teacher_predicted_distance_m','rear_teacher_match_gate_m','scc_teacher_confirmed','front_link',
     'corner_link_id','camera_confirmed','camera_prob','camera_id','camera_key',
     'camera_only','sensor_fusion','camera_match_cost','camera_dx_m',
     'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
     'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
-    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
+    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid',
     'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s',
@@ -125,6 +125,10 @@ class ShadowLogger:
           'vehicle_vrel_gate_mps':3.0,
           'kalman_model':'CA-6D Cartesian + CA-6D Frenet',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
+          'coordinate_x_origin':'ego_front_bumper_display_reference',
+          'decoded_object_x_adjustment_m':0.0,
+          'rear_teacher_one_to_one':True,
+          'rear_teacher_match_gate_m':0.8,
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -178,6 +182,7 @@ class ShadowLogger:
       'model_path':[[round(float(x),3),round(float(y),3)] for x,y in (model_path or [])],
       'runtime_versions':core.get('runtime_versions',{}),
       'runtime_mismatch':bool(core.get('runtime_mismatch',False)),
+      'coordinate_frame':core.get('coordinate_frame',{}),
       'road_model_summary':{
         'fresh':(core.get('road_model',{}) or {}).get('fresh'),
         'age_ms':(core.get('road_model',{}) or {}).get('age_ms'),
@@ -206,6 +211,7 @@ class ShadowLogger:
       'corner_fusion_stats':core.get('corner_fusion_stats',{}),
       'scc_teacher':core.get('scc_teacher',{}),
       'rear_teacher':core.get('teacher_rear',[]),
+      'rear_teacher_match_stats':core.get('rear_teacher_match_stats',{}),
       'corner_front_associations':core.get('corner_front_associations',[]),
       'zones':core.get('zones',{}),
       'validation_summary':self._validation_summary(core),
@@ -234,7 +240,15 @@ class ShadowLogger:
       'kalman_cutin_confirmed':kf_cutin_confirmed,
       'scc_teacher_usable':bool(teacher.get('teacher_usable')),
       'shadow_l1_present':bool(l1.get('status')),
+      'rear_teacher_usable_count':sum(1 for t in (core.get('teacher_rear',[]) or []) if t.get('teacher_usable')),
+      'rear_teacher_matched_count':int((core.get('rear_teacher_match_stats',{}) or {}).get('matched_count',0) or 0),
     }
+    rear_errors=(core.get('rear_teacher_match_stats',{}) or {}).get('errors_m',[]) or []
+    if rear_errors:
+      try:
+        out['rear_teacher_abs_error_max_m']=round(max(abs(float(v)) for v in rear_errors),3)
+      except Exception:
+        pass
     if teacher.get('teacher_usable') and l1.get('status'):
       try:
         de = float(l1.get('dRel')) - float(teacher.get('distance_m'))

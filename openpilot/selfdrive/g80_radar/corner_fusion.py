@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+# V28 explicit proximity + speed de-dup gates.
+V28_NEAR_SAME_DIST_M = 2.2
+V28_NEAR_SAME_DV_MPS = 1.5
+V28_NEAR_CROSS_DIST_M = 3.5
+V28_NEAR_CROSS_DY_M = 2.0
+V28_NEAR_CROSS_DV_MPS = 2.0
+
 
 def corner_sector(x: float, y: float) -> str:
     if x > 0.5:
@@ -63,9 +70,14 @@ class CornerFusionTracker:
     def _stable_same_pair(self,a,b,now_ns):
         if a.get('sensor') != b.get('sensor'): return False
         dx=float(a['x'])-float(b['x']); dy=float(a['y'])-float(b['y'])
+        dv=self._vx_diff(a,b)
+        dist=math.hypot(dx,dy)
+        # V28 hard near+speed gate is checked before the legacy distance-varying
+        # gate, so close same-sensor duplicate returns merge immediately.
+        if dist<=V28_NEAR_SAME_DIST_M and (dv is None or dv<=V28_NEAR_SAME_DV_MPS):
+            return True
         gx,gy=self._same_gate(a,b)
         if abs(dx)>gx or abs(dy)>gy: return False
-        dv=self._vx_diff(a,b)
         if dv is not None and dv>2.0: return False
 
         ka,kb=self._key(a),self._key(b)
@@ -83,8 +95,6 @@ class CornerFusionTracker:
                          (1-alpha)*st.mean_dy+alpha*dy,
                          .70*st.residual_ema+.30*residual)
         self.same_pair_hist[k]=st
-        dist=math.hypot(dx,dy)
-        if dist<=0.75 and (dv is None or dv<=1.5): return True
         return st.count>=2 and st.residual_ema<=0.65
 
     @staticmethod
@@ -103,18 +113,25 @@ class CornerFusionTracker:
         vx=sum(w*v for w,v in vv)/sum(w for w,_ in vv) if vv else None
         keys=sorted({k for o in members for k in (o.get('member_keys') if isinstance(o.get('member_keys'),list) else [o.get('key')]) if k})
         sensors=sorted({str(o.get('sensor','')) for o in members})
-        return {
+        tm=[o for o in members if o.get('teacher_match')]
+        best_tm=min(tm,key=lambda o:float(o.get('teacher_error_m',999.0) or 999.0)) if tm else None
+        ret={
             'source':'corner_local' if local else 'corner_fused',
             'sensor':'+'.join(sensors),
             'key':('LOCAL:' if local else 'CF:')+'/'.join(keys),
             'x':round(x,3),'y':round(y,3),'vx':None if vx is None else round(vx,3),
             'member_keys':keys,'member_count':len(keys),
             'source_members':[{'key':o.get('key'),'sensor':o.get('sensor'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx')} for o in members],
-            'teacher_match':any(bool(o.get('teacher_match')) for o in members),
+            'teacher_match':bool(best_tm),
+            'rear_teacher_confirmed':bool(best_tm),
             'track_consecutive':max([int(o.get('track_consecutive',0)) for o in members] or [0]),
             'recv_ns':max([int(o.get('recv_ns',0)) for o in members] or [0]),
             'can_log_ns':max([int(o.get('can_log_ns',0)) for o in members] or [0]),
         }
+        if best_tm is not None:
+            for k in ('teacher_error_m','rear_teacher_sector','rear_teacher_distance_m','rear_teacher_predicted_distance_m','rear_teacher_match_gate_m'):
+                if best_tm.get(k) is not None: ret[k]=best_tm.get(k)
+        return ret
 
     def _local_fuse(self, pts, now_ns):
         n=len(pts)
@@ -144,8 +161,11 @@ class CornerFusionTracker:
         if a.get('sensor')==b.get('sensor'): return None
         gx,gy=self._cross_gate(a,b)
         dx=abs(float(a['x'])-float(b['x']));dy=abs(float(a['y'])-float(b['y']))
-        if dx>gx or dy>gy:return None
         dv=self._vx_diff(a,b)
+        dist=math.hypot(dx,dy)
+        if dy<=V28_NEAR_CROSS_DY_M and dist<=V28_NEAR_CROSS_DIST_M and (dv is None or dv<=V28_NEAR_CROSS_DV_MPS):
+            return .15*(dist/V28_NEAR_CROSS_DIST_M)**2 + (0 if dv is None else .10*(dv/V28_NEAR_CROSS_DV_MPS)**2)
+        if dx>gx or dy>gy:return None
         if dv is not None and dv>2.5:return None
         return (dx/gx)**2+(dy/gy)**2+(0 if dv is None else .3*(dv/2.5)**2)
 
@@ -206,5 +226,9 @@ class CornerFusionTracker:
                 'after_cross_corner_fusion':len(fused),
                 'same_sensor_merged_points':max(0,len(corner)-len(locals_)),
                 'cross_source_merged_objects':max(0,len(locals_)-len(fused)),
+                'v28_near_same_dist_m':V28_NEAR_SAME_DIST_M,
+                'v28_near_same_dv_mps':V28_NEAR_SAME_DV_MPS,
+                'v28_near_cross_dist_m':V28_NEAR_CROSS_DIST_M,
+                'v28_near_cross_dv_mps':V28_NEAR_CROSS_DV_MPS,
             }
         }

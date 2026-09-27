@@ -26,11 +26,11 @@ def _obj(o: dict) -> dict:
   d={'id':o.get('key'),'x':o.get('x'),'y':o.get('y'),'vx':o.get('vx'),'source':o.get('source')}
   ck=_sector_color_key(o)
   if ck is not None:d['corner_color_key']=ck
-  for k in ('sector','front_sector','corner_fused_id','member_count','teacher_match','scc_teacher_confirmed',
+  for k in ('sector','front_sector','corner_fused_id','member_count','teacher_match','rear_teacher_confirmed','teacher_error_m','rear_teacher_sector','rear_teacher_distance_m','rear_teacher_predicted_distance_m','rear_teacher_match_gate_m','scc_teacher_confirmed',
             'front_link','corner_link_id','confidence','camera_confirmed','camera_prob','camera_id','camera_key',
             'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps',
             'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
-            'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources',
+            'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
             'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
             'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','preview_quality',
             'kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma',
@@ -46,6 +46,7 @@ def build_render_packet(state: dict) -> dict:
     'protocol':'g80_radar_render','protocol_version':PROTOCOL_VERSION,
     'state_version':state.get('version',0),'mono_ns':state.get('mono_ns',0),
     'runtime_versions':state.get('runtime_versions',{}),'runtime_mismatch':state.get('runtime_mismatch',False),
+    'coordinate_frame':state.get('coordinate_frame',{}),
     'all':[_obj(o) for o in final_all],
     'front':[_obj(o) for o in final_front],
     'corner':[_obj(o) for o in state.get('corner_fused_objects',[])],
@@ -58,6 +59,7 @@ def build_render_packet(state: dict) -> dict:
     'shadow_logger':state.get('shadow_logger',{}),
     'zones':state.get('zones',{}),
     'rear_teacher':state.get('teacher_rear',[]),
+    'rear_teacher_match_stats':state.get('rear_teacher_match_stats',{}),
     'scc_teacher':state.get('scc_teacher',{}),
     'scc_front_match':state.get('scc_front_match',{}),
     'road_model':state.get('road_model',{}),

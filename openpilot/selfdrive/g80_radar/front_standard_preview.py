@@ -26,9 +26,12 @@ import math
 SOURCE = 'front_group1_candidate'
 
 # Keep the de-dup/re-identification geometry aligned with the V17 shadow result.
-SAME_FRONT_DX_M = 2.6
-SAME_FRONT_DY_M = 1.5
-SAME_FRONT_DV_MPS = 3.0
+SAME_FRONT_DX_M = 2.8
+SAME_FRONT_DY_M = 1.6
+SAME_FRONT_DV_MPS = 2.5
+NEAR_FRONT_DIST_M = 2.6
+NEAR_FRONT_DY_M = 1.6
+NEAR_FRONT_DV_MPS = 1.8
 REID_DX_M = 4.8
 REID_DY_M = 2.1
 REID_DV_MPS = 3.0
@@ -65,9 +68,12 @@ def _valid_raw(o: dict) -> bool:
 
 
 def _same_vehicle(a: dict, b: dict) -> bool:
-  return (abs(float(a['x']) - float(b['x'])) <= SAME_FRONT_DX_M and
-          abs(float(a['y']) - float(b['y'])) <= SAME_FRONT_DY_M and
-          abs(float(a['vx']) - float(b['vx'])) <= SAME_FRONT_DV_MPS)
+  dx=abs(float(a['x'])-float(b['x']))
+  dy=abs(float(a['y'])-float(b['y']))
+  dv=abs(float(a['vx'])-float(b['vx']))
+  if dy<=NEAR_FRONT_DY_M and math.hypot(dx,dy)<=NEAR_FRONT_DIST_M and dv<=NEAR_FRONT_DV_MPS:
+    return True
+  return dx<=SAME_FRONT_DX_M and dy<=SAME_FRONT_DY_M and dv<=SAME_FRONT_DV_MPS
 
 
 def _cluster_ok(group: list[dict]) -> bool:
@@ -123,6 +129,8 @@ def dedup_group1(objects: list[dict]) -> tuple[list[dict], dict]:
     'group1_after_dedup': len(out),
     'group1_duplicates_merged': max(0, len(cand)-len(out)),
     'group1_invalid_sentinel_rejected': sentinel_count,
+    'group1_near_dedup_dist_m': NEAR_FRONT_DIST_M,
+    'group1_near_dedup_dv_mps': NEAR_FRONT_DV_MPS,
   }
 
 
