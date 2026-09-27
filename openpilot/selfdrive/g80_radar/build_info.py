@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 24
-BUILD_TAG = 'v24-monitor-kalman-tuned-scroll-ui'
+BUILD_VERSION = 25
+BUILD_TAG = 'v25-monitor-drive-larger-vehicles'
 LOGGER_FORMAT_VERSION = 7
 KALMAN_API_VERSION = 2
 ANDROID_PROTOCOL_VERSION = 10
