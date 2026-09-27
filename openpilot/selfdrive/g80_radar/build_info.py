@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+BUILD_VERSION = 23
+BUILD_TAG = 'v23-monitor-kalman-verified'
+LOGGER_FORMAT_VERSION = 6
+KALMAN_API_VERSION = 1
+ANDROID_PROTOCOL_VERSION = 9

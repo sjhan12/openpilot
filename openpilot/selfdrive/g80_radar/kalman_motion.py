@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V22 monitor-only 360-degree motion Kalman tracker.
+"""V23 monitor-only 360-degree motion Kalman tracker.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
@@ -9,7 +9,7 @@ Two constant-acceleration (CA) filters are maintained per persistent vehicle:
   Cartesian: [x, vx, ax] and [y, vy, ay]
   Frenet:    [s, ds, dds] and [d, dd, ddd]
 
-Frenet is updated only when V21/V22 C4 road projection is valid. Rear objects
+Frenet is updated only when C4 road projection is valid. Rear objects
 and points outside the C4 path horizon keep Cartesian prediction only.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from openpilot.selfdrive.g80_radar.road_geometry import frenet_to_xy, lane_index_from_d, lane_name
+from openpilot.selfdrive.g80_radar.build_info import KALMAN_API_VERSION
 
 
 HORIZONS_S = (0.5, 1.0, 2.0, 3.0)

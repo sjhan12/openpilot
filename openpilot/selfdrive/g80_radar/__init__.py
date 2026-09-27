@@ -1,1 +1,4 @@
-# G80 5-radar monitor-only package V22: C4 road model + CA Kalman trajectory prediction.
+"""G80 five-radar monitor/shadow package."""
+from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG
+
+__all__ = ['BUILD_VERSION', 'BUILD_TAG']

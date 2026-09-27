@@ -22,6 +22,10 @@ import json
 import os
 import time
 
+from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG, LOGGER_FORMAT_VERSION
+
+LOGGER_SERVICE_VERSION = BUILD_VERSION
+
 
 def _env_bool(name: str, default: bool) -> bool:
   v = os.getenv(name)
@@ -82,12 +86,12 @@ class ShadowLogger:
 
   def _filename(self) -> Path:
     stamp = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')
-    base = self.log_dir / f'shadow_{stamp}.jsonl.gz'
+    base = self.log_dir / f'shadow_v{BUILD_VERSION}_{stamp}.jsonl.gz'
     if not base.exists() and not Path(str(base) + '.part').exists():
       return base
     i = 1
     while True:
-      p = self.log_dir / f'shadow_{stamp}_{i:02d}.jsonl.gz'
+      p = self.log_dir / f'shadow_v{BUILD_VERSION}_{stamp}_{i:02d}.jsonl.gz'
       if not p.exists() and not Path(str(p) + '.part').exists():
         return p
       i += 1
@@ -107,8 +111,9 @@ class ShadowLogger:
       header = {
         'type':'header',
         'format':'g80_shadow_log',
-        'format_version':5,
-        'service_version':22,
+        'format_version':LOGGER_FORMAT_VERSION,
+        'service_version':LOGGER_SERVICE_VERSION,
+        'build_tag':BUILD_TAG,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
         'config':{
           'hz':self.hz,
@@ -171,6 +176,8 @@ class ShadowLogger:
       'v_ego_recv_ns':int(v_ego_recv_ns or 0),
       'model_path_recv_ns':int(model_path_recv_ns or 0),
       'model_path':[[round(float(x),3),round(float(y),3)] for x,y in (model_path or [])],
+      'runtime_versions':core.get('runtime_versions',{}),
+      'runtime_mismatch':bool(core.get('runtime_mismatch',False)),
       'road_model_summary':{
         'fresh':(core.get('road_model',{}) or {}).get('fresh'),
         'age_ms':(core.get('road_model',{}) or {}).get('age_ms'),
@@ -201,6 +208,7 @@ class ShadowLogger:
       'rear_teacher':core.get('teacher_rear',[]),
       'corner_front_associations':core.get('corner_front_associations',[]),
       'zones':core.get('zones',{}),
+      'validation_summary':self._validation_summary(core),
       'diag':{
         k:(diag or {}).get(k) for k in (
           'corner_A_frames','corner_B_frames','corner_decoded_total',
@@ -209,6 +217,36 @@ class ShadowLogger:
         ) if k in (diag or {})
       },
     }
+
+  def _validation_summary(self, core: dict) -> dict:
+    shadow = core.get('shadow_leads', {}) or {}
+    l1 = shadow.get('leadOne', {}) or {}
+    teacher = core.get('scc_teacher', {}) or {}
+    objs = core.get('sensor_fused_objects', []) or []
+    kf_valid = sum(1 for o in objs if o.get('kalman_valid'))
+    kf_frenet = sum(1 for o in objs if o.get('kf_frenet_valid'))
+    kf_cutin = sum(1 for o in objs if o.get('kf_cutin_candidate'))
+    out = {
+      'kalman_objects':kf_valid,
+      'kalman_frenet_objects':kf_frenet,
+      'kalman_cutin_candidates':kf_cutin,
+      'scc_teacher_usable':bool(teacher.get('teacher_usable')),
+      'shadow_l1_present':bool(l1.get('status')),
+    }
+    if teacher.get('teacher_usable') and l1.get('status'):
+      try:
+        de = float(l1.get('dRel')) - float(teacher.get('distance_m'))
+        ve = float(l1.get('vRel')) - float(teacher.get('rel_speed_mps'))
+        out.update({
+          'scc_l1_d_error_m':round(de,3),
+          'scc_l1_v_error_mps':round(ve,3),
+          'scc_l1_disagreement':abs(de) > 3.0 or abs(ve) > 3.0,
+          'scc_l1_camera_confirmed':bool(l1.get('cameraConfirmed')),
+          'scc_l1_scc_confirmed':bool(l1.get('sccConfirmed')),
+        })
+      except Exception:
+        pass
+    return out
 
   def maybe_write(self, core: dict, model_path, v_ego: float,
                   model_path_recv_ns: int, v_ego_recv_ns: int,
@@ -269,6 +307,9 @@ class ShadowLogger:
   def status(self) -> dict:
     return {
       'enabled':self.enabled,
+      'service_version':LOGGER_SERVICE_VERSION,
+      'format_version':LOGGER_FORMAT_VERSION,
+      'build_tag':BUILD_TAG,
       'directory':str(self.log_dir),
       'path':str(self.path) if self.path else '',
       'filename':self.path.name if self.path else '',

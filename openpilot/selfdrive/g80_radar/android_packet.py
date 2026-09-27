@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-PROTOCOL_VERSION = 8
+from openpilot.selfdrive.g80_radar.build_info import ANDROID_PROTOCOL_VERSION
+PROTOCOL_VERSION = ANDROID_PROTOCOL_VERSION
 
 def _sector_color_key(o: dict) -> str | None:
   src = str(o.get('source',''))
@@ -44,6 +45,7 @@ def build_render_packet(state: dict) -> dict:
   return {
     'protocol':'g80_radar_render','protocol_version':PROTOCOL_VERSION,
     'state_version':state.get('version',0),'mono_ns':state.get('mono_ns',0),
+    'runtime_versions':state.get('runtime_versions',{}),'runtime_mismatch':state.get('runtime_mismatch',False),
     'all':[_obj(o) for o in final_all],
     'front':[_obj(o) for o in final_front],
     'corner':[_obj(o) for o in state.get('corner_fused_objects',[])],
