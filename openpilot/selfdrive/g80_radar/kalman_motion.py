@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V23 monitor-only 360-degree motion Kalman tracker.
+"""V24 monitor-only 360-degree motion Kalman tracker.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
@@ -117,6 +117,8 @@ class MotionTrack:
   dk: AxisCAKalman | None = None
   frenet_last_update_ns: int = 0
   source_keys: set[str] = field(default_factory=set)
+  cutin_candidate_since_ns: int = 0
+  cutin_last_candidate_ns: int = 0
 
 
 class KalmanMotionTracker:
@@ -258,13 +260,53 @@ class KalmanMotionTracker:
 
     lane_now = dct.get('kf_lane')
     future_ego = any(p.get('lane') == 'ego' for p in traj if p.get('lane') is not None)
-    ttlc = dct.get('kf_ttlc_s')
+    ttlc = _finite(dct.get('kf_ttlc_s'))
     d_dot = _finite(dct.get('kf_d_dot'))
     d_sig = _finite(dct.get('kf_d_sigma'), 99.0)
     dv_sig = _finite(dct.get('kf_d_dot_sigma'), 99.0)
-    motion_confident = bool(frenet_valid and t.age_frames >= 4 and d_sig <= 1.0 and dv_sig <= 2.5 and d_dot is not None and abs(d_dot) <= 3.0)
+
+    # V24 tuning from V23 road logs:
+    # - keep a broad motion-confidence flag for diagnostics,
+    # - only promote an adjacent-lane inward motion to a cut-in candidate,
+    # - require lower uncertainty and temporal persistence before CONFIRMED.
+    motion_confident = bool(
+      frenet_valid and t.age_frames >= 4 and d_sig <= 1.0 and dv_sig <= 2.5
+      and d_dot is not None and abs(d_dot) <= 3.0
+    )
+    adjacent_lane = lane_now in ('left1', 'right1')
+    strict_candidate = bool(
+      motion_confident and adjacent_lane and future_ego and ttlc is not None
+      and 0.20 <= float(ttlc) <= 3.0
+      and d_sig <= 0.70 and dv_sig <= 1.80
+      and d_dot is not None and 0.30 <= abs(d_dot) <= 2.50
+      and (int(now_ns) - int(t.first_ns)) >= 800_000_000
+    )
+
+    if strict_candidate:
+      if t.cutin_candidate_since_ns == 0 or (t.cutin_last_candidate_ns and int(now_ns) - int(t.cutin_last_candidate_ns) > 350_000_000):
+        t.cutin_candidate_since_ns = int(now_ns)
+      t.cutin_last_candidate_ns = int(now_ns)
+    elif t.cutin_last_candidate_ns == 0 or int(now_ns) - int(t.cutin_last_candidate_ns) > 200_000_000:
+      t.cutin_candidate_since_ns = 0
+
+    persistence_s = 0.0
+    if strict_candidate and t.cutin_candidate_since_ns:
+      persistence_s = max(0.0, (int(now_ns) - int(t.cutin_candidate_since_ns)) / 1e9)
+    confirmed = bool(strict_candidate and persistence_s >= 0.25)
+
+    # 0..1 diagnostic score, not a control probability.
+    score = 0.0
+    if strict_candidate:
+      ttlc_term = max(0.0, min(1.0, (3.0 - float(ttlc)) / 2.8))
+      sig_term = max(0.0, min(1.0, 1.0 - dv_sig / 1.8))
+      persist_term = max(0.0, min(1.0, persistence_s / 0.5))
+      score = 0.45 * ttlc_term + 0.25 * sig_term + 0.30 * persist_term
+
     dct['kf_motion_confident'] = motion_confident
-    dct['kf_cutin_candidate'] = bool(motion_confident and lane_now not in (None, 'ego') and future_ego and ttlc is not None and 0.0 < float(ttlc) <= 3.0)
+    dct['kf_cutin_candidate'] = strict_candidate
+    dct['kf_cutin_confirmed'] = confirmed
+    dct['kf_cutin_persistence_s'] = round(persistence_s, 3)
+    dct['kf_cutin_score'] = round(score, 3)
     return dct
 
   def update(self, objects: list[dict], road_model: dict | None, now_ns: int) -> tuple[list[dict], dict]:
@@ -322,6 +364,7 @@ class KalmanMotionTracker:
       self.tracks.pop(k, None)
 
     cutins = sum(1 for o in out if o.get('kf_cutin_candidate'))
+    confirmed_cutins = sum(1 for o in out if o.get('kf_cutin_confirmed'))
     frenet_valid = sum(1 for o in out if o.get('kf_frenet_valid'))
     confident = sum(1 for o in out if o.get('kf_motion_confident'))
     lateral_unstable = sum(1 for o in out if o.get('kf_d_dot') is not None and abs(float(o.get('kf_d_dot'))) > 3.0)
@@ -334,6 +377,8 @@ class KalmanMotionTracker:
       'motion_confident_tracks': confident,
       'lateral_unstable_tracks': lateral_unstable,
       'cutin_candidates': cutins,
+      'cutin_confirmed': confirmed_cutins,
+      'cutin_rule': 'adjacent lane + TTLC 0.2..3.0s + low covariance + >=0.25s persistence',
       'model': 'CA-6D cartesian + CA-6D Frenet',
       'horizons_s': list(HORIZONS_S),
       'control_connected': False,

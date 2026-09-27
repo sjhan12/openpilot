@@ -226,10 +226,12 @@ class ShadowLogger:
     kf_valid = sum(1 for o in objs if o.get('kalman_valid'))
     kf_frenet = sum(1 for o in objs if o.get('kf_frenet_valid'))
     kf_cutin = sum(1 for o in objs if o.get('kf_cutin_candidate'))
+    kf_cutin_confirmed = sum(1 for o in objs if o.get('kf_cutin_confirmed'))
     out = {
       'kalman_objects':kf_valid,
       'kalman_frenet_objects':kf_frenet,
       'kalman_cutin_candidates':kf_cutin,
+      'kalman_cutin_confirmed':kf_cutin_confirmed,
       'scc_teacher_usable':bool(teacher.get('teacher_usable')),
       'shadow_l1_present':bool(l1.get('status')),
     }
