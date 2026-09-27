@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""V29 monitor-only 360-degree motion Kalman tracker.
+"""V30 monitor-only motion Kalman tracker driven by Canonical360Tracker IDs.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
 state and short-horizon trajectory predictions for validation.
 
-CA state filters are maintained per persistent vehicle, but V29 deliberately
+CA state filters are maintained per persistent vehicle, but V30 retains the V29 stabilization and deliberately
 uses asymmetric prediction models:
   longitudinal s/x: constant acceleration (CA)
   lateral d/y:      CA for the first 0.5 s, then bounded constant velocity (CV)
@@ -236,11 +236,16 @@ class KalmanMotionTracker:
     assert t.xk is not None and t.yk is not None
     x, vx, ax = map(float, t.xk.x)
     y, vy, ay = map(float, t.yk.x)
+    kalman_age_s = (int(now_ns) - int(t.first_ns)) / 1e9
+    canonical_key = str(dct.get('canonical_key') or dct.get('vehicle_key') or '')
+    canonical_age_s = _finite(dct.get('canonical_track_duration_s'))
     dct.update({
       'kalman_valid': True,
       'kalman_track_key': f'{self.prefix}:{t.key}',
       'kalman_age_frames': int(t.age_frames),
-      'kalman_age_s': round((int(now_ns) - int(t.first_ns)) / 1e9, 3),
+      'kalman_age_s': round(kalman_age_s, 3),
+      'kf_canonical_key_match': bool(not canonical_key or canonical_key == t.key),
+      'kf_reset_suspect': bool(canonical_age_s is not None and canonical_age_s > 1.0 and kalman_age_s + 0.5 < canonical_age_s),
       'kf_x': round(x, 3), 'kf_y': round(y, 3),
       'kf_vx': round(vx, 3), 'kf_vy': round(vy, 3),
       'kf_ax': round(ax, 3), 'kf_ay': round(ay, 3),
@@ -411,6 +416,8 @@ class KalmanMotionTracker:
     frenet_valid = sum(1 for o in out if o.get('kf_frenet_valid'))
     confident = sum(1 for o in out if o.get('kf_motion_confident'))
     lateral_unstable = sum(1 for o in out if o.get('kf_d_dot') is not None and abs(float(o.get('kf_d_dot'))) > 3.0)
+    canonical_key_mismatch = sum(1 for o in out if o.get('canonical_valid') and not o.get('kf_canonical_key_match', False))
+    reset_suspects = sum(1 for o in out if o.get('kf_reset_suspect'))
     return out, {
       'active_tracks': len(self.tracks),
       'visible_tracks': len(out),
@@ -419,6 +426,8 @@ class KalmanMotionTracker:
       'frenet_valid_tracks': frenet_valid,
       'motion_confident_tracks': confident,
       'lateral_unstable_tracks': lateral_unstable,
+      'canonical_key_mismatch_tracks': canonical_key_mismatch,
+      'kf_reset_suspect_tracks': reset_suspects,
       'cutin_candidates': cutins,
       'cutin_confirmed': confirmed_cutins,
       'low_speed_lateral_candidates': low_speed_lateral,

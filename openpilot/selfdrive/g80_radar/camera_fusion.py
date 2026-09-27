@@ -412,7 +412,8 @@ class StickyMatch:
 class CameraRadarFusion:
   def __init__(self):
     self.sticky={}
-    self.vehicle_tracker=VehicleFootprintTracker('V')
+    # V30: global Vxxxx identity is owned only by Canonical360Tracker.
+    # FRONT keeps a local VFxxxx tracker for diagnostics; it is not an identity authority.
     self.front_vehicle_tracker=VehicleFootprintTracker('VF')
 
   @staticmethod
@@ -497,7 +498,9 @@ class CameraRadarFusion:
       self.sticky.pop(k,None)
 
     pre_vehicle=radar+camera_only
-    all_objs,vehicle_stats=self.vehicle_tracker.update(pre_vehicle,now_ns)
+    # V30: spatial/speed de-duplication only. Persistent Vxxxx IDs are assigned
+    # exactly once downstream by Canonical360Tracker after road annotation.
+    all_objs,vehicle_stats=fuse_vehicle_footprints(pre_vehicle)
 
     # Keep the FRONT view in the front-radar domain. The fused radar list also
     # contains corner tracks; spatial filtering alone used to copy them here.

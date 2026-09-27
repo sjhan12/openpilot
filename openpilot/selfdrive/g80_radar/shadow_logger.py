@@ -41,11 +41,11 @@ def _compact_obj(o: dict) -> dict:
     'corner_link_id','camera_confirmed','camera_prob','camera_id','camera_key',
     'camera_only','sensor_fusion','camera_match_cost','camera_dx_m',
     'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
-    'vehicle_id','vehicle_key','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
+    'vehicle_id','vehicle_key','canonical_id','canonical_key','canonical_valid','canonical_age_frames','canonical_track_duration_s','canonical_match_reason','canonical_match_cost','canonical_alias_overlap','canonical_gap_ms','canonical_reacquired','canonical_reacquire_count','canonical_domains','canonical_primary_domain','canonical_domain_history','canonical_source_transition','canonical_handoff_count','canonical_alias_count','canonical_candidate_count','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
     'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','road_projection_endpoint_overshoot_m',
-    'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s',
+    'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect',
     'kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma','kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot',
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
@@ -123,7 +123,7 @@ class ShadowLogger:
           'flush_sec':self.flush_sec,
           'log_dir':str(self.log_dir),
           'vehicle_footprint_m':[4.8,2.1],
-          'vehicle_vrel_gate_mps':3.0,
+          'vehicle_vrel_gate_mps':2.5,
           'kalman_model':'CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
           'coordinate_x_origin':'ego_front_bumper_display_reference',
@@ -132,6 +132,9 @@ class ShadowLogger:
           'rear_teacher_match_gate_m':0.8,
           'highway_cutin_min_v_ego_mps':5.0,
           'c4_path_projection_margin_m':0.75,
+          'canonical360_identity_authority':True,
+          'canonical360_ttl_s':1.5,
+          'future_gap_evaluator':False,
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -151,7 +154,7 @@ class ShadowLogger:
     self.fp.write(s + '\n')
     self.uncompressed_bytes += len(s.encode('utf-8')) + 1
 
-  def _signature(self, shadow: dict, kalman_stats: dict | None = None):
+  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None):
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
     st = shadow.get('stats', {}) or {}
@@ -164,6 +167,10 @@ class ShadowLogger:
       int((kalman_stats or {}).get('cutin_candidates', 0) or 0),
       int((kalman_stats or {}).get('cutin_confirmed', 0) or 0),
       int((kalman_stats or {}).get('low_speed_lateral_candidates', 0) or 0),
+      int((canonical_stats or {}).get('new_tracks', 0) or 0),
+      int((canonical_stats or {}).get('reacquired_tracks', 0) or 0),
+      int((canonical_stats or {}).get('source_handoffs', 0) or 0),
+      int((canonical_stats or {}).get('ambiguous_objects', 0) or 0),
     )
 
   def _rotate_due(self, now_mono: float) -> bool:
@@ -202,6 +209,7 @@ class ShadowLogger:
       },
       'shadow':shadow,
       'sensor_fused_objects':[_compact_obj(o) for o in core.get('sensor_fused_objects',[])],
+      'canonical_tracker_stats':core.get('canonical_tracker_stats',{}),
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],
       'corner_fused_objects':[_compact_obj(o) for o in core.get('corner_fused_objects',[])],
       'front_sensor_objects':[_compact_obj(o) for o in core.get('front_sensor_objects',[])],
@@ -234,11 +242,19 @@ class ShadowLogger:
     l1 = shadow.get('leadOne', {}) or {}
     teacher = core.get('scc_teacher', {}) or {}
     objs = core.get('sensor_fused_objects', []) or []
+    canon = core.get('canonical_tracker_stats', {}) or {}
     kf_valid = sum(1 for o in objs if o.get('kalman_valid'))
     kf_frenet = sum(1 for o in objs if o.get('kf_frenet_valid'))
     kf_cutin = sum(1 for o in objs if o.get('kf_cutin_candidate'))
     kf_cutin_confirmed = sum(1 for o in objs if o.get('kf_cutin_confirmed'))
     out = {
+      'canonical_visible_tracks':int(canon.get('visible_tracks',0) or 0),
+      'canonical_active_tracks':int(canon.get('active_tracks',0) or 0),
+      'canonical_new_tracks':int(canon.get('new_tracks',0) or 0),
+      'canonical_reacquired_tracks':int(canon.get('reacquired_tracks',0) or 0),
+      'canonical_source_handoffs':int(canon.get('source_handoffs',0) or 0),
+      'canonical_ambiguous_objects':int(canon.get('ambiguous_objects',0) or 0),
+      'canonical_continuity_ratio':canon.get('continuity_ratio'),
       'kalman_objects':kf_valid,
       'kalman_frenet_objects':kf_frenet,
       'kalman_cutin_candidates':kf_cutin,
@@ -277,7 +293,7 @@ class ShadowLogger:
 
     now_mono = time.monotonic()
     shadow = core.get('shadow_leads', {}) or {}
-    sig = self._signature(shadow, core.get('kalman_motion_stats', {}))
+    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}))
     event = self.last_signature is not None and sig != self.last_signature
     self.last_signature = sig
 
