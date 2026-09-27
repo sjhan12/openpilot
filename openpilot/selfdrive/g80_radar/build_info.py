@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 25
-BUILD_TAG = 'v25-monitor-drive-larger-vehicles'
+BUILD_VERSION = 26
+BUILD_TAG = 'v26-monitor-drive-large-front-color'
 LOGGER_FORMAT_VERSION = 7
 KALMAN_API_VERSION = 2
 ANDROID_PROTOCOL_VERSION = 10
