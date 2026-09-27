@@ -22,7 +22,7 @@ PASSENGER_CAR_VREL_GATE_MPS = 2.5
 NEAR_SAME_SOURCE_DIST_M = 2.2
 NEAR_CROSS_SOURCE_DIST_M = 3.5
 NEAR_SAME_SOURCE_DY_M = 1.5
-NEAR_CROSS_SOURCE_DY_M = 2.0
+NEAR_CROSS_SOURCE_DY_M = 1.55
 NEAR_SAME_SOURCE_DV_MPS = 1.5
 NEAR_CROSS_SOURCE_DV_MPS = 2.0
 SAME_CORNER_LENGTH_M = 3.4
@@ -30,7 +30,7 @@ SAME_CORNER_WIDTH_M = 1.8
 SAME_FRONT_LENGTH_M = 2.8
 SAME_FRONT_WIDTH_M = 1.6
 CONTROL_SAFE_FALLBACK_LENGTH_M = 4.0
-CONTROL_SAFE_FALLBACK_WIDTH_M = 1.8
+CONTROL_SAFE_FALLBACK_WIDTH_M = 1.60
 
 
 def _f0(v, default=None):
@@ -133,15 +133,25 @@ def _near_speed_duplicate(a, b):
 
 
 def _strong_cross_sensor_evidence(a, b):
+  """Require a *direct pair link* before allowing the full 2.1 m envelope.
+
+  V30 treated "either object has camera/SCC evidence" as proof that the pair
+  belonged to one car.  That allowed a camera-confirmed center object and an
+  adjacent-lane return to merge.  Evidence is now pair-specific.
+  """
   if _source_identity(a) == _source_identity(b):
     return False
-  evidence_keys = ('scc_teacher_confirmed','camera_confirmed','teacher_match','rear_teacher_confirmed')
-  if any(bool(a.get(k)) or bool(b.get(k)) for k in evidence_keys):
-    return True
-  if a.get('front_link') or b.get('front_link'):
-    return True
-  if a.get('corner_link_id') is not None or b.get('corner_link_id') is not None:
-    return True
+  ak=str(a.get('key') or ''); bk=str(b.get('key') or '')
+  af=str(a.get('front_link') or ''); bf=str(b.get('front_link') or '')
+  afk=str(a.get('front_key') or ''); bfk=str(b.get('front_key') or '')
+  if af and af in (bk,bfk): return True
+  if bf and bf in (ak,afk): return True
+  if af and bf and af==bf: return True
+  ac=a.get('corner_link_id'); bc=b.get('corner_link_id')
+  acid=a.get('corner_fused_id'); bcid=b.get('corner_fused_id')
+  if ac is not None and bcid is not None and str(ac)==str(bcid): return True
+  if bc is not None and acid is not None and str(bc)==str(acid): return True
+  if ac is not None and bc is not None and str(ac)==str(bc): return True
   return False
 
 
@@ -166,7 +176,7 @@ def _pair_vehicle_compatible(a, b):
     return dx <= SAME_FRONT_LENGTH_M and dy <= SAME_FRONT_WIDTH_M
   if sa==sb=='c4_camera':
     return dx <= PASSENGER_CAR_LENGTH_M and dy <= PASSENGER_CAR_WIDTH_M
-  # V29 control-safety guard: near+speed duplicates still merge immediately.
+  # V31 identity-safety guard: near+speed duplicates still merge immediately.
   # For the wider 4.8 x 2.1 m fallback, require independent sensor evidence;
   # otherwise use a conservative 4.0 x 1.8 m envelope to avoid joining two
   # tightly spaced real vehicles.
@@ -182,8 +192,18 @@ def _cluster_envelope_ok(members):
     return False
   if max(xs)-min(xs) > PASSENGER_CAR_LENGTH_M:
     return False
-  if max(ys)-min(ys) > PASSENGER_CAR_WIDTH_M:
+  span_y=max(ys)-min(ys)
+  if span_y > PASSENGER_CAR_WIDTH_M:
     return False
+  # V31 identity safety: a wide cluster is allowed only when each pair that
+  # exceeds the conservative width has an explicit corner↔front pair link.
+  if span_y > CONTROL_SAFE_FALLBACK_WIDTH_M:
+    for i in range(len(members)):
+      for j in range(i+1,len(members)):
+        yi=_finite(members[i].get('y')); yj=_finite(members[j].get('y'))
+        if yi is not None and yj is not None and abs(yi-yj)>CONTROL_SAFE_FALLBACK_WIDTH_M:
+          if not _strong_cross_sensor_evidence(members[i],members[j]):
+            return False
   vs=[_finite(o.get('vx')) for o in members]
   vs=[v for v in vs if v is not None]
   return not vs or max(vs)-min(vs) <= PASSENGER_CAR_VREL_GATE_MPS

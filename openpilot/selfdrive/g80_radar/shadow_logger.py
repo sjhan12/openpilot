@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  5 Hz periodic sampling
+  4 Hz periodic sampling (V31 performance-safe default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -49,7 +49,10 @@ def _compact_obj(o: dict) -> dict:
     'kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma','kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot',
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
-    'kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory'
+    'kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
+    'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count',
+    'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
+    'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate','imm_trajectory'
   )
   return {k:o.get(k) for k in keys if k in o and o.get(k) is not None}
 
@@ -64,7 +67,7 @@ class ShadowLogger:
                flush_sec: float | None = None):
     self.log_dir = Path(log_dir or os.getenv('G80_SHADOW_LOG_DIR', '/data/radar'))
     self.enabled = _env_bool('G80_SHADOW_LOG', True) if enabled is None else bool(enabled)
-    self.hz = max(0.2, float(os.getenv('G80_SHADOW_LOG_HZ', '5.0')) if hz is None else float(hz))
+    self.hz = max(0.2, float(os.getenv('G80_SHADOW_LOG_HZ', '4.0')) if hz is None else float(hz))
     self.rotate_min = max(1.0, float(os.getenv('G80_SHADOW_LOG_ROTATE_MIN', '30')) if rotate_min is None else float(rotate_min))
     self.max_bytes = int(max(1.0, float(os.getenv('G80_SHADOW_LOG_MAX_MB', '64')) if max_mb is None else float(max_mb)) * 1024 * 1024)
     self.flush_sec = max(0.2, float(os.getenv('G80_SHADOW_LOG_FLUSH_SEC', '1.0')) if flush_sec is None else float(flush_sec))
@@ -104,7 +107,7 @@ class ShadowLogger:
       self.log_dir.mkdir(parents=True, exist_ok=True)
       self.final_path = self._filename()
       self.path = Path(str(self.final_path) + '.part')
-      self.fp = gzip.open(self.path, 'at', encoding='utf-8', compresslevel=5)
+      self.fp = gzip.open(self.path, 'at', encoding='utf-8', compresslevel=3)
       self.file_start_mono = now_mono
       self.next_flush_mono = now_mono + self.flush_sec
       self.uncompressed_bytes = 0
@@ -124,7 +127,8 @@ class ShadowLogger:
           'log_dir':str(self.log_dir),
           'vehicle_footprint_m':[4.8,2.1],
           'vehicle_vrel_gate_mps':2.5,
-          'kalman_model':'CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
+          'kalman_model':'KF3 baseline: CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
+          'imm_model':'IMM1: CV + CA + MANEUVER on canonical IDs',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
           'coordinate_x_origin':'ego_front_bumper_display_reference',
           'decoded_object_x_adjustment_m':0.0,
@@ -134,6 +138,9 @@ class ShadowLogger:
           'c4_path_projection_margin_m':0.75,
           'canonical360_identity_authority':True,
           'canonical360_ttl_s':1.5,
+          'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
+          'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm',
+          'performance_policy':'4Hz gzip level3; events only on lead/cutin transitions',
           'future_gap_evaluator':False,
         },
         'control_connected':False,
@@ -154,7 +161,14 @@ class ShadowLogger:
     self.fp.write(s + '\n')
     self.uncompressed_bytes += len(s.encode('utf-8')) + 1
 
-  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None):
+  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None, imm_stats: dict | None = None):
+    """Sparse event signature.
+
+    V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
+    became "events" and gzip/JSON work ran almost every publish.  V31 reserves
+    immediate records for semantically important lead/cut-in transitions; the
+    full canonical/IMM state is still captured by the 4 Hz periodic stream.
+    """
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
     st = shadow.get('stats', {}) or {}
@@ -162,15 +176,8 @@ class ShadowLogger:
       bool(l1.get('status')), l1.get('key'), l1.get('reason'),
       bool(l2.get('status')), l2.get('key'), l2.get('reason'),
       int(st.get('confirmed_cutin_count', 0) or 0),
-      int(st.get('stationary_supported_count', 0) or 0),
       bool(st.get('path_valid')), bool(st.get('v_ego_valid')),
-      int((kalman_stats or {}).get('cutin_candidates', 0) or 0),
       int((kalman_stats or {}).get('cutin_confirmed', 0) or 0),
-      int((kalman_stats or {}).get('low_speed_lateral_candidates', 0) or 0),
-      int((canonical_stats or {}).get('new_tracks', 0) or 0),
-      int((canonical_stats or {}).get('reacquired_tracks', 0) or 0),
-      int((canonical_stats or {}).get('source_handoffs', 0) or 0),
-      int((canonical_stats or {}).get('ambiguous_objects', 0) or 0),
     )
 
   def _rotate_due(self, now_mono: float) -> bool:
@@ -216,6 +223,8 @@ class ShadowLogger:
       'standard_front_preview':core.get('standard_front_preview',[]),
       'standard_front_preview_stats':core.get('standard_front_preview_stats',{}),
       'kalman_motion_stats':core.get('kalman_motion_stats',{}),
+      'imm_motion_stats':core.get('imm_motion_stats',{}),
+      'performance_stats':core.get('performance_stats',{}),
       'corner_kalman_motion_stats':core.get('corner_kalman_motion_stats',{}),
       'front_kalman_motion_stats':core.get('front_kalman_motion_stats',{}),
       'camera_leads':[_compact_obj(o) for o in core.get('camera_leads',[])],
@@ -247,6 +256,9 @@ class ShadowLogger:
     kf_frenet = sum(1 for o in objs if o.get('kf_frenet_valid'))
     kf_cutin = sum(1 for o in objs if o.get('kf_cutin_candidate'))
     kf_cutin_confirmed = sum(1 for o in objs if o.get('kf_cutin_confirmed'))
+    imm_valid = sum(1 for o in objs if o.get('imm_valid'))
+    imm_man = sum(1 for o in objs if o.get('imm_maneuver_candidate'))
+    imm_reset = sum(1 for o in objs if o.get('imm_reset_suspect'))
     out = {
       'canonical_visible_tracks':int(canon.get('visible_tracks',0) or 0),
       'canonical_active_tracks':int(canon.get('active_tracks',0) or 0),
@@ -259,6 +271,9 @@ class ShadowLogger:
       'kalman_frenet_objects':kf_frenet,
       'kalman_cutin_candidates':kf_cutin,
       'kalman_cutin_confirmed':kf_cutin_confirmed,
+      'imm_objects':imm_valid,
+      'imm_maneuver_candidates':imm_man,
+      'imm_reset_suspects':imm_reset,
       'scc_teacher_usable':bool(teacher.get('teacher_usable')),
       'shadow_l1_present':bool(l1.get('status')),
       'rear_teacher_usable_count':sum(1 for t in (core.get('teacher_rear',[]) or []) if t.get('teacher_usable')),
@@ -293,7 +308,7 @@ class ShadowLogger:
 
     now_mono = time.monotonic()
     shadow = core.get('shadow_leads', {}) or {}
-    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}))
+    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}), core.get('imm_motion_stats', {}))
     event = self.last_signature is not None and sig != self.last_signature
     self.last_signature = sig
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V30 canonical 360-degree physical-vehicle identity tracker.
+"""V31 canonical 360-degree physical-vehicle identity tracker.
 
 This module is monitor-only. It does not publish radarTracks/radarState and does
 not transmit CAN. Its only job is to turn the already de-duplicated multi-sensor
@@ -32,10 +32,12 @@ def _strset(vals):
 
 
 def _aliases(o: dict) -> set[str]:
-  """Stable sensor aliases carried by one physical vehicle cluster.
+  """Identity-safe sensor aliases carried by one physical vehicle cluster.
 
-  C4 leadsV3 CV0/CV1/CV2 are hypothesis slots, not persistent object IDs, so
-  they are intentionally excluded from canonical identity matching.
+  V30 promoted every member of a wide dedup cluster to a permanent alias. One
+  bad cross-lane merge could therefore poison identity for many seconds. V31
+  always trusts only the representative/explicit links; all cluster members are
+  promoted only when the cluster itself is geometrically tight.
   """
   def stable(v):
     if v is None: return None
@@ -43,14 +45,21 @@ def _aliases(o: dict) -> set[str]:
     if not q or (q.startswith('CV') and q[2:].isdigit()): return None
     return q
   out=set()
-  for v in _strset(o.get('vehicle_cluster_keys')):
-    q=stable(v)
-    if q: out.add(q)
+  # Representative/raw anchor aliases are always eligible.
   for k in ('key','vehicle_anchor_key','front_link'):
     q=stable(o.get(k))
     if q: out.add(q)
-  # camera_key / camera_hypothesis_keys are evidence only, never identity aliases.
-  # Numeric corner link IDs are namespaced so they cannot collide with raw keys.
+  try:
+    span_x=float(o.get('vehicle_span_x_m',0.0) or 0.0)
+    span_y=float(o.get('vehicle_span_y_m',0.0) or 0.0)
+  except Exception:
+    span_x=span_y=99.0
+  tight_cluster=(span_x<=3.5 and span_y<=1.25)
+  if tight_cluster:
+    for v in _strset(o.get('vehicle_cluster_keys')):
+      q=stable(v)
+      if q: out.add(q)
+  # camera_key / camera_hypothesis_keys remain evidence only, never identity.
   if o.get('corner_link_id') is not None:
     out.add(f"corner_link:{o.get('corner_link_id')}")
   return out
@@ -146,25 +155,25 @@ class Canonical360Tracker:
     # Shared raw/front/camera alias is the strongest cue. Allow a wider geometric
     # hand-off gate because different radars can return different body surfaces.
     if overlap:
-      if dx>8.0 or dy>3.0 or dv>5.0: return None
+      if dx>6.5 or dy>2.0 or dv>4.5: return None
       cost=-20.0*overlap + 0.10*dx + 0.20*dy + 0.05*dv
       if dd is not None: cost += 0.06*min(dd,4.0)
       return cost,'alias',overlap,dx,dy,dv,dd
 
     # No alias overlap: use short-horizon ego-frame kinematics. This is the
     # important rear→side→front sensor hand-off path.
-    dx_gate=5.0 + 2.0*dt
-    dy_gate=2.35 + 0.25*dt
-    dv_gate=4.0
+    dx_gate=4.5 + 1.5*dt
+    dy_gate=1.80 + 0.20*dt
+    dv_gate=3.5
     if dx>dx_gate or dy>dy_gate or dv>dv_gate: return None
-    if dd is not None and dd>2.6: return None
+    if dd is not None and dd>2.0: return None
     if lane and t.lane and lane!=t.lane and lane not in ('unknown','out') and t.lane not in ('unknown','out'):
       # Lane labels may change during a real lane change; penalize, do not reject.
       lane_pen=0.45
     else:
       lane_pen=0.0
     cost=(dx/dx_gate)**2 + 1.35*(dy/dy_gate)**2 + .35*(dv/dv_gate)**2 + lane_pen
-    if dd is not None: cost += .25*(dd/2.6)**2
+    if dd is not None: cost += .30*(dd/2.0)**2
     return cost,'kinematic',0,dx,dy,dv,dd
 
   def update(self,objects:list[dict],now_ns:int):
@@ -223,7 +232,7 @@ class Canonical360Tracker:
         if reason=='alias': frame_alias+=1
         else: frame_kin+=1
         gap_ms=max(0.0,(now_ns-int(t.last_ns))/1e6)
-        reacquired=gap_ms>250.0
+        reacquired=gap_ms>650.0
         if reacquired:
           t.reacquire_count+=1; self.reacquire_total+=1; frame_reacq+=1
         source_transition=(primary!=t.last_primary_domain and primary!='UNKNOWN' and t.last_primary_domain!='UNKNOWN')
@@ -284,6 +293,8 @@ class Canonical360Tracker:
       'handoff_total':self.handoff_total,
       'reacquire_total':self.reacquire_total,
       'ttl_s':round(self.ttl_ns/1e9,3),
+      'reacquire_threshold_ms':650.0,
+      'cluster_alias_policy':'all members only if span_x<=3.5m and span_y<=1.25m',
       'identity_authority':'canonical360',
       'control_connected':False,
     }

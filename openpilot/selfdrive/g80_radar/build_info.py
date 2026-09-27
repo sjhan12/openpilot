@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 30
-BUILD_TAG = 'v30-canonical360-kalman-final-monitor'
-LOGGER_FORMAT_VERSION = 11
+BUILD_VERSION = 31
+BUILD_TAG = 'v31-canonical360-imm-identity-fastui-monitor'
+LOGGER_FORMAT_VERSION = 12
 KALMAN_API_VERSION = 3
-ANDROID_PROTOCOL_VERSION = 13
+IMM_API_VERSION = 1
+ANDROID_PROTOCOL_VERSION = 14
 
 # Display/reference coordinate convention. Decoded object x values are preserved
 # to keep the empirically validated SCC/rear-teacher calibration unchanged.

@@ -36,7 +36,10 @@ def _obj(o: dict) -> dict:
             'kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect','kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma',
             'kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot','kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane',
             'kf_ttlc_s','kf_lateral_motion','kf_motion_confident','kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class',
-            'kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s','kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory'):
+            'kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s','kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
+            'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count',
+            'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
+            'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate','imm_trajectory'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 
@@ -66,6 +69,8 @@ def build_render_packet(state: dict) -> dict:
     'road_model':state.get('road_model',{}),
     'canonical_tracker_stats':state.get('canonical_tracker_stats',{}),
     'kalman_motion_stats':state.get('kalman_motion_stats',{}),
+    'imm_motion_stats':state.get('imm_motion_stats',{}),
+    'performance_stats':state.get('performance_stats',{}),
     'scc_teacher_by_bus':state.get('scc_teacher_by_bus',{}),
     'associations':state.get('corner_front_associations',[]),
     'fusion_stats':state.get('corner_fusion_stats',{}),
