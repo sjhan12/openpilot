@@ -45,6 +45,14 @@ DUP_DV_MPS = 3.0
 LEAD_REID_MAX_AGE_S = 0.65
 RADAR_ONLY_MAX_DREL_M = 100.0
 
+# V32: a sticky previous L1 must yield when a substantially closer ego-path
+# vehicle is independently confirmed by both SCC and camera.  This fixes the
+# V31 case where the SCC matcher was correct but ShadowLeadVerifier kept an
+# older, farther L1 solely because its identity was still eligible.
+L1_STRONG_HANDOFF_CONFIRM_S = 0.15
+L1_STRONG_HANDOFF_MIN_GAIN_M = 1.0
+L1_STRONG_HANDOFF_MAX_DPATH_M = 1.80
+
 
 def _finite(v, default=0.0):
   try:
@@ -167,6 +175,8 @@ class ShadowLeadVerifier:
     self.last_l2_key = None
     self.last_l1_state = None
     self.last_l2_state = None
+    self.l1_takeover_key = None
+    self.l1_takeover_since_s = 0.0
 
   @staticmethod
   def _identity(o):
@@ -407,11 +417,50 @@ class ShadowLeadVerifier:
 
     l1c = next((c for c in eligible if c['key']==self.last_l1_key),None)
     l1_reidentified = False
+    l1_strong_handoff = False
+    l1_handoff_from = None
+    l1_handoff_to = None
+    l1_handoff_gain_m = None
     if l1c is None:
       l1c = self._reidentify(eligible,self.last_l1_state,now_s)
       if l1c is not None:
         l1c['reidentified']=True
         l1_reidentified=True
+
+    # V32 strong-evidence takeover.  Identity hysteresis is useful through sensor
+    # hand-offs, but it must not override a new closer lead that the stock SCC
+    # teacher and C4 camera independently agree on.  Require persistence so one
+    # noisy frame cannot steal L1.
+    if l1c is not None:
+      strong=[]
+      for c in eligible:
+        if c['key']==l1c['key'] or self._same_physical(c,l1c):
+          continue
+        ev=c['evidence']
+        if not (c['physical'] and ev['scc'] and ev['camera']):
+          continue
+        if abs(float(c['dpath'])) > L1_STRONG_HANDOFF_MAX_DPATH_M:
+          continue
+        gain=float(l1c['x'])-float(c['x'])
+        if gain < L1_STRONG_HANDOFF_MIN_GAIN_M:
+          continue
+        strong.append((float(c['x']),abs(float(c['dpath'])),c,gain))
+      challenger=min(strong,key=lambda z:(z[0],z[1])) if strong else None
+      if challenger is not None:
+        c=challenger[2]; gain=challenger[3]
+        if self.l1_takeover_key==c['key']:
+          dwell=max(0.0,now_s-self.l1_takeover_since_s)
+        else:
+          self.l1_takeover_key=c['key']; self.l1_takeover_since_s=now_s; dwell=0.0
+        if dwell >= L1_STRONG_HANDOFF_CONFIRM_S:
+          l1_handoff_from=l1c['key']; l1_handoff_to=c['key']; l1_handoff_gain_m=gain
+          l1c=c; l1_strong_handoff=True
+          self.l1_takeover_key=None; self.l1_takeover_since_s=0.0
+      else:
+        self.l1_takeover_key=None; self.l1_takeover_since_s=0.0
+    else:
+      self.l1_takeover_key=None; self.l1_takeover_since_s=0.0
+
     if l1c is None:
       scored = []
       for c in eligible:
@@ -527,6 +576,9 @@ class ShadowLeadVerifier:
         'duplicate_suppressed_count':duplicate_suppressed,
         'far_unconfirmed_rejected_count':sum(1 for c in candidates if c.get('far_unconfirmed')),
         'leadOne_reidentified':l1_reidentified,'leadTwo_reidentified':l2_reidentified,
+        'leadOne_strong_handoff':l1_strong_handoff,'leadOne_handoff_from':l1_handoff_from,'leadOne_handoff_to':l1_handoff_to,
+        'leadOne_handoff_gain_m':None if l1_handoff_gain_m is None else round(float(l1_handoff_gain_m),3),
+        'leadOne_takeover_pending_key':self.l1_takeover_key,
         'duplicate_gate_m':[DUP_DX_M,DUP_DY_M,DUP_DV_MPS],
         'path_valid':path_valid,'path_age_ms':path_age,
         'v_ego_valid':v_ego_valid,'v_ego_age_ms':vego_age,
@@ -537,5 +589,6 @@ class ShadowLeadVerifier:
         'stationary confirmation requires fresh path/vEgo plus cross-sensor support',
         'leadTwo is a cut-in/stationary-shadow candidate, not simply the second-nearest car',
         'unconfirmed radar-only objects beyond 100 m are not promoted to leadOne',
+        'V32: closer SCC+camera confirmed ego-path lead overrides sticky L1 after short persistence',
       ],
     }

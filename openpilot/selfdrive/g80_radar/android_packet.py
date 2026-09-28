@@ -30,16 +30,16 @@ def _obj(o: dict) -> dict:
             'front_link','corner_link_id','confidence','camera_confirmed','camera_prob','camera_id','camera_key',
             'camera_only','sensor_fusion','camera_match_cost','camera_dx_m','camera_dy_m','camera_dv_mps',
             'vehicle_id','vehicle_key','canonical_id','canonical_key','canonical_valid','canonical_age_frames','canonical_track_duration_s','canonical_match_reason','canonical_match_cost','canonical_alias_overlap','canonical_gap_ms','canonical_reacquired','canonical_reacquire_count','canonical_domains','canonical_primary_domain','canonical_domain_history','canonical_source_transition','canonical_handoff_count','canonical_alias_count','canonical_candidate_count','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
-            'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
-            'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
+            'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_sources','vehicle_merge_reason',
+            'camera_hypothesis_count','camera_hypotheses_merged',
             'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','road_projection_endpoint_overshoot_m','preview_quality',
             'kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect','kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma',
             'kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot','kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane',
             'kf_ttlc_s','kf_lateral_motion','kf_motion_confident','kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class',
             'kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s','kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
-            'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count',
+            'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason',
             'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
-            'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate','imm_trajectory'):
+            'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate'):
     if k in o and o.get(k) is not None:d[k]=o.get(k)
   return d
 

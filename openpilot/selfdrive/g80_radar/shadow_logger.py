@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  4 Hz periodic sampling (V31 performance-safe default)
+  4 Hz periodic sampling (V32 performance-safe default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -50,7 +50,7 @@ def _compact_obj(o: dict) -> dict:
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
     'kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
-    'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count',
+    'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason',
     'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
     'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate','imm_trajectory'
   )
@@ -128,7 +128,7 @@ class ShadowLogger:
           'vehicle_footprint_m':[4.8,2.1],
           'vehicle_vrel_gate_mps':2.5,
           'kalman_model':'KF3 baseline: CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
-          'imm_model':'IMM1: CV + CA + MANEUVER on canonical IDs',
+          'imm_model':'IMM2: CV + CA + MANEUVER; 5Hz interaction ROI with cached hypotheses between ticks',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
           'coordinate_x_origin':'ego_front_bumper_display_reference',
           'decoded_object_x_adjustment_m':0.0,
@@ -139,8 +139,8 @@ class ShadowLogger:
           'canonical360_identity_authority':True,
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
-          'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm',
-          'performance_policy':'4Hz gzip level3; events only on lead/cutin transitions',
+          'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
+          'performance_policy':'Canonical/KF 10Hz; IMM2 default 5Hz interaction ROI; 4Hz gzip level3; compact UI/UDP',
           'future_gap_evaluator':False,
         },
         'control_connected':False,
