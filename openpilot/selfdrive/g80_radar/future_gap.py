@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""V33 shadow Future Gap + Target-Lane Occupancy evaluator.
+"""V34 shadow Future Gap + Target-Lane Occupancy evaluator.
 
-This module consumes the authoritative Canonical360 objects after KF3/IMM2 and
-computes *diagnostic* left/right target-lane geometry for NOW/0.5/1/2/3 s.
-It does not output SAFE/CAUTION/BLOCKED and is not connected to planner/control.
+Consumes Canonical360 vehicles after KF3/IMM2 and computes diagnostic target-lane
+geometry for NOW/0.5/1/2/3 s.  V34 separates:
+- core occupants: object centre is inside the target lane;
+- boundary overlaps: only the object footprint overlaps the target lane;
+- confirmed incoming: predicted centre enters and persists in the target lane;
+- possible incoming: footprint/one-horizon entry only.
 
-Design goals:
-- use IMM trajectory when available, KF3 trajectory otherwise;
-- retain L2->L1 / R2->R1 incoming vehicles by testing vehicle footprint overlap
-  with the target lane, rather than only looking at integer lane labels;
-- expose raw longitudinal separation and a conservative clearance estimate;
-- expose CA TTC estimates for front/rear closing objects;
-- model a hypothetical smooth 3 s ego lane-change trajectory for *both* sides
-  only to define when ego begins to occupy the target lane.
+It also exposes diagnostic what-if braking scenarios.  It never emits
+SAFE/CAUTION/BLOCKED and is not connected to planner/control.
 """
 from __future__ import annotations
 
 import math
-from typing import Any
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name
 
-FUTURE_GAP_API_VERSION = 1
+FUTURE_GAP_API_VERSION = 2
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
 OBJECT_HALF_WIDTH_M = 1.05
-# Decoded x/s is empirically calibrated and is not a rigorously defined object
-# centre.  Therefore this is deliberately called a conservative *margin*, not
-# a bumper-to-bumper geometry correction.
 OBJECT_LONG_MARGIN_M = 2.4
 MAX_LAT_SIGMA_MARGIN_M = 1.5
 MAX_LONG_SIGMA_MARGIN_M = 5.0
 MAX_TTC_S = 20.0
+
+# Diagnostic what-if assumptions only.  These are not safety thresholds.
+TARGET_BRAKE_ASSUMPTION_MPS2 = -3.0
+EGO_BRAKE_ASSUMPTION_MPS2 = -3.0
+INCOMING_EGO_MIN_MANEUVER_PROB = 0.35
 
 
 def _finite(v, default=None):
@@ -51,20 +49,17 @@ def _find_traj_point(o: dict, t: float) -> tuple[dict | None, str]:
   if t <= 1e-9:
     return None, 'current'
   if o.get('imm_valid'):
-    pts = o.get('imm_trajectory') or []
-    for p in pts:
+    for p in o.get('imm_trajectory') or []:
       if abs(float(p.get('t', -999.0)) - t) < 1e-6:
         return p, 'IMM'
   if o.get('kalman_valid'):
-    pts = o.get('kalman_trajectory') or []
-    for p in pts:
+    for p in o.get('kalman_trajectory') or []:
       if abs(float(p.get('t', -999.0)) - t) < 1e-6:
         return p, 'KF3'
   return None, 'CV_FALLBACK'
 
 
 def _state_at(o: dict, t: float) -> dict | None:
-  """Return local relative [s,d] state for a horizon."""
   if t <= 1e-9:
     if o.get('imm_valid'):
       s = _finite(o.get('imm_s')); d = _finite(o.get('imm_d'))
@@ -104,7 +99,6 @@ def _state_at(o: dict, t: float) -> dict | None:
             'lane_index':int(p.get('lane_index')) if p.get('lane_index') is not None else lane_index_from_d(d),
             'lane':p.get('lane') or lane_name(lane_index_from_d(d))}
 
-  # Fallback keeps all canonical tracks usable even if they are outside IMM ROI.
   s0 = _finite(o.get('kf_s'), _finite(o.get('kf_x'), _finite(o.get('x'))))
   d0 = _finite(o.get('kf_d'), _finite(o.get('kf_y'), _finite(o.get('road_d'), _finite(o.get('y')))))
   if s0 is None or d0 is None:
@@ -125,7 +119,13 @@ def _target_bounds(target_idx: int) -> tuple[float,float,float]:
   return c - LANE_W_M/2.0, c + LANE_W_M/2.0, c
 
 
-def _occupies_target(st: dict, target_idx: int, conservative: bool=False) -> bool:
+def _center_in_target(st: dict, target_idx: int) -> bool:
+  lo,hi,_ = _target_bounds(target_idx)
+  d=float(st['d'])
+  return lo <= d <= hi
+
+
+def _overlaps_target(st: dict, target_idx: int, conservative: bool=False) -> bool:
   lo,hi,_ = _target_bounds(target_idx)
   sigma = min(MAX_LAT_SIGMA_MARGIN_M, max(0.0,float(st.get('d_sigma',0.0)))) if conservative else 0.0
   half = OBJECT_HALF_WIDTH_M + sigma
@@ -150,8 +150,12 @@ def _clearance(st: dict) -> float:
   return max(0.0, s - OBJECT_LONG_MARGIN_M - sig)
 
 
+def _scenario_clearance(s: float, s_dot: float, a_rel: float, t: float) -> tuple[float,float]:
+  sp=float(s)+float(s_dot)*float(t)+0.5*float(a_rel)*float(t)*float(t)
+  return sp, max(0.0, abs(sp)-OBJECT_LONG_MARGIN_M)
+
+
 def _ttc_ca(s: float, v: float, a: float) -> float | None:
-  """Smallest positive solution to s + v*t + .5*a*t^2 = 0."""
   s=float(s); v=float(v); a=float(a)
   if abs(a) < 1e-5:
     if abs(v) < 1e-5:
@@ -167,11 +171,12 @@ def _ttc_ca(s: float, v: float, a: float) -> float | None:
   return min(vals) if vals else None
 
 
-def _obj_summary(o: dict, st: dict, target_idx: int, current_occ: bool) -> dict:
+def _obj_summary(o: dict, st: dict, current_core: bool, current_overlap: bool) -> dict:
   return {
     'key':_key(o),'s':round(float(st['s']),3),'d':round(float(st['d']),3),
     'clearance_m':round(_clearance(st),3),'lane':st.get('lane'),'lane_index':st.get('lane_index'),
-    'prediction_source':st.get('source'),'current_target_occupant':bool(current_occ),
+    'prediction_source':st.get('source'),'current_target_core':bool(current_core),
+    'current_target_overlap':bool(current_overlap),
     'imm_prob_maneuver':o.get('imm_prob_maneuver'),'imm_dominant_model':o.get('imm_dominant_model'),
     'canonical_age_s':o.get('canonical_track_duration_s'),
   }
@@ -181,10 +186,12 @@ class FutureGapEvaluator:
   def __init__(self):
     self.api_version=FUTURE_GAP_API_VERSION
 
-  def _side(self, objects: list[dict], target_idx: int) -> dict:
+  def _side(self, objects: list[dict], target_idx: int, a_ego: float) -> dict:
     states_by_key: dict[str,dict[float,dict]]={}
-    current_occ: dict[str,bool]={}
+    current_core: dict[str,bool]={}
+    current_overlap: dict[str,bool]={}
     origin_lane: dict[str,str|None]={}
+    obj_by_key={}
     for o in objects:
       k=_key(o)
       if not k:
@@ -192,56 +199,100 @@ class FutureGapEvaluator:
       st0=_state_at(o,0.0)
       if st0 is None:
         continue
-      states_by_key[k]={0.0:st0}; current_occ[k]=_occupies_target(st0,target_idx,False); origin_lane[k]=st0.get('lane')
+      obj_by_key[k]=o
+      states_by_key[k]={0.0:st0}
+      current_core[k]=_center_in_target(st0,target_idx)
+      current_overlap[k]=_overlaps_target(st0,target_idx,False)
+      origin_lane[k]=st0.get('lane')
       for h in HORIZONS_S[1:]:
         st=_state_at(o,h)
         if st is not None:
           states_by_key[k][h]=st
 
-    incoming=[]
+    confirmed_incoming=[]
+    possible_incoming=[]
     relevant_origins = ('left2','ego') if target_idx > 0 else ('right2','ego')
-    for o in objects:
-      k=_key(o)
-      if k not in states_by_key or current_occ.get(k) or origin_lane.get(k) not in relevant_origins:
+    _,_,target_center=_target_bounds(target_idx)
+    for k,o in obj_by_key.items():
+      if current_core.get(k) or origin_lane.get(k) not in relevant_origins:
         continue
-      eta=None; entry_state=None
+      states=states_by_key[k]
+      center_hits=[]
+      overlap_hits=[]
       for h in HORIZONS_S[1:]:
-        st=states_by_key[k].get(h)
-        if st is not None and _occupies_target(st,target_idx,False):
-          eta=h; entry_state=st; break
-      if eta is not None:
-        incoming.append({
-          'key':k,'origin_lane':origin_lane.get(k),'target_lane':lane_name(target_idx),'entry_eta_s':eta,
-          'entry_s_m':round(float(entry_state['s']),3),'entry_d_m':round(float(entry_state['d']),3),
-          'imm_prob_maneuver':o.get('imm_prob_maneuver'),'imm_dominant_model':o.get('imm_dominant_model'),
-          'imm_ttlc_s':o.get('imm_ttlc_s'),'prediction_source':entry_state.get('source')
-        })
-    incoming.sort(key=lambda z:(z['entry_eta_s'],abs(z['entry_s_m'])))
-
-    horizons=[]
-    min_front=None; min_rear=None; min_abs=None
-    nearest_front_key=None; nearest_rear_key=None
-    for h in HORIZONS_S:
-      occ=[]; uncertain_only=[]
-      for o in objects:
-        k=_key(o); st=states_by_key.get(k,{}).get(h)
+        st=states.get(h)
         if st is None:
           continue
-        if _occupies_target(st,target_idx,False):
-          occ.append((o,st,current_occ.get(k,False)))
-        elif _occupies_target(st,target_idx,True):
-          uncertain_only.append((o,st,current_occ.get(k,False)))
-      front=[x for x in occ if float(x[1]['s'])>=0.0]
-      rear=[x for x in occ if float(x[1]['s'])<0.0]
+        if _center_in_target(st,target_idx):
+          center_hits.append((h,st))
+        if _overlaps_target(st,target_idx,False):
+          overlap_hits.append((h,st))
+      if not center_hits and not overlap_hits:
+        continue
+      first_h,first_st=(center_hits[0] if center_hits else overlap_hits[0])
+      persists=False
+      if center_hits:
+        first_i=HORIZONS_S.index(first_h)
+        for h2 in HORIZONS_S[first_i+1:]:
+          st2=states.get(h2)
+          if st2 is not None and _center_in_target(st2,target_idx):
+            persists=True
+            break
+      d0=float(states[0.0]['d']); d1=float(first_st['d'])
+      toward_prediction=abs(d1-target_center) <= max(0.0,abs(d0-target_center)-0.15)
+      pman=float(o.get('imm_prob_maneuver') or 0.0)
+      man_candidate=bool(o.get('imm_maneuver_candidate'))
+      if origin_lane.get(k)=='ego':
+        confirmed=bool(center_hits and persists and toward_prediction and (pman>=INCOMING_EGO_MIN_MANEUVER_PROB or man_candidate))
+      else:
+        confirmed=bool(center_hits and persists and toward_prediction)
+      item={
+        'key':k,'origin_lane':origin_lane.get(k),'target_lane':lane_name(target_idx),
+        'entry_eta_s':float(first_h),'entry_s_m':round(float(first_st['s']),3),'entry_d_m':round(float(first_st['d']),3),
+        'centre_entry':bool(center_hits),'persists':bool(persists),'toward_target':bool(toward_prediction),
+        'imm_prob_maneuver':o.get('imm_prob_maneuver'),'imm_dominant_model':o.get('imm_dominant_model'),
+        'imm_ttlc_s':o.get('imm_ttlc_s'),'prediction_source':first_st.get('source')
+      }
+      (confirmed_incoming if confirmed else possible_incoming).append(item)
+
+    confirmed_incoming.sort(key=lambda z:(z['entry_eta_s'],abs(z['entry_s_m'])))
+    possible_incoming.sort(key=lambda z:(z['entry_eta_s'],abs(z['entry_s_m'])))
+
+    horizons=[]
+    min_front=None; min_rear=None; min_abs=None; min_boundary=None
+    nearest_front_key=None; nearest_rear_key=None
+    for h in HORIZONS_S:
+      core=[]; boundary=[]; uncertain_only=[]
+      for k,o in obj_by_key.items():
+        st=states_by_key.get(k,{}).get(h)
+        if st is None:
+          continue
+        if _center_in_target(st,target_idx):
+          core.append((o,st,current_core.get(k,False),current_overlap.get(k,False)))
+        elif _overlaps_target(st,target_idx,False):
+          boundary.append((o,st,current_core.get(k,False),current_overlap.get(k,False)))
+        elif _overlaps_target(st,target_idx,True):
+          uncertain_only.append((o,st,current_core.get(k,False),current_overlap.get(k,False)))
+      front=[x for x in core if float(x[1]['s'])>=0.0]
+      rear=[x for x in core if float(x[1]['s'])<0.0]
       front.sort(key=lambda x:float(x[1]['s']))
       rear.sort(key=lambda x:abs(float(x[1]['s'])))
       f=front[0] if front else None; r=rear[0] if rear else None
-      fsum=_obj_summary(f[0],f[1],target_idx,f[2]) if f else None
-      rsum=_obj_summary(r[0],r[1],target_idx,r[2]) if r else None
+      fsum=_obj_summary(f[0],f[1],f[2],f[3]) if f else None
+      rsum=_obj_summary(r[0],r[1],r[2],r[3]) if r else None
+
+      bfront=[x for x in boundary if float(x[1]['s'])>=0.0]
+      brear=[x for x in boundary if float(x[1]['s'])<0.0]
+      bfront.sort(key=lambda x:float(x[1]['s'])); brear.sort(key=lambda x:abs(float(x[1]['s'])))
+      bf=_obj_summary(*bfront[0]) if bfront else None
+      br=_obj_summary(*brear[0]) if brear else None
+
       ego_overlap=_ego_overlaps_target(h,target_idx)
       row={
         't':h,'ego_target_d_m':round(_ego_d_at(h,target_idx),3),'ego_target_overlap':ego_overlap,
-        'occupant_count':len(occ),'uncertain_only_count':len(uncertain_only),'front':fsum,'rear':rsum,
+        'core_occupant_count':len(core),'boundary_overlap_count':len(boundary),
+        'uncertain_only_count':len(uncertain_only),'front':fsum,'rear':rsum,
+        'boundary_front':bf,'boundary_rear':br,
       }
       horizons.append(row)
       if ego_overlap:
@@ -249,37 +300,69 @@ class FutureGapEvaluator:
           min_front=fsum['clearance_m']; nearest_front_key=fsum['key']
         if rsum is not None and (min_rear is None or rsum['clearance_m']<min_rear):
           min_rear=rsum['clearance_m']; nearest_rear_key=rsum['key']
-        vals=[abs(float(x[1]['s'])) for x in occ]
+        vals=[abs(float(x[1]['s'])) for x in core]
         if vals:
           v=min(vals); min_abs=v if min_abs is None else min(min_abs,v)
+        bvals=[_clearance(x[1]) for x in boundary]
+        if bvals:
+          bv=min(bvals); min_boundary=bv if min_boundary is None else min(min_boundary,bv)
 
-    # Current closest target-lane TTC diagnostics, acceleration-aware.
     current=horizons[0]
     ft=rt=None
+    current_front_obj=current_rear_obj=None
     if current['front'] is not None:
-      o=next((x for x in objects if _key(x)==current['front']['key']),None)
+      current_front_obj=obj_by_key.get(current['front']['key'])
       st=states_by_key[current['front']['key']][0.0]
       ft=_ttc_ca(st['s'],st['s_dot'],st['s_ddot'])
     if current['rear'] is not None:
+      current_rear_obj=obj_by_key.get(current['rear']['key'])
       st=states_by_key[current['rear']['key']][0.0]
       rt=_ttc_ca(st['s'],st['s_dot'],st['s_ddot'])
 
+    scenarios={'target_brake_assumption_mps2':TARGET_BRAKE_ASSUMPTION_MPS2,
+               'ego_brake_assumption_mps2':EGO_BRAKE_ASSUMPTION_MPS2,
+               'front_target_brake':None,'rear_ego_brake':None}
+    if current_front_obj is not None:
+      st=states_by_key[_key(current_front_obj)][0.0]
+      a_rel=TARGET_BRAKE_ASSUMPTION_MPS2-float(a_ego)
+      series=[]
+      for h in HORIZONS_S:
+        sp,clr=_scenario_clearance(st['s'],st['s_dot'],a_rel,h)
+        series.append({'t':h,'s_m':round(sp,3),'clearance_m':round(clr,3)})
+      scenarios['front_target_brake']={'key':_key(current_front_obj),'relative_accel_mps2':round(a_rel,3),'horizons':series,
+                                       'min_clearance_m':round(min(x['clearance_m'] for x in series),3)}
+    if current_rear_obj is not None:
+      st=states_by_key[_key(current_rear_obj)][0.0]
+      rear_abs_accel=float(st.get('s_ddot',0.0))+float(a_ego)
+      a_rel=rear_abs_accel-EGO_BRAKE_ASSUMPTION_MPS2
+      series=[]
+      for h in HORIZONS_S:
+        sp,clr=_scenario_clearance(st['s'],st['s_dot'],a_rel,h)
+        series.append({'t':h,'s_m':round(sp,3),'clearance_m':round(clr,3)})
+      scenarios['rear_ego_brake']={'key':_key(current_rear_obj),'estimated_rear_abs_accel_mps2':round(rear_abs_accel,3),
+                                   'relative_accel_mps2':round(a_rel,3),'horizons':series,
+                                   'min_clearance_m':round(min(x['clearance_m'] for x in series),3)}
+
     return {
       'target_lane':lane_name(target_idx),'target_lane_index':target_idx,
-      'horizons':horizons,'incoming':incoming[:12],'incoming_count':len(incoming),
+      'horizons':horizons,
+      'incoming':confirmed_incoming[:12],'incoming_count':len(confirmed_incoming),
+      'possible_incoming':possible_incoming[:12],'possible_incoming_count':len(possible_incoming),
       'min_front_clearance_during_ego_overlap_m':None if min_front is None else round(float(min_front),3),
       'min_rear_clearance_during_ego_overlap_m':None if min_rear is None else round(float(min_rear),3),
+      'min_boundary_clearance_during_ego_overlap_m':None if min_boundary is None else round(float(min_boundary),3),
       'min_abs_separation_during_ego_overlap_m':None if min_abs is None else round(float(min_abs),3),
       'min_front_key':nearest_front_key,'min_rear_key':nearest_rear_key,
       'current_front_ttc_ca_s':None if ft is None else round(float(ft),3),
       'current_rear_ttc_ca_s':None if rt is None else round(float(rt),3),
+      'scenarios':scenarios,
     }
 
   def update(self, objects: list[dict], v_ego: float=0.0, a_ego: float=0.0, left_blinker: bool=False, right_blinker: bool=False) -> dict:
-    left=self._side(objects,+1); right=self._side(objects,-1)
+    left=self._side(objects,+1,a_ego); right=self._side(objects,-1,a_ego)
     return {
       'api_version':FUTURE_GAP_API_VERSION,
-      'mode':'SHADOW_GEOMETRY_ONLY',
+      'mode':'SHADOW_GEOMETRY_FG2',
       'decision_enabled':False,
       'safe_caution_blocked_enabled':False,
       'horizons_s':list(HORIZONS_S),
@@ -291,11 +374,12 @@ class FutureGapEvaluator:
       'left':left,'right':right,
       'stats':{
         'visible_objects':len(objects),
-        'left_incoming':left['incoming_count'],'right_incoming':right['incoming_count'],
-        'left_current_occupants':left['horizons'][0]['occupant_count'],
-        'right_current_occupants':right['horizons'][0]['occupant_count'],
-        'left_current_uncertain_only':left['horizons'][0]['uncertain_only_count'],
-        'right_current_uncertain_only':right['horizons'][0]['uncertain_only_count'],
+        'left_incoming_confirmed':left['incoming_count'],'right_incoming_confirmed':right['incoming_count'],
+        'left_incoming_possible':left['possible_incoming_count'],'right_incoming_possible':right['possible_incoming_count'],
+        'left_current_core':left['horizons'][0]['core_occupant_count'],
+        'right_current_core':right['horizons'][0]['core_occupant_count'],
+        'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
+        'right_current_boundary':right['horizons'][0]['boundary_overlap_count'],
       },
-      'note':'Future-gap/target-lane occupancy only; no SAFE/CAUTION/BLOCKED and no control output.',
+      'note':'FG2 shadow only: core lane gaps + boundary conflicts + confirmed/possible incoming + braking what-if; no SAFE/CAUTION/BLOCKED.',
     }

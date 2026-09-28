@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V30 monitor-only motion Kalman tracker driven by Canonical360Tracker IDs.
+"""V34 monitor-only motion Kalman tracker driven by Canonical360Tracker IDs.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
@@ -49,6 +49,10 @@ LATERAL_CA_HORIZON_S = float(os.getenv('G80_KF_LAT_CA_HORIZON_S', '0.5'))
 LATERAL_PRED_MAX_SPEED_MPS = float(os.getenv('G80_KF_LAT_PRED_MAX_SPEED_MPS', '2.0'))
 LATERAL_PRED_MAX_ACCEL_MPS2 = float(os.getenv('G80_KF_LAT_PRED_MAX_ACCEL_MPS2', '1.5'))
 HIGHWAY_CUTIN_MIN_VEGO_MPS = float(os.getenv('G80_KF_HIGHWAY_CUTIN_MIN_VEGO_MPS', '5.0'))
+KF_MAX_TRACKS = max(4, int(os.getenv('G80_KF_MAX_TRACKS', '14')))
+KF_FRONT_MAX_M = float(os.getenv('G80_KF_FRONT_MAX_M', '150.0'))
+KF_REAR_MAX_M = float(os.getenv('G80_KF_REAR_MAX_M', '90.0'))
+KF_LATERAL_MAX_M = float(os.getenv('G80_KF_LATERAL_MAX_M', '9.0'))
 
 
 def _finite(v, default=None):
@@ -355,10 +359,38 @@ class KalmanMotionTracker:
     dct['kf_cutin_score'] = round(score, 3)
     return dct
 
+  @staticmethod
+  def _priority(o: dict) -> tuple:
+    x=_finite(o.get('x'), 999.0)
+    d=_finite(o.get('road_d') if o.get('road_projection_valid') else o.get('y'), 99.0)
+    evidence=0
+    if o.get('scc_teacher_confirmed'): evidence-=80
+    if o.get('camera_confirmed'): evidence-=45
+    if o.get('rear_teacher_confirmed') or o.get('teacher_match'): evidence-=45
+    if o.get('kf_cutin_candidate') or o.get('kf_lateral_candidate'): evidence-=25
+    lane_pen=max(0.0,abs(d)-5.5)*8.0
+    rear_pen=0.0 if x>=0 else 0.15*abs(x)
+    return (evidence + abs(x) + lane_pen + rear_pen, abs(d), abs(x))
+
+  @classmethod
+  def _prediction_relevant(cls, o: dict) -> bool:
+    if o.get('scc_teacher_confirmed') or o.get('camera_confirmed') or o.get('rear_teacher_confirmed') or o.get('teacher_match'):
+      return True
+    x=_finite(o.get('x')); d=_finite(o.get('road_d') if o.get('road_projection_valid') else o.get('y'))
+    return x is not None and d is not None and -KF_REAR_MAX_M <= x <= KF_FRONT_MAX_M and abs(d) <= KF_LATERAL_MAX_M
+
   def update(self, objects: list[dict], road_model: dict | None, now_ns: int, v_ego: float = 0.0) -> tuple[list[dict], dict]:
     now_ns = int(now_ns)
-    # Predict all live tracks to this publication instant exactly once.
-    for t in self.tracks.values():
+
+    candidates=[o for o in objects if self._key(o) and self._prediction_relevant(o)]
+    candidates.sort(key=self._priority)
+    selected_keys={self._key(o) for o in candidates[:KF_MAX_TRACKS]}
+
+    # Predict only selected interaction tracks. Canonical360 identity remains full
+    # coverage; dense/far objects can fall back to raw/KF-free geometry.
+    for key,t in list(self.tracks.items()):
+      if key not in selected_keys:
+        continue
       dt = (now_ns - int(t.last_filter_ns)) / 1e9
       if dt >= MIN_DT_S:
         if t.xk is not None: t.xk.predict(dt)
@@ -368,15 +400,23 @@ class KalmanMotionTracker:
         t.last_filter_ns = now_ns
 
     out = []
-    used = set()
     updates = 0
     frenet_updates = 0
+    ranked_out=0
     for o in objects:
       key = self._key(o)
       if not key:
         out.append(dict(o))
         continue
-      used.add(key)
+      if key not in selected_keys:
+        d=dict(o)
+        d['kalman_valid']=False
+        d['kalman_api_version']=KALMAN_API_VERSION
+        d['kf_skipped_reason']='ranked_out_or_outside_roi'
+        out.append(d)
+        ranked_out+=1
+        continue
+
       t = self.tracks.get(key)
       if t is None:
         t = self._new_track(key, o, now_ns)
@@ -416,11 +456,15 @@ class KalmanMotionTracker:
     frenet_valid = sum(1 for o in out if o.get('kf_frenet_valid'))
     confident = sum(1 for o in out if o.get('kf_motion_confident'))
     lateral_unstable = sum(1 for o in out if o.get('kf_d_dot') is not None and abs(float(o.get('kf_d_dot'))) > 3.0)
-    canonical_key_mismatch = sum(1 for o in out if o.get('canonical_valid') and not o.get('kf_canonical_key_match', False))
+    canonical_key_mismatch = sum(1 for o in out if o.get('canonical_valid') and o.get('kalman_valid') and not o.get('kf_canonical_key_match', False))
     reset_suspects = sum(1 for o in out if o.get('kf_reset_suspect'))
     return out, {
       'active_tracks': len(self.tracks),
       'visible_tracks': len(out),
+      'selected_tracks': len(selected_keys),
+      'candidate_tracks_before_cap': len(candidates),
+      'ranked_out_tracks': ranked_out,
+      'max_tracks': KF_MAX_TRACKS,
       'measurement_updates': updates,
       'frenet_updates': frenet_updates,
       'frenet_valid_tracks': frenet_valid,
@@ -434,7 +478,8 @@ class KalmanMotionTracker:
       'lateral_prediction_limited_tracks': prediction_limited,
       'cutin_rule': 'vEgo>=5m/s + adjacent lane + TTLC 0.2..3.0s + low covariance + >=0.25s persistence',
       'lateral_prediction_model': 'CA <=0.5s then bounded CV',
-      'model': 'CA-6D cartesian + CA-6D Frenet',
+      'model': 'selective CA cartesian+Frenet; Canonical360 remains full coverage',
+      'roi_m': {'front':KF_FRONT_MAX_M,'rear':KF_REAR_MAX_M,'lateral_abs':KF_LATERAL_MAX_M},
       'horizons_s': list(HORIZONS_S),
       'control_connected': False,
     }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 33
-BUILD_TAG = 'v33-canonical360-imm2-future-gap-occupancy-monitor'
-LOGGER_FORMAT_VERSION = 14
+BUILD_VERSION = 34
+BUILD_TAG = 'v34-fg2-fastui-highway-validation-monitor'
+LOGGER_FORMAT_VERSION = 15
 KALMAN_API_VERSION = 3
 IMM_API_VERSION = 2
-FUTURE_GAP_API_VERSION = 1
-ANDROID_PROTOCOL_VERSION = 16
+FUTURE_GAP_API_VERSION = 2
+ANDROID_PROTOCOL_VERSION = 17
 
 # Display/reference coordinate convention. Decoded object x values are preserved
 # to keep the empirically validated SCC/rear-teacher calibration unchanged.

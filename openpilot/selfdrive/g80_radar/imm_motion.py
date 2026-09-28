@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V33 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
+"""V34 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
 
 Three linear Gaussian motion hypotheses are maintained in a common 6D state:
   [s, s_dot, s_ddot, d, d_dot, d_ddot]
@@ -35,6 +35,7 @@ IMM_REAR_MAX_M = float(os.getenv('G80_IMM_REAR_MAX_M', '80.0'))
 IMM_LATERAL_MAX_M = float(os.getenv('G80_IMM_LATERAL_MAX_M', '6.3'))
 IMM_L2_MAX_M = float(os.getenv('G80_IMM_L2_MAX_M', '8.8'))
 IMM_L2_INWARD_RATE_MPS = float(os.getenv('G80_IMM_L2_INWARD_RATE_MPS', '0.12'))
+IMM_MAX_TRACKS = max(4, int(os.getenv('G80_IMM_MAX_TRACKS', '10')))
 MAX_DT_S = float(os.getenv('G80_IMM_MAX_DT_S', '0.40'))
 MIN_DT_S = 0.01
 LANE_HALF_W_M = 1.8
@@ -427,13 +428,30 @@ class ImmMotionTracker:
     d['imm_skipped_reason']=reason
     return d
 
+  @staticmethod
+  def _priority(o: dict) -> tuple:
+    x=_finite(o.get('x'),999.0)
+    d=_finite(o.get('road_d') if o.get('road_projection_valid') else o.get('y'),99.0)
+    p=0.0
+    if o.get('scc_teacher_confirmed'): p-=100.0
+    if o.get('camera_confirmed'): p-=60.0
+    if o.get('rear_teacher_confirmed') or o.get('teacher_match'): p-=55.0
+    if o.get('kf_cutin_candidate') or o.get('kf_lateral_candidate'): p-=45.0
+    if abs(d)<=5.5: p-=25.0
+    return (p+abs(x)+6.0*max(0.0,abs(d)-5.5),abs(d),abs(x))
+
   def update(self, objects: list[dict], road_model: dict | None, now_ns: int, v_ego: float=0.0):
     now_ns=int(now_ns)
-    relevant=[]; skipped=[]
+    relevant_candidates=[]; skipped=[]
     for o in objects:
-      (relevant if self._interaction_relevant(o) else skipped).append(o)
+      (relevant_candidates if self._interaction_relevant(o) else skipped).append(o)
+    relevant_candidates.sort(key=self._priority)
+    relevant=relevant_candidates[:IMM_MAX_TRACKS]
+    selected_keys={self._key(o) for o in relevant if self._key(o)}
+    ranked_out=relevant_candidates[IMM_MAX_TRACKS:]
+    skipped.extend(ranked_out)
 
-    # Full IMM evaluation runs at 4 Hz by default while Canonical360 + KF3 stay
+    # Full IMM evaluation runs at 4 Hz by default while Canonical360 + selective KF3 stay
     # at 10 Hz.  New relevant identities force an immediate evaluation.  Cached
     # model probabilities/trajectory are at most ~200 ms old and carry an age.
     new_key=any(self._key(o) and self._key(o) not in self.tracks for o in relevant)
@@ -443,10 +461,12 @@ class ImmMotionTracker:
       relevant_keys=set()
       for o in objects:
         key=self._key(o)
-        if self._interaction_relevant(o):
+        if key in selected_keys:
           relevant_keys.add(key)
           c=self.cache.get(key)
           out.append(self._copy_cached_imm(o,c,now_ns) if c is not None else self._skip(o,'awaiting_imm_tick'))
+        elif self._interaction_relevant(o):
+          out.append(self._skip(o,'imm_capacity_ranked_out'))
         else:
           out.append(self._skip(o,'out_of_interaction_roi'))
       valid=[o for o in out if o.get('imm_valid')]
@@ -455,13 +475,13 @@ class ImmMotionTracker:
       return out,{
         'api_version':IMM_API_VERSION,'target_hz':IMM_HZ,'evaluated_this_cycle':False,
         'eval_age_ms':round((now_ns-self.last_eval_ns)/1e6,2),'active_tracks':len(self.tracks),
-        'visible_tracks':len(out),'interaction_relevant_tracks':len(relevant),'skipped_tracks':len(skipped),'valid_tracks':len(valid),
+        'visible_tracks':len(out),'interaction_candidates':len(relevant_candidates),'interaction_relevant_tracks':len(relevant),'skipped_tracks':len(skipped),'valid_tracks':len(valid),'max_tracks':IMM_MAX_TRACKS,
         'measurement_updates':0,'reset_suspect_tracks':0,'expected_reinitializations':0,
         'dominant_cv':counts['CV'],'dominant_ca':counts['CA'],'dominant_maneuver':counts['MANEUVER'],
         'maneuver_candidates':sum(1 for o in valid if o.get('imm_maneuver_candidate')),
         'mean_model_probability':means,'models':list(MODEL_NAMES),'horizons_s':list(HORIZONS_S),
         'coordinate_policy':'C4 Frenet when valid; ego x/y fallback for rear/out-of-horizon',
-        'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},
+        'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},'max_tracks':IMM_MAX_TRACKS,
         'control_connected':False,
       }
 
@@ -508,8 +528,10 @@ class ImmMotionTracker:
     out=[]
     for o in objects:
       key=self._key(o)
-      if self._interaction_relevant(o):
+      if key in selected_keys:
         out.append(decorated_by_key.get(key,self._skip(o,'no_imm_result')))
+      elif self._interaction_relevant(o):
+        out.append(self._skip(o,'imm_capacity_ranked_out'))
       else:
         out.append(self._skip(o,'out_of_interaction_roi'))
 
@@ -522,14 +544,14 @@ class ImmMotionTracker:
     }
     return out,{
       'api_version':IMM_API_VERSION,'target_hz':IMM_HZ,'evaluated_this_cycle':True,'eval_age_ms':0.0,
-      'active_tracks':len(self.tracks),'visible_tracks':len(out),'interaction_relevant_tracks':len(relevant),'skipped_tracks':len(skipped),'valid_tracks':len(valid),
+      'active_tracks':len(self.tracks),'visible_tracks':len(out),'interaction_candidates':len(relevant_candidates),'interaction_relevant_tracks':len(relevant),'skipped_tracks':len(skipped),'valid_tracks':len(valid),'max_tracks':IMM_MAX_TRACKS,
       'measurement_updates':updates,'reset_suspect_tracks':suspect_resets,'expected_reinitializations':expected_reinits,
       'dominant_cv':counts['CV'],'dominant_ca':counts['CA'],'dominant_maneuver':counts['MANEUVER'],
       'maneuver_candidates':sum(1 for o in valid if o.get('imm_maneuver_candidate')),
       'mean_model_probability':means,
       'models':list(MODEL_NAMES),'horizons_s':list(HORIZONS_S),
       'coordinate_policy':'C4 Frenet when valid; ego x/y fallback for rear/out-of-horizon',
-      'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},
+      'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},'max_tracks':IMM_MAX_TRACKS,
       'control_connected':False,
     }
 

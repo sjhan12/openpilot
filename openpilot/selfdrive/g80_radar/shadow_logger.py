@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  2 Hz periodic sampling (V33 Golden-replay default)
+  2 Hz periodic sampling (V34 Golden/highway-validation default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -142,7 +142,7 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'Canonical/KF target 10Hz; IMM2 default 4Hz selective ROI; 2Hz gzip level1; local-domain road annotation on-demand',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V33 shadow geometry only: left/right NOW/0.5/1/2/3s + target-lane incoming; no SAFE/CAUTION/BLOCKED',
+          'future_gap_policy':'V34 FG2: core/boundary occupancy + confirmed/possible incoming + brake what-if; no SAFE/CAUTION/BLOCKED',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -162,23 +162,28 @@ class ShadowLogger:
     self.fp.write(s + '\n')
     self.uncompressed_bytes += len(s.encode('utf-8')) + 1
 
-  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None, imm_stats: dict | None = None):
+  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None, imm_stats: dict | None = None, future_gap: dict | None = None, ego_state: dict | None = None):
     """Sparse event signature.
 
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
     became "events" and gzip/JSON work ran almost every publish.  V31 reserves
     immediate records for semantically important lead/cut-in transitions; the
-    full canonical/IMM state is still captured by the 4 Hz periodic stream.
+    full canonical/IMM/FG2 state is still captured by the 2 Hz periodic stream.
     """
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
     st = shadow.get('stats', {}) or {}
+    fg=future_gap or {}
+    left=(fg.get('left') or {}); right=(fg.get('right') or {})
+    ego=ego_state or {}
     return (
       bool(l1.get('status')), l1.get('key'), l1.get('reason'),
       bool(l2.get('status')), l2.get('key'), l2.get('reason'),
       int(st.get('confirmed_cutin_count', 0) or 0),
       bool(st.get('path_valid')), bool(st.get('v_ego_valid')),
       int((kalman_stats or {}).get('cutin_confirmed', 0) or 0),
+      int(left.get('incoming_count',0) or 0), int(right.get('incoming_count',0) or 0),
+      bool(ego.get('leftBlinker')), bool(ego.get('rightBlinker')),
     )
 
   def _rotate_due(self, now_mono: float) -> bool:
@@ -313,7 +318,7 @@ class ShadowLogger:
 
     now_mono = time.monotonic()
     shadow = core.get('shadow_leads', {}) or {}
-    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}), core.get('imm_motion_stats', {}))
+    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}), core.get('imm_motion_stats', {}), core.get('future_gap', {}), core.get('ego_state', {}))
     event = self.last_signature is not None and sig != self.last_signature
     self.last_signature = sig
 
