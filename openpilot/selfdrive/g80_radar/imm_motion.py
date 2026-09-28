@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V32 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
+"""V33 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
 
 Three linear Gaussian motion hypotheses are maintained in a common 6D state:
   [s, s_dot, s_ddot, d, d_dot, d_ddot]
@@ -28,11 +28,13 @@ HORIZONS_S = (0.5, 1.0, 2.0, 3.0)
 MODEL_NAMES = ('CV', 'CA', 'MANEUVER')
 MODEL_CV, MODEL_CA, MODEL_MAN = 0, 1, 2
 TRACK_TTL_NS = int(float(os.getenv('G80_IMM_TRACK_TTL_S', '1.5')) * 1e9)
-IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '5.0')))
+IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '4.0')))
 IMM_PERIOD_NS = int(1e9 / IMM_HZ)
-IMM_FRONT_MAX_M = float(os.getenv('G80_IMM_FRONT_MAX_M', '150.0'))
+IMM_FRONT_MAX_M = float(os.getenv('G80_IMM_FRONT_MAX_M', '125.0'))
 IMM_REAR_MAX_M = float(os.getenv('G80_IMM_REAR_MAX_M', '80.0'))
-IMM_LATERAL_MAX_M = float(os.getenv('G80_IMM_LATERAL_MAX_M', '8.5'))
+IMM_LATERAL_MAX_M = float(os.getenv('G80_IMM_LATERAL_MAX_M', '6.3'))
+IMM_L2_MAX_M = float(os.getenv('G80_IMM_L2_MAX_M', '8.8'))
+IMM_L2_INWARD_RATE_MPS = float(os.getenv('G80_IMM_L2_INWARD_RATE_MPS', '0.12'))
 MAX_DT_S = float(os.getenv('G80_IMM_MAX_DT_S', '0.40'))
 MIN_DT_S = 0.01
 LANE_HALF_W_M = 1.8
@@ -393,9 +395,19 @@ class ImmMotionTracker:
     if o.get('scc_teacher_confirmed') or o.get('camera_confirmed') or o.get('teacher_match') or o.get('rear_teacher_confirmed') or o.get('kf_cutin_candidate'):
       return True
     x=_finite(o.get('x')); y=_finite(o.get('road_d') if o.get('road_projection_valid') else o.get('y'))
-    if x is None or y is None:
+    if x is None or y is None or not (-IMM_REAR_MAX_M <= x <= IMM_FRONT_MAX_M):
       return False
-    return (-IMM_REAR_MAX_M <= x <= IMM_FRONT_MAX_M) and abs(y) <= IMM_LATERAL_MAX_M
+    # Ego/adjacent lanes are always prediction-relevant.  L2/R2 vehicles are
+    # promoted when KF3 already sees an inward lateral rate, preserving the
+    # L2->L1 / R2->R1 use case without running three IMM filters on every far
+    # second-lane object.
+    if abs(y) <= IMM_LATERAL_MAX_M:
+      return True
+    if abs(y) <= IMM_L2_MAX_M:
+      d_dot=_finite(o.get('kf_d_dot'), _finite(o.get('kf_vy'), 0.0)) or 0.0
+      inward=(y > 0.0 and d_dot < -IMM_L2_INWARD_RATE_MPS) or (y < 0.0 and d_dot > IMM_L2_INWARD_RATE_MPS)
+      return bool(inward or o.get('kf_lateral_candidate') or o.get('kf_low_speed_lateral_candidate'))
+    return False
 
   @staticmethod
   def _copy_cached_imm(o: dict, cached: dict, now_ns: int) -> dict:
@@ -421,7 +433,7 @@ class ImmMotionTracker:
     for o in objects:
       (relevant if self._interaction_relevant(o) else skipped).append(o)
 
-    # Full IMM evaluation runs at 5 Hz by default while Canonical360 + KF3 stay
+    # Full IMM evaluation runs at 4 Hz by default while Canonical360 + KF3 stay
     # at 10 Hz.  New relevant identities force an immediate evaluation.  Cached
     # model probabilities/trajectory are at most ~200 ms old and carry an age.
     new_key=any(self._key(o) and self._key(o) not in self.tracks for o in relevant)
@@ -449,7 +461,7 @@ class ImmMotionTracker:
         'maneuver_candidates':sum(1 for o in valid if o.get('imm_maneuver_candidate')),
         'mean_model_probability':means,'models':list(MODEL_NAMES),'horizons_s':list(HORIZONS_S),
         'coordinate_policy':'C4 Frenet when valid; ego x/y fallback for rear/out-of-horizon',
-        'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_abs':IMM_LATERAL_MAX_M},
+        'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},
         'control_connected':False,
       }
 
@@ -517,7 +529,7 @@ class ImmMotionTracker:
       'mean_model_probability':means,
       'models':list(MODEL_NAMES),'horizons_s':list(HORIZONS_S),
       'coordinate_policy':'C4 Frenet when valid; ego x/y fallback for rear/out-of-horizon',
-      'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_abs':IMM_LATERAL_MAX_M},
+      'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},
       'control_connected':False,
     }
 

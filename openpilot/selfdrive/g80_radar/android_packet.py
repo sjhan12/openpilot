@@ -70,6 +70,8 @@ def build_render_packet(state: dict) -> dict:
     'canonical_tracker_stats':state.get('canonical_tracker_stats',{}),
     'kalman_motion_stats':state.get('kalman_motion_stats',{}),
     'imm_motion_stats':state.get('imm_motion_stats',{}),
+    'future_gap':state.get('future_gap',{}),
+    'ego_state':state.get('ego_state',{}),
     'performance_stats':state.get('performance_stats',{}),
     'scc_teacher_by_bus':state.get('scc_teacher_by_bus',{}),
     'associations':state.get('corner_front_associations',[]),

@@ -45,13 +45,14 @@ DUP_DV_MPS = 3.0
 LEAD_REID_MAX_AGE_S = 0.65
 RADAR_ONLY_MAX_DREL_M = 100.0
 
-# V32: a sticky previous L1 must yield when a substantially closer ego-path
-# vehicle is independently confirmed by both SCC and camera.  This fixes the
-# V31 case where the SCC matcher was correct but ShadowLeadVerifier kept an
-# older, farther L1 solely because its identity was still eligible.
+# V33: a sticky previous L1 must yield when a substantially closer ego-path
+# vehicle is independently confirmed by both SCC and camera. Strong SCC+CAM
+# evidence gets a 2.20 m soft path gate (the V32 golden log had a real 1.859 m
+# dPath challenger rejected by the previous 1.80 m hard gate). General L1
+# eligibility/path logic remains unchanged.
 L1_STRONG_HANDOFF_CONFIRM_S = 0.15
 L1_STRONG_HANDOFF_MIN_GAIN_M = 1.0
-L1_STRONG_HANDOFF_MAX_DPATH_M = 1.80
+L1_STRONG_HANDOFF_MAX_DPATH_M = 2.20
 
 
 def _finite(v, default=0.0):
@@ -433,13 +434,19 @@ class ShadowLeadVerifier:
     # noisy frame cannot steal L1.
     if l1c is not None:
       strong=[]
-      for c in eligible:
+      # Strong SCC+CAM evidence gets a *soft* path gate and therefore must scan
+      # all fresh candidates, not only the normal 1.80 m `eligible` set. SCC
+      # matching is already ego-path constrained upstream and camera confirmation
+      # supplies independent evidence.
+      for c in candidates:
         if c['key']==l1c['key'] or self._same_physical(c,l1c):
           continue
         ev=c['evidence']
         if not (c['physical'] and ev['scc'] and ev['camera']):
           continue
         if abs(float(c['dpath'])) > L1_STRONG_HANDOFF_MAX_DPATH_M:
+          continue
+        if c.get('far_unconfirmed'):
           continue
         gain=float(l1c['x'])-float(c['x'])
         if gain < L1_STRONG_HANDOFF_MIN_GAIN_M:

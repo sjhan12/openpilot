@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  4 Hz periodic sampling (V32 performance-safe default)
+  2 Hz periodic sampling (V33 Golden-replay default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -52,7 +52,7 @@ def _compact_obj(o: dict) -> dict:
     'kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
     'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason',
     'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
-    'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate','imm_trajectory'
+    'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate'
   )
   return {k:o.get(k) for k in keys if k in o and o.get(k) is not None}
 
@@ -67,7 +67,7 @@ class ShadowLogger:
                flush_sec: float | None = None):
     self.log_dir = Path(log_dir or os.getenv('G80_SHADOW_LOG_DIR', '/data/radar'))
     self.enabled = _env_bool('G80_SHADOW_LOG', True) if enabled is None else bool(enabled)
-    self.hz = max(0.2, float(os.getenv('G80_SHADOW_LOG_HZ', '4.0')) if hz is None else float(hz))
+    self.hz = max(0.2, float(os.getenv('G80_SHADOW_LOG_HZ', '2.0')) if hz is None else float(hz))
     self.rotate_min = max(1.0, float(os.getenv('G80_SHADOW_LOG_ROTATE_MIN', '30')) if rotate_min is None else float(rotate_min))
     self.max_bytes = int(max(1.0, float(os.getenv('G80_SHADOW_LOG_MAX_MB', '64')) if max_mb is None else float(max_mb)) * 1024 * 1024)
     self.flush_sec = max(0.2, float(os.getenv('G80_SHADOW_LOG_FLUSH_SEC', '1.0')) if flush_sec is None else float(flush_sec))
@@ -107,7 +107,7 @@ class ShadowLogger:
       self.log_dir.mkdir(parents=True, exist_ok=True)
       self.final_path = self._filename()
       self.path = Path(str(self.final_path) + '.part')
-      self.fp = gzip.open(self.path, 'at', encoding='utf-8', compresslevel=3)
+      self.fp = gzip.open(self.path, 'at', encoding='utf-8', compresslevel=1)
       self.file_start_mono = now_mono
       self.next_flush_mono = now_mono + self.flush_sec
       self.uncompressed_bytes = 0
@@ -128,7 +128,7 @@ class ShadowLogger:
           'vehicle_footprint_m':[4.8,2.1],
           'vehicle_vrel_gate_mps':2.5,
           'kalman_model':'KF3 baseline: CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
-          'imm_model':'IMM2: CV + CA + MANEUVER; 5Hz interaction ROI with cached hypotheses between ticks',
+          'imm_model':'IMM2: CV + CA + MANEUVER; 4Hz selective interaction ROI with cached hypotheses between ticks',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
           'coordinate_x_origin':'ego_front_bumper_display_reference',
           'decoded_object_x_adjustment_m':0.0,
@@ -140,8 +140,9 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'Canonical/KF 10Hz; IMM2 default 5Hz interaction ROI; 4Hz gzip level3; compact UI/UDP',
-          'future_gap_evaluator':False,
+          'performance_policy':'Canonical/KF target 10Hz; IMM2 default 4Hz selective ROI; 2Hz gzip level1; local-domain road annotation on-demand',
+          'future_gap_evaluator':True,
+          'future_gap_policy':'V33 shadow geometry only: left/right NOW/0.5/1/2/3s + target-lane incoming; no SAFE/CAUTION/BLOCKED',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -224,6 +225,8 @@ class ShadowLogger:
       'standard_front_preview_stats':core.get('standard_front_preview_stats',{}),
       'kalman_motion_stats':core.get('kalman_motion_stats',{}),
       'imm_motion_stats':core.get('imm_motion_stats',{}),
+      'future_gap':core.get('future_gap',{}),
+      'ego_state':core.get('ego_state',{}),
       'performance_stats':core.get('performance_stats',{}),
       'corner_kalman_motion_stats':core.get('corner_kalman_motion_stats',{}),
       'front_kalman_motion_stats':core.get('front_kalman_motion_stats',{}),
@@ -274,6 +277,8 @@ class ShadowLogger:
       'imm_objects':imm_valid,
       'imm_maneuver_candidates':imm_man,
       'imm_reset_suspects':imm_reset,
+      'future_gap_left_incoming':int((((core.get('future_gap',{}) or {}).get('left',{}) or {}).get('incoming_count',0) or 0)),
+      'future_gap_right_incoming':int((((core.get('future_gap',{}) or {}).get('right',{}) or {}).get('incoming_count',0) or 0)),
       'scc_teacher_usable':bool(teacher.get('teacher_usable')),
       'shadow_l1_present':bool(l1.get('status')),
       'rear_teacher_usable_count':sum(1 for t in (core.get('teacher_rear',[]) or []) if t.get('teacher_usable')),

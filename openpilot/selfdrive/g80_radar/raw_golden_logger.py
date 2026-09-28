@@ -43,12 +43,6 @@ Environment overrides:
   G80_RAW_PAUSE_FREE_GB=6
   G80_RAW_RESUME_FREE_GB=8
   G80_RAW_MAX_HOURS=3
-
-Low-disk behavior:
-  - recorder PROCESS stays alive
-  - below PAUSE_FREE_GB: raw recording pauses, incoming messages are drained/discarded
-  - at/above RESUME_FREE_GB: recording resumes automatically
-  - this prevents manager from reporting "g80rawlogger process not running"
   G80_RAW_QUEUE=16384
 
 This process is RECEIVE-ONLY. It never publishes cereal messages and never
@@ -59,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import fcntl
 import json
 import os
 import platform
@@ -75,6 +70,7 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 FORMAT_VERSION = 1
+RECORDER_VERSION = 2
 MAGIC = b"G80RAW1\0"
 RECORD_HEADER = struct.Struct("<BBHQQII")
 UINT32 = struct.Struct("<I")
@@ -267,6 +263,7 @@ class GoldenWriter:
     header = {
       "format": "G80_RAW_GOLDEN",
       "format_version": FORMAT_VERSION,
+    "recorder_version": RECORDER_VERSION,
       "magic": "G80RAW1",
       "chunk_index": self.chunk_index,
       "created_utc": _utc_now(),
@@ -356,6 +353,31 @@ def _session_metadata(session_dir: Path, codec: str, chunk_sec: int) -> dict:
   }
 
 
+def _acquire_singleton(root: Path):
+  """Hold an advisory lock for the complete recorder lifetime.
+
+  If another recorder already owns the lock, remain as a harmless standby while
+  the enable marker exists instead of creating a second Golden session. This
+  prevents manager + manual-launch duplicates from both recording/compressing.
+  """
+  lock_path = root / ".g80_raw_golden.lock"
+  fp = open(lock_path, "a+", encoding="utf-8")
+  try:
+    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError:
+    print(f"G80 golden recorder: another instance owns {lock_path}; standby only", flush=True)
+    marker = os.getenv("G80_RAW_ENABLE_MARKER", DEFAULT_ENABLE_MARKER)
+    try:
+      while os.path.exists(marker):
+        time.sleep(5.0)
+    finally:
+      fp.close()
+    return None
+  fp.seek(0); fp.truncate()
+  fp.write(f"pid={os.getpid()} started={_utc_now()}\n"); fp.flush()
+  return fp
+
+
 def run_recorder() -> int:
   # Keep this recorder below perception/UI priority. Writer runs in a separate thread.
   try:
@@ -367,20 +389,13 @@ def run_recorder() -> int:
 
   root = Path(os.getenv("G80_RAW_ROOT", DEFAULT_ROOT))
   root.mkdir(parents=True, exist_ok=True)
+  singleton_fp = _acquire_singleton(root)
+  if singleton_fp is None:
+    return 0
   chunk_sec = max(10, int(float(os.getenv("G80_RAW_CHUNK_SEC", "60"))))
   codec = os.getenv("G80_RAW_CODEC", "auto").strip().lower()
-  # Keep the process alive on low disk. 6/8 GB hysteresis avoids rapid
-  # pause/resume oscillation around one threshold.
-  # G80_RAW_MIN_FREE_GB from the old version is intentionally ignored.
-  # Use the new pause/resume thresholds below.
-  pause_free_gb = max(
-    1.0,
-    float(os.getenv("G80_RAW_PAUSE_FREE_GB", "6")),
-  )
-  resume_free_gb = max(
-    pause_free_gb + 0.5,
-    float(os.getenv("G80_RAW_RESUME_FREE_GB", "8")),
-  )
+  pause_free_gb = max(1.0, float(os.getenv("G80_RAW_PAUSE_FREE_GB", "6")))
+  resume_free_gb = max(pause_free_gb + 0.5, float(os.getenv("G80_RAW_RESUME_FREE_GB", "8")))
   max_hours = max(0.25, float(os.getenv("G80_RAW_MAX_HOURS", "3")))
   queue_size = max(1024, int(os.getenv("G80_RAW_QUEUE", "16384")))
 
@@ -417,22 +432,15 @@ def run_recorder() -> int:
   start_ns = time.monotonic_ns()
   next_status = 0.0
   last_status = {}
-
-  # Disk-pause state. We still drain cereal sockets while paused so ZMQ queues
-  # do not grow without bound. Messages seen while paused are intentionally
-  # not serialized/written.
-  usage0 = shutil.disk_usage(root)
-  free_gb0 = usage0.free / (1024 ** 3)
-  paused_low_disk = free_gb0 < pause_free_gb
-  paused_max_hours = False
+  paused = False
   paused_drops = {k: 0 for k in SERVICE_IDS}
 
   try:
     while not stop.is_set():
       now = time.monotonic()
       if now - start_mono >= max_hours * 3600.0:
-        # Do not exit: manager expects this process to stay alive.
-        paused_max_hours = True
+        stop_reason["reason"] = "max_hours"
+        break
 
       got = False
       for service, sock in sockets.items():
@@ -441,11 +449,6 @@ def run_recorder() -> int:
           if msg is None:
             break
           got = True
-
-          if paused_low_disk or paused_max_hours:
-            paused_drops[service] += 1
-            continue
-
           recv_ns = time.monotonic_ns()
           try:
             payload = _event_to_bytes(msg)
@@ -453,38 +456,33 @@ def run_recorder() -> int:
           except Exception:
             writer.note_serialization_error()
             continue
-          writer.submit(service, recv_ns, log_mono_ns, payload)
+          if paused:
+            paused_drops[service] += 1
+          else:
+            writer.submit(service, recv_ns, log_mono_ns, payload)
 
       if now >= next_status:
         usage = shutil.disk_usage(root)
         free_gb = usage.free / (1024 ** 3)
-
-        # Hysteresis: pause below 6 GB (default), resume at/above 8 GB.
-        # The process itself never exits because of low disk.
-        if not paused_low_disk and free_gb < pause_free_gb:
-          paused_low_disk = True
-        elif paused_low_disk and free_gb >= resume_free_gb:
-          paused_low_disk = False
-
         stats = writer.snapshot()
-        pause_reasons = []
-        if paused_low_disk:
-          pause_reasons.append("low_disk_space")
-        if paused_max_hours:
-          pause_reasons.append("max_hours")
-
+        if not paused and free_gb < pause_free_gb:
+          paused = True
+        elif paused and free_gb >= resume_free_gb:
+          paused = False
         last_status = {
           "session": str(session_dir),
           "running": True,
-          "recording": not (paused_low_disk or paused_max_hours),
-          "paused": bool(paused_low_disk or paused_max_hours),
-          "pause_reasons": pause_reasons,
+          "recording": not paused,
+          "paused": paused,
+          "pause_reasons": (["low_disk_space"] if paused else []),
           "start_monotonic_ns": start_ns,
           "elapsed_sec": round(now - start_mono, 1),
           "free_gb": round(free_gb, 2),
           "pause_free_gb": pause_free_gb,
           "resume_free_gb": resume_free_gb,
           "paused_drops_by_service": dict(paused_drops),
+          "singleton_pid": os.getpid(),
+          "recorder_version": RECORDER_VERSION,
           **stats,
         }
         _atomic_json(session_dir / "status.json", last_status)
@@ -501,11 +499,17 @@ def run_recorder() -> int:
       **last_status,
       **writer.snapshot(),
       "running": False,
-      "recording": False,
       "ended_utc": _utc_now(),
       "elapsed_sec": round(now - start_mono, 1),
       "free_gb": round(usage.free / (1024 ** 3), 2),
       "stop_reason": stop_reason["reason"],
+      "recording": False,
+      "paused": paused,
+      "pause_free_gb": pause_free_gb,
+      "resume_free_gb": resume_free_gb,
+      "paused_drops_by_service": dict(paused_drops),
+      "singleton_pid": os.getpid(),
+      "recorder_version": RECORDER_VERSION,
     }
     _atomic_json(session_dir / "status.json", final)
     _atomic_json(root / "STATUS.json", final)
@@ -513,6 +517,11 @@ def run_recorder() -> int:
     try:
       (root / "CURRENT_SESSION.txt").unlink()
     except FileNotFoundError:
+      pass
+    try:
+      fcntl.flock(singleton_fp.fileno(), fcntl.LOCK_UN)
+      singleton_fp.close()
+    except Exception:
       pass
   return 0
 
