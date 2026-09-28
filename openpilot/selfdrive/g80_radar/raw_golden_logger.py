@@ -40,8 +40,15 @@ Environment overrides:
   G80_RAW_ROOT=/data/radar/golden
   G80_RAW_CHUNK_SEC=60
   G80_RAW_CODEC=auto        # auto | zstd | gzip | none
-  G80_RAW_MIN_FREE_GB=10
+  G80_RAW_PAUSE_FREE_GB=6
+  G80_RAW_RESUME_FREE_GB=8
   G80_RAW_MAX_HOURS=3
+
+Low-disk behavior:
+  - recorder PROCESS stays alive
+  - below PAUSE_FREE_GB: raw recording pauses, incoming messages are drained/discarded
+  - at/above RESUME_FREE_GB: recording resumes automatically
+  - this prevents manager from reporting "g80rawlogger process not running"
   G80_RAW_QUEUE=16384
 
 This process is RECEIVE-ONLY. It never publishes cereal messages and never
@@ -362,7 +369,18 @@ def run_recorder() -> int:
   root.mkdir(parents=True, exist_ok=True)
   chunk_sec = max(10, int(float(os.getenv("G80_RAW_CHUNK_SEC", "60"))))
   codec = os.getenv("G80_RAW_CODEC", "auto").strip().lower()
-  min_free_gb = max(1.0, float(os.getenv("G80_RAW_MIN_FREE_GB", "10")))
+  # Keep the process alive on low disk. 6/8 GB hysteresis avoids rapid
+  # pause/resume oscillation around one threshold.
+  # G80_RAW_MIN_FREE_GB from the old version is intentionally ignored.
+  # Use the new pause/resume thresholds below.
+  pause_free_gb = max(
+    1.0,
+    float(os.getenv("G80_RAW_PAUSE_FREE_GB", "6")),
+  )
+  resume_free_gb = max(
+    pause_free_gb + 0.5,
+    float(os.getenv("G80_RAW_RESUME_FREE_GB", "8")),
+  )
   max_hours = max(0.25, float(os.getenv("G80_RAW_MAX_HOURS", "3")))
   queue_size = max(1024, int(os.getenv("G80_RAW_QUEUE", "16384")))
 
@@ -400,12 +418,21 @@ def run_recorder() -> int:
   next_status = 0.0
   last_status = {}
 
+  # Disk-pause state. We still drain cereal sockets while paused so ZMQ queues
+  # do not grow without bound. Messages seen while paused are intentionally
+  # not serialized/written.
+  usage0 = shutil.disk_usage(root)
+  free_gb0 = usage0.free / (1024 ** 3)
+  paused_low_disk = free_gb0 < pause_free_gb
+  paused_max_hours = False
+  paused_drops = {k: 0 for k in SERVICE_IDS}
+
   try:
     while not stop.is_set():
       now = time.monotonic()
       if now - start_mono >= max_hours * 3600.0:
-        stop_reason["reason"] = "max_hours"
-        break
+        # Do not exit: manager expects this process to stay alive.
+        paused_max_hours = True
 
       got = False
       for service, sock in sockets.items():
@@ -414,6 +441,11 @@ def run_recorder() -> int:
           if msg is None:
             break
           got = True
+
+          if paused_low_disk or paused_max_hours:
+            paused_drops[service] += 1
+            continue
+
           recv_ns = time.monotonic_ns()
           try:
             payload = _event_to_bytes(msg)
@@ -426,22 +458,38 @@ def run_recorder() -> int:
       if now >= next_status:
         usage = shutil.disk_usage(root)
         free_gb = usage.free / (1024 ** 3)
+
+        # Hysteresis: pause below 6 GB (default), resume at/above 8 GB.
+        # The process itself never exits because of low disk.
+        if not paused_low_disk and free_gb < pause_free_gb:
+          paused_low_disk = True
+        elif paused_low_disk and free_gb >= resume_free_gb:
+          paused_low_disk = False
+
         stats = writer.snapshot()
+        pause_reasons = []
+        if paused_low_disk:
+          pause_reasons.append("low_disk_space")
+        if paused_max_hours:
+          pause_reasons.append("max_hours")
+
         last_status = {
           "session": str(session_dir),
           "running": True,
+          "recording": not (paused_low_disk or paused_max_hours),
+          "paused": bool(paused_low_disk or paused_max_hours),
+          "pause_reasons": pause_reasons,
           "start_monotonic_ns": start_ns,
           "elapsed_sec": round(now - start_mono, 1),
           "free_gb": round(free_gb, 2),
-          "min_free_gb": min_free_gb,
+          "pause_free_gb": pause_free_gb,
+          "resume_free_gb": resume_free_gb,
+          "paused_drops_by_service": dict(paused_drops),
           **stats,
         }
         _atomic_json(session_dir / "status.json", last_status)
         _atomic_json(root / "STATUS.json", last_status)
         next_status = now + 2.0
-        if free_gb < min_free_gb:
-          stop_reason["reason"] = "low_disk_space"
-          break
 
       if not got:
         time.sleep(0.001)
@@ -453,6 +501,7 @@ def run_recorder() -> int:
       **last_status,
       **writer.snapshot(),
       "running": False,
+      "recording": False,
       "ended_utc": _utc_now(),
       "elapsed_sec": round(now - start_mono, 1),
       "free_gb": round(usage.free / (1024 ** 3), 2),
