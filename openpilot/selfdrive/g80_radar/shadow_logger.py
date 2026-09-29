@@ -142,7 +142,8 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V38R1 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'future_gap_policy':'V38R2 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -162,7 +163,7 @@ class ShadowLogger:
     self.fp.write(s + '\n')
     self.uncompressed_bytes += len(s.encode('utf-8')) + 1
 
-  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None, imm_stats: dict | None = None, future_gap: dict | None = None, ego_state: dict | None = None):
+  def _signature(self, shadow: dict, kalman_stats: dict | None = None, canonical_stats: dict | None = None, imm_stats: dict | None = None, future_gap: dict | None = None, ego_state: dict | None = None, traffic_signal: dict | None = None):
     """Sparse event signature.
 
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
@@ -176,6 +177,7 @@ class ShadowLogger:
     fg=future_gap or {}
     left=(fg.get('left') or {}); right=(fg.get('right') or {})
     ego=ego_state or {}
+    tl=traffic_signal or {}
     return (
       bool(l1.get('status')), l1.get('key'), l1.get('reason'),
       bool(l2.get('status')), l2.get('key'), l2.get('reason'),
@@ -185,6 +187,7 @@ class ShadowLogger:
       int(left.get('stable_incoming_count',0) or 0), int(right.get('stable_incoming_count',0) or 0),
       (left.get('decision') or {}).get('state'), (right.get('decision') or {}).get('state'),
       bool(ego.get('leftBlinker')), bool(ego.get('rightBlinker')),
+      tl.get('state'), bool(tl.get('sunnypilot_green_alert')), tl.get('turn_direction'),
     )
 
   def _rotate_due(self, now_mono: float) -> bool:
@@ -232,6 +235,7 @@ class ShadowLogger:
       'kalman_motion_stats':core.get('kalman_motion_stats',{}),
       'imm_motion_stats':core.get('imm_motion_stats',{}),
       'future_gap':core.get('future_gap',{}),
+      'traffic_signal_probe':core.get('traffic_signal_probe',{}),
       'ego_state':core.get('ego_state',{}),
       'performance_stats':core.get('performance_stats',{}),
       'corner_kalman_motion_stats':core.get('corner_kalman_motion_stats',{}),
@@ -319,7 +323,7 @@ class ShadowLogger:
 
     now_mono = time.monotonic()
     shadow = core.get('shadow_leads', {}) or {}
-    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}), core.get('imm_motion_stats', {}), core.get('future_gap', {}), core.get('ego_state', {}))
+    sig = self._signature(shadow, core.get('kalman_motion_stats', {}), core.get('canonical_tracker_stats', {}), core.get('imm_motion_stats', {}), core.get('future_gap', {}), core.get('ego_state', {}), core.get('traffic_signal_probe', {}))
     event = self.last_signature is not None and sig != self.last_signature
     self.last_signature = sig
 
@@ -334,6 +338,7 @@ class ShadowLogger:
       int(stats.get('fresh_object_count', 0) or 0) > 0
       or production_valid
       or len(core.get('camera_leads', [])) > 0
+      or bool((core.get('traffic_signal_probe', {}) or {}).get('context_active'))
     )
     if not meaningful and not event:
       self.next_periodic_mono = now_mono + 1.0 / self.hz

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V38R1 shadow Future Gap + Target-Lane Occupancy evaluator.
+"""V38R2 shadow Future Gap + Target-Lane Occupancy evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
 geometry for NOW/0.5/1/2/3 s.  V37 keeps FG4 geometry and adds DEC3 maneuver-context handling:
