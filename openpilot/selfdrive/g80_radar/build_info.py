@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 38
-BUILD_TAG = 'v38r2-source-trace-road-gate-signal-probe-fg6-dec3-goldenv2'
+BUILD_TAG = 'v38r3-source-trace-road-gate-signal-hud-kr-horizontal-fg6-dec3-goldenv2'
 LOGGER_FORMAT_VERSION = 20
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3

@@ -25,7 +25,7 @@ PATH_PROJECTION_MARGIN_M = 0.75
 PATH_BACK_MARGIN_M = 1.0
 MAX_PROJECTION_D_M = 12.5
 
-# V38R2 target-lane geometry gate.  SAFE is allowed only when C4 road geometry
+# V38R3 target-lane geometry gate.  SAFE is allowed only when C4 road geometry
 # confirms that a lane-sized lateral corridor exists on that side.  This is
 # diagnostic/UI gating only; it is not connected to planner or CAN control.
 LANE_GATE_SAMPLE_X_M = (8.0, 15.0, 25.0)

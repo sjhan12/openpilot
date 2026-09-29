@@ -142,7 +142,7 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V38R2 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'future_gap_policy':'V38R3 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
         },
         'control_connected':False,
