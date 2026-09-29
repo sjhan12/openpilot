@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 37
-BUILD_TAG = 'v37r1-fg5-dec3-turn-latch-arrow-hud-goldenv2'
-LOGGER_FORMAT_VERSION = 18
+BUILD_VERSION = 38
+BUILD_TAG = 'v38-source-trace-corner-debug-fg5-dec3-goldenv2'
+LOGGER_FORMAT_VERSION = 19
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
 FUTURE_GAP_API_VERSION = 5
-ANDROID_PROTOCOL_VERSION = 20
+ANDROID_PROTOCOL_VERSION = 21
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'
 EGO_DISPLAY_LENGTH_M = 4.8

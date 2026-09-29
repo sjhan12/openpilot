@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  2 Hz periodic sampling (V37 Golden-regression default)
+  2 Hz periodic sampling (V38 source-trace default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -142,7 +142,7 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V37 FG5+DEC3: turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'future_gap_policy':'V38 FG5+DEC3: source-trace UI + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
         },
         'control_connected':False,
         'publishes_radarState':False,
