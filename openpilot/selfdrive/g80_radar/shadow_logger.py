@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  2 Hz periodic sampling (V35 Golden/highway-validation default)
+  2 Hz periodic sampling (V36 Golden-regression default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -142,7 +142,7 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V35 FG3+DEC1: temporal incoming + core/boundary occupancy + braking what-if + shadow SAFE/CAUTION/BLOCKED',
+          'future_gap_policy':'V36 FG4+DEC2: geometry/TTC/incoming danger + advisory braking what-if + stabilized blinker HUD',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -168,7 +168,7 @@ class ShadowLogger:
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
     became "events" and gzip/JSON work ran almost every publish.  V31 reserves
     immediate records for semantically important lead/cut-in transitions; the
-    full canonical/IMM/FG3/DEC1 state is still captured by the 2 Hz periodic stream.
+    full canonical/IMM/FG4/DEC2 state is still captured by the 2 Hz periodic stream.
     """
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}

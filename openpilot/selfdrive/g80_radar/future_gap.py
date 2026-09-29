@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""V35 shadow Future Gap + Target-Lane Occupancy evaluator.
+"""V36 shadow Future Gap + Target-Lane Occupancy evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
-geometry for NOW/0.5/1/2/3 s.  V35 keeps the V34 geometry separation and adds temporal incoming + DEC1 diagnostic:
+geometry for NOW/0.5/1/2/3 s.  V36 keeps FG3 geometry and adds DEC2 raw decision + conservative display hysteresis:
 - core occupants: object centre is inside the target lane;
 - boundary overlaps: only the object footprint overlaps the target lane;
 - confirmed incoming: predicted centre enters and persists in the target lane;
 - possible incoming: footprint/one-horizon entry only.
 
 It also exposes diagnostic what-if braking scenarios and shadow-only
-SAFE_SHADOW/CAUTION_SHADOW/BLOCKED_SHADOW. These are diagnostic labels only and
+SAFE_SHADOW/CAUTION_SHADOW/BLOCKED_SHADOW. Driver HUD maps these to SAFE/CHECK?/DANGER. These are diagnostic labels only and
 are not connected to planner/control.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name
 
-FUTURE_GAP_API_VERSION = 3
+FUTURE_GAP_API_VERSION = 4
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -35,8 +35,12 @@ INCOMING_EGO_MIN_MANEUVER_PROB = 0.35
 INCOMING_STABLE_S = 0.25
 INCOMING_FORGET_S = 0.80
 
-# DEC1 diagnostic thresholds. These are shadow-only engineering gates, not
-# control limits and not connected to planner/CAN.
+DISPLAY_DANGER_RELEASE_S = 0.35
+DISPLAY_SAFE_ENTRY_S = 0.60
+
+# DEC2 diagnostic thresholds. These are shadow-only engineering gates, not
+# control limits and not connected to planner/CAN. V36 separates actual geometry/TTC
+# hazards from hypothetical braking scenarios.
 DEC_BLOCK_CLEARANCE_M = 5.0
 DEC_CAUTION_CLEARANCE_M = 12.0
 DEC_BLOCK_BOUNDARY_M = 2.0
@@ -202,6 +206,7 @@ class FutureGapEvaluator:
   def __init__(self):
     self.api_version=FUTURE_GAP_API_VERSION
     self.incoming_hist: dict[tuple[int,str], dict] = {}
+    self.display_hist = {+1:{'state':'CAUTION_SHADOW','raw':None,'raw_since_ns':0}, -1:{'state':'CAUTION_SHADOW','raw':None,'raw_since_ns':0}}
 
   def _stabilize_incoming(self, side: dict, target_idx: int, now_ns: int) -> dict:
     now_ns=int(now_ns)
@@ -245,25 +250,14 @@ class FutureGapEvaluator:
     sc=side.get('scenarios') or {}
     fb=(sc.get('front_target_brake') or {}).get('min_clearance_m')
     rb=(sc.get('rear_ego_brake') or {}).get('min_clearance_m')
-
-    def le(v,thr):
-      return v is not None and float(v) <= float(thr)
-    if le(front,DEC_BLOCK_CLEARANCE_M):
-      reasons.append(f'front_gap<={DEC_BLOCK_CLEARANCE_M:.0f}m')
-    if le(rear,DEC_BLOCK_CLEARANCE_M):
-      reasons.append(f'rear_gap<={DEC_BLOCK_CLEARANCE_M:.0f}m')
-    if le(boundary,DEC_BLOCK_BOUNDARY_M):
-      reasons.append(f'boundary<={DEC_BLOCK_BOUNDARY_M:.0f}m')
-    if le(ft,DEC_BLOCK_TTC_S) or le(rt,DEC_BLOCK_TTC_S):
-      reasons.append(f'TTC<={DEC_BLOCK_TTC_S:.0f}s')
-    if le(fb,3.0):
-      reasons.append('front_brake_scenario<=3m')
-    if le(rb,3.0):
-      reasons.append('ego_brake_rear<=3m')
+    def le(v,thr): return v is not None and float(v) <= float(thr)
+    if le(front,DEC_BLOCK_CLEARANCE_M): reasons.append(f'front_gap<={DEC_BLOCK_CLEARANCE_M:.0f}m')
+    if le(rear,DEC_BLOCK_CLEARANCE_M): reasons.append(f'rear_gap<={DEC_BLOCK_CLEARANCE_M:.0f}m')
+    if le(boundary,DEC_BLOCK_BOUNDARY_M): reasons.append(f'boundary<={DEC_BLOCK_BOUNDARY_M:.0f}m')
+    if le(ft,DEC_BLOCK_TTC_S) or le(rt,DEC_BLOCK_TTC_S): reasons.append(f'TTC<={DEC_BLOCK_TTC_S:.0f}s')
     for x in stable:
       if float(x.get('entry_eta_s',99))<=DEC_BLOCK_INCOMING_ETA_S and abs(float(x.get('entry_s_m',999)))<=DEC_BLOCK_INCOMING_ABS_S_M:
-        reasons.append('stable_incoming_near')
-        break
+        reasons.append('stable_incoming_near'); break
     if reasons:
       level='BLOCKED_SHADOW'
     else:
@@ -276,17 +270,37 @@ class FutureGapEvaluator:
       if le(rb,8.0): caution.append('ego_brake_rear<=8m')
       for x in stable:
         if float(x.get('entry_eta_s',99))<=DEC_CAUTION_INCOMING_ETA_S and abs(float(x.get('entry_s_m',999)))<=DEC_CAUTION_INCOMING_ABS_S_M:
-          caution.append('stable_incoming')
-          break
+          caution.append('stable_incoming'); break
       if not caution:
         for x in possible:
           if float(x.get('entry_eta_s',99))<=1.5 and abs(float(x.get('entry_s_m',999)))<=25.0:
-            caution.append('possible_incoming_near')
-            break
-      if caution:
-        level='CAUTION_SHADOW'; reasons=caution
-    return {'state':level,'reasons':reasons[:6],
-            'policy':'DEC1 diagnostic only; never connected to planner/control'}
+            caution.append('possible_incoming_near'); break
+      if caution: level='CAUTION_SHADOW'; reasons=caution
+    return {'state':level,'reasons':reasons[:6],'policy':'DEC2 shadow; what-if braking alone is advisory CHECK only'}
+
+  def _stabilize_decision(self, side: dict, target_idx: int, now_ns: int) -> dict:
+    raw=dict(side.get('decision_raw') or self._decision(side))
+    h=self.display_hist[int(target_idx)]
+    raw_state=str(raw.get('state') or 'CAUTION_SHADOW')
+    if h.get('raw') != raw_state:
+      h['raw']=raw_state; h['raw_since_ns']=int(now_ns)
+    age_s=max(0.0,(int(now_ns)-int(h.get('raw_since_ns') or now_ns))/1e9)
+    cur=str(h.get('state') or 'CAUTION_SHADOW')
+    if raw_state == 'BLOCKED_SHADOW': cur='BLOCKED_SHADOW'
+    elif raw_state == 'CAUTION_SHADOW':
+      if cur == 'BLOCKED_SHADOW':
+        if age_s >= DISPLAY_DANGER_RELEASE_S: cur='CAUTION_SHADOW'
+      else: cur='CAUTION_SHADOW'
+    else:
+      if cur == 'BLOCKED_SHADOW':
+        if age_s >= DISPLAY_DANGER_RELEASE_S: cur='CAUTION_SHADOW'
+      elif cur == 'CAUTION_SHADOW':
+        if age_s >= DISPLAY_SAFE_ENTRY_S: cur='SAFE_SHADOW'
+      else: cur='SAFE_SHADOW'
+    h['state']=cur; self.display_hist[int(target_idx)]=h
+    label='DANGER' if cur=='BLOCKED_SHADOW' else ('CHECK ?' if cur=='CAUTION_SHADOW' else 'SAFE')
+    reasons=raw.get('reasons',[])[:6] if cur==raw_state else ['display_hysteresis']+raw.get('reasons',[])[:5]
+    return {'state':cur,'label':label,'raw_state':raw_state,'raw_reasons':raw.get('reasons',[])[:6],'reasons':reasons,'raw_age_s':round(age_s,3),'policy':'DEC2 display hysteresis; comparison only'}
 
   def _side(self, objects: list[dict], target_idx: int, a_ego: float) -> dict:
     states_by_key: dict[str,dict[float,dict]]={}
@@ -466,31 +480,15 @@ class FutureGapEvaluator:
       now_ns=time.monotonic_ns()
     left=self._stabilize_incoming(self._side(objects,+1,a_ego),+1,now_ns)
     right=self._stabilize_incoming(self._side(objects,-1,a_ego),-1,now_ns)
-    left['decision']=self._decision(left); right['decision']=self._decision(right)
-    active='left' if left_blinker and not right_blinker else ('right' if right_blinker and not left_blinker else None)
-    return {
-      'api_version':FUTURE_GAP_API_VERSION,
-      'mode':'SHADOW_GEOMETRY_FG3_DEC1',
-      'decision_enabled':True,
-      'safe_caution_blocked_enabled':True,
-      'decision_shadow_only':True,
-      'active_target':active,
-      'horizons_s':list(HORIZONS_S),
-      'lane_change_duration_s':LANE_CHANGE_DURATION_S,
-      'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
-      'vehicle_half_width_m':OBJECT_HALF_WIDTH_M,
-      'ego':{'v_ego_mps':round(float(v_ego),3),'a_ego_mps2':round(float(a_ego),3),
-             'left_blinker':bool(left_blinker),'right_blinker':bool(right_blinker)},
-      'left':left,'right':right,
-      'stats':{
-        'visible_objects':len(objects),
-        'left_incoming_confirmed':left['incoming_count'],'right_incoming_confirmed':right['incoming_count'],
-        'left_incoming_stable':left['stable_incoming_count'],'right_incoming_stable':right['stable_incoming_count'],
-        'left_incoming_possible':left['possible_incoming_count'],'right_incoming_possible':right['possible_incoming_count'],
-        'left_current_core':left['horizons'][0]['core_occupant_count'],
-        'right_current_core':right['horizons'][0]['core_occupant_count'],
-        'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
-        'right_current_boundary':right['horizons'][0]['boundary_overlap_count'],
-      },
-      'note':'FG3 + DEC1 shadow only: temporal incoming stability + core/boundary gaps + braking what-if + SAFE/CAUTION/BLOCKED diagnostic; no planner/CAN control.',
-    }
+    left['decision_raw']=self._decision(left); right['decision_raw']=self._decision(right)
+    left['decision']=self._stabilize_decision(left,+1,now_ns); right['decision']=self._stabilize_decision(right,-1,now_ns)
+    active=None; active_side=None
+    if left_blinker and not right_blinker: active='left'; active_side=left
+    elif right_blinker and not left_blinker: active='right'; active_side=right
+    intent={'active':bool(active_side is not None),'side':active,'label':'STANDBY','state':'STANDBY','raw_state':None,'reasons':[],'front_clearance_m':None,'rear_clearance_m':None,'boundary_clearance_m':None,'front_ttc_s':None,'rear_ttc_s':None,'shadow_only':True}
+    if active_side is not None:
+      dec=active_side.get('decision') or {}
+      intent.update({'label':dec.get('label','CHECK ?'),'state':dec.get('state','CAUTION_SHADOW'),'raw_state':dec.get('raw_state'),'reasons':dec.get('reasons',[])[:6],'front_clearance_m':active_side.get('min_front_clearance_during_ego_overlap_m'),'rear_clearance_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),'boundary_clearance_m':active_side.get('min_boundary_clearance_during_ego_overlap_m'),'front_ttc_s':active_side.get('current_front_ttc_ca_s'),'rear_ttc_s':active_side.get('current_rear_ttc_ca_s')})
+    elif left_blinker and right_blinker: intent.update({'label':'HAZARD','state':'HAZARD','reasons':['both_blinkers']})
+    return {'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG4_DEC2','decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,'vehicle_half_width_m':OBJECT_HALF_WIDTH_M,'ego':{'v_ego_mps':round(float(v_ego),3),'a_ego_mps2':round(float(a_ego),3),'left_blinker':bool(left_blinker),'right_blinker':bool(right_blinker)},'left':left,'right':right,'stats':{'visible_objects':len(objects),'left_incoming_confirmed':left['incoming_count'],'right_incoming_confirmed':right['incoming_count'],'left_incoming_stable':left['stable_incoming_count'],'right_incoming_stable':right['stable_incoming_count'],'left_incoming_possible':left['possible_incoming_count'],'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},'note':'FG4 + DEC2 shadow only: Golden-regression decision separation + asymmetric display hysteresis + blinker-directed driver comparison HUD; no planner/CAN control.'}
+
