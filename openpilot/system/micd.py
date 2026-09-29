@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import numpy as np
+import time
 from functools import cache
 import threading
 
@@ -114,10 +115,17 @@ class Mic:
     import sounddevice as sd
     patch_sounddevice(sd)
 
-    with self.get_stream(sd) as stream:
-      cloudlog.info(f"micd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
-      while True:
-        self.update()
+    # Keep micd alive across transient PortAudio / audio-HAL failures.
+    while True:
+      try:
+        with self.get_stream(sd) as stream:
+          cloudlog.info(f"micd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
+          while True:
+            self.update()
+            assert stream.active
+      except Exception:
+        cloudlog.exception("micd stream failed; restarting after backoff")
+        time.sleep(5)
 
 
 def main():
