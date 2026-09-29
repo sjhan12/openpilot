@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 37
-BUILD_TAG = 'v37-fg5-dec3-turn-latch-arrow-hud'
+BUILD_TAG = 'v37r1-fg5-dec3-turn-latch-arrow-hud-goldenv2'
 LOGGER_FORMAT_VERSION = 18
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
