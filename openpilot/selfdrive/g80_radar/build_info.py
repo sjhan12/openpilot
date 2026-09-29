@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 38
-BUILD_TAG = 'v38-source-trace-corner-debug-fg5-dec3-goldenv2'
+BUILD_TAG = 'v38r1-source-trace-road-gate-corner-debug-fg6-dec3-goldenv2'
 LOGGER_FORMAT_VERSION = 19
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
-FUTURE_GAP_API_VERSION = 5
+FUTURE_GAP_API_VERSION = 6
 ANDROID_PROTOCOL_VERSION = 21
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'

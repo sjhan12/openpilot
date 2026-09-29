@@ -25,6 +25,18 @@ PATH_PROJECTION_MARGIN_M = 0.75
 PATH_BACK_MARGIN_M = 1.0
 MAX_PROJECTION_D_M = 12.5
 
+# V38R1 target-lane geometry gate.  SAFE is allowed only when C4 road geometry
+# confirms that a lane-sized lateral corridor exists on that side.  This is
+# diagnostic/UI gating only; it is not connected to planner or CAN control.
+LANE_GATE_SAMPLE_X_M = (8.0, 15.0, 25.0)
+LANE_GATE_MIN_LINE_PROB = 0.35
+LANE_GATE_INNER_MIN_M = 0.8
+LANE_GATE_INNER_MAX_M = 2.8
+LANE_GATE_OUTER_MIN_M = 4.0
+LANE_GATE_CONFIRMED_EDGE_M = 4.6
+LANE_GATE_NARROW_EDGE_M = 3.4
+
+
 
 def _finite(v, default=math.nan):
   try:
@@ -143,6 +155,94 @@ def road_model_with_age(road_model: dict | None, now_ns: int) -> dict:
   out['age_ms'] = round(age_ns / 1e6, 1) if recv_ns > 0 else None
   out['fresh'] = bool(out.get('valid')) and -50_000_000 <= age_ns <= ROAD_MODEL_MAX_AGE_NS
   return out
+
+
+
+def _median(vals: list[float]) -> float | None:
+  vals = sorted(float(v) for v in vals if math.isfinite(float(v)))
+  if not vals:
+    return None
+  n = len(vals)
+  if n % 2:
+    return vals[n // 2]
+  return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def _relative_offsets(points: list[dict], path: list[dict]) -> list[float]:
+  out = []
+  for x in LANE_GATE_SAMPLE_X_M:
+    py = _path_y(path, x, clamp=False)
+    ly = _path_y(points, x, clamp=False)
+    if py is not None and ly is not None:
+      out.append(float(ly) - float(py))
+  return out
+
+
+def adjacent_lane_availability(road_model: dict | None) -> dict:
+  """Estimate whether a full lane-sized corridor exists left/right of ego path.
+
+  Conservative policy: no green SAFE unless geometry is CONFIRMED.  ABSENT means
+  road edge is too close for a normal adjacent lane.  UNCERTAIN means C4 geometry
+  is stale/insufficient; callers should show CHECK ROAD rather than SAFE.
+  """
+  empty = {
+    'status': 'UNCERTAIN', 'reason': 'road_model_unavailable',
+    'edge_extent_m': None, 'inner_boundary_m': None, 'outer_boundary_m': None,
+    'line_count': 0,
+  }
+  if not road_model or not road_model.get('fresh', road_model.get('valid', False)):
+    return {'left': dict(empty), 'right': dict(empty), 'fresh': False}
+
+  path = road_model.get('path') or []
+  if len(path) < 2:
+    return {'left': dict(empty), 'right': dict(empty), 'fresh': False}
+
+  lines = []
+  for ln in road_model.get('lane_lines') or []:
+    try:
+      prob = float(ln.get('prob', 0.0))
+    except Exception:
+      prob = 0.0
+    if prob < LANE_GATE_MIN_LINE_PROB:
+      continue
+    offs = _relative_offsets(ln.get('points') or [], path)
+    med = _median(offs)
+    if med is not None:
+      lines.append({'d': med, 'prob': prob, 'index': ln.get('index')})
+
+  edge_offsets = []
+  for ed in road_model.get('road_edges') or []:
+    med = _median(_relative_offsets(ed.get('points') or [], path))
+    if med is not None:
+      edge_offsets.append(med)
+
+  def side_result(sign: int) -> dict:
+    side_lines = [abs(x['d']) for x in lines if x['d'] * sign > 0.35]
+    inner = min((d for d in side_lines if LANE_GATE_INNER_MIN_M <= d <= LANE_GATE_INNER_MAX_M), default=None)
+    outer = min((d for d in side_lines if d >= LANE_GATE_OUTER_MIN_M), default=None)
+    side_edges = [abs(d) for d in edge_offsets if d * sign > 0.35]
+    edge = max(side_edges) if side_edges else None
+
+    if edge is not None and edge < LANE_GATE_NARROW_EDGE_M:
+      status, reason = 'ABSENT', 'road_edge_too_close'
+    elif inner is not None and ((edge is not None and edge >= LANE_GATE_CONFIRMED_EDGE_M) or outer is not None):
+      status, reason = 'CONFIRMED', 'lane_corridor_confirmed'
+    elif outer is not None and outer >= LANE_GATE_CONFIRMED_EDGE_M:
+      # Strong outer-lane-line evidence can confirm even when roadEdges are missing.
+      status, reason = 'CONFIRMED', 'outer_lane_line_confirmed'
+    else:
+      status, reason = 'UNCERTAIN', 'insufficient_lane_geometry'
+
+    return {
+      'status': status,
+      'reason': reason,
+      'edge_extent_m': None if edge is None else round(edge, 2),
+      'inner_boundary_m': None if inner is None else round(inner, 2),
+      'outer_boundary_m': None if outer is None else round(outer, 2),
+      'line_count': len(side_lines),
+    }
+
+  return {'left': side_result(+1), 'right': side_result(-1), 'fresh': True}
 
 
 def path_as_tuples(road_model: dict | None) -> list[tuple[float, float]]:

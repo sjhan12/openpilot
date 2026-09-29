@@ -142,7 +142,7 @@ class ShadowLogger:
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
           'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V38 FG5+DEC3: source-trace UI + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'future_gap_policy':'V38R1 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -168,7 +168,7 @@ class ShadowLogger:
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
     became "events" and gzip/JSON work ran almost every publish.  V31 reserves
     immediate records for semantically important lead/cut-in transitions; the
-    full canonical/IMM/FG5/DEC3 state is still captured by the 2 Hz periodic stream.
+    full canonical/IMM/FG6/DEC3 state is still captured by the 2 Hz periodic stream.
     """
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
