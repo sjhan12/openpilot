@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  2 Hz periodic sampling (V34 Golden/highway-validation default)
+  2 Hz periodic sampling (V35 Golden/highway-validation default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -45,7 +45,7 @@ def _compact_obj(o: dict) -> dict:
     'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','road_projection_endpoint_overshoot_m',
-    'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect',
+    'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect','kf_dormant_preserved',
     'kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma','kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot',
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
@@ -127,8 +127,8 @@ class ShadowLogger:
           'log_dir':str(self.log_dir),
           'vehicle_footprint_m':[4.8,2.1],
           'vehicle_vrel_gate_mps':2.5,
-          'kalman_model':'KF3 baseline: CA longitudinal + CA<=0.5s then bounded-CV lateral prediction',
-          'imm_model':'IMM2: CV + CA + MANEUVER; 4Hz selective interaction ROI with cached hypotheses between ticks',
+          'kalman_model':'KF4: selective CA longitudinal + bounded lateral; dormant Canonical identity preserved',
+          'imm_model':'IMM3: CV + CA + MANEUVER; 3Hz selective ROI, max 8, cached between ticks',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
           'coordinate_x_origin':'ego_front_bumper_display_reference',
           'decoded_object_x_adjustment_m':0.0,
@@ -140,9 +140,9 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'Canonical/KF target 10Hz; IMM2 default 4Hz selective ROI; 2Hz gzip level1; local-domain road annotation on-demand',
+          'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V34 FG2: core/boundary occupancy + confirmed/possible incoming + brake what-if; no SAFE/CAUTION/BLOCKED',
+          'future_gap_policy':'V35 FG3+DEC1: temporal incoming + core/boundary occupancy + braking what-if + shadow SAFE/CAUTION/BLOCKED',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -168,7 +168,7 @@ class ShadowLogger:
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
     became "events" and gzip/JSON work ran almost every publish.  V31 reserves
     immediate records for semantically important lead/cut-in transitions; the
-    full canonical/IMM/FG2 state is still captured by the 2 Hz periodic stream.
+    full canonical/IMM/FG3/DEC1 state is still captured by the 2 Hz periodic stream.
     """
     l1 = shadow.get('leadOne', {}) or {}
     l2 = shadow.get('leadTwo', {}) or {}
@@ -182,7 +182,8 @@ class ShadowLogger:
       int(st.get('confirmed_cutin_count', 0) or 0),
       bool(st.get('path_valid')), bool(st.get('v_ego_valid')),
       int((kalman_stats or {}).get('cutin_confirmed', 0) or 0),
-      int(left.get('incoming_count',0) or 0), int(right.get('incoming_count',0) or 0),
+      int(left.get('stable_incoming_count',0) or 0), int(right.get('stable_incoming_count',0) or 0),
+      (left.get('decision') or {}).get('state'), (right.get('decision') or {}).get('state'),
       bool(ego.get('leftBlinker')), bool(ego.get('rightBlinker')),
     )
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-G80 v17 receive-only shadow leadOne/leadTwo verifier.
+G80 V35 receive-only shadow leadOne/leadTwo verifier.
 
 HARD SEPARATION:
 - NEVER publishes radarState
@@ -178,6 +178,11 @@ class ShadowLeadVerifier:
     self.last_l2_state = None
     self.l1_takeover_key = None
     self.l1_takeover_since_s = 0.0
+    # Separate dwell state: strong SCC-confirmed takeover and teacher-camera
+    # recovery are independent mechanisms. Sharing one key/since caused the
+    # normal takeover path to clear teacher recovery dwell every cycle.
+    self.l1_teacher_recovery_key = None
+    self.l1_teacher_recovery_since_s = 0.0
 
   @staticmethod
   def _identity(o):
@@ -317,7 +322,7 @@ class ShadowLeadVerifier:
     return abs(float(shadow['dRel'])-float(stock['dRel'])) <= 5.0 and abs(float(shadow['yRel'])-float(stock['yRel'])) <= 2.0
 
   def update(self, objects, model_path, v_ego, now_ns,
-             production=None, model_path_recv_ns=0, v_ego_recv_ns=0):
+             production=None, model_path_recv_ns=0, v_ego_recv_ns=0, scc_teacher=None):
     now_s = float(now_ns) * 1e-9
     path_valid = bool(model_path) and _age_ok(model_path_recv_ns, now_ns, PATH_MAX_AGE_NS)
     v_ego_valid = _age_ok(v_ego_recv_ns, now_ns, VEGO_MAX_AGE_NS)
@@ -422,6 +427,7 @@ class ShadowLeadVerifier:
     l1_handoff_from = None
     l1_handoff_to = None
     l1_handoff_gain_m = None
+    l1_teacher_recovery = False
     if l1c is None:
       l1c = self._reidentify(eligible,self.last_l1_state,now_s)
       if l1c is not None:
@@ -467,6 +473,52 @@ class ShadowLeadVerifier:
         self.l1_takeover_key=None; self.l1_takeover_since_s=0.0
     else:
       self.l1_takeover_key=None; self.l1_takeover_since_s=0.0
+
+    # V35 teacher-camera recovery: V34 highway logs still showed a long SCC/L1
+    # error tail when SCC raw and a camera-confirmed ego-path radar object agreed,
+    # while sticky L1 stayed on another physical_in_path object. This recovery is
+    # deliberately conservative and only runs when SCC_CONTROL is strictly usable.
+    if l1c is not None and scc_teacher and scc_teacher.get('teacher_usable'):
+      try:
+        td=float(scc_teacher.get('distance_m'))
+        tv=float(scc_teacher.get('rel_speed_mps'))
+      except Exception:
+        td=math.nan; tv=math.nan
+      current_err=abs(float(l1c['x'])-td) if math.isfinite(td) else 0.0
+      if current_err > 5.0:
+        recover=[]
+        for c in candidates:
+          if c['key']==l1c['key'] or self._same_physical(c,l1c):
+            continue
+          ev=c['evidence']
+          if not (c['physical'] and ev['camera']):
+            continue
+          if abs(float(c['dpath'])) > 1.40:
+            continue
+          dx=abs(float(c['x'])-td)
+          if dx > 4.0:
+            continue
+          if c.get('vx') is not None and math.isfinite(tv) and abs(float(c['vx'])-tv) > 2.0:
+            continue
+          recover.append((dx,abs(float(c['dpath'])),c))
+        rc=min(recover,key=lambda z:(z[0],z[1])) if recover else None
+        if rc is not None:
+          c=rc[2]
+          if self.l1_teacher_recovery_key==c['key']:
+            dwell=max(0.0,now_s-self.l1_teacher_recovery_since_s)
+          else:
+            self.l1_teacher_recovery_key=c['key']; self.l1_teacher_recovery_since_s=now_s; dwell=0.0
+          if dwell >= 0.18:
+            l1_handoff_from=l1c['key']; l1_handoff_to=c['key']
+            l1_handoff_gain_m=float(l1c['x'])-float(c['x'])
+            l1c=c; l1_strong_handoff=True; l1_teacher_recovery=True
+            self.l1_teacher_recovery_key=None; self.l1_teacher_recovery_since_s=0.0
+        else:
+          self.l1_teacher_recovery_key=None; self.l1_teacher_recovery_since_s=0.0
+      else:
+        self.l1_teacher_recovery_key=None; self.l1_teacher_recovery_since_s=0.0
+    else:
+      self.l1_teacher_recovery_key=None; self.l1_teacher_recovery_since_s=0.0
 
     if l1c is None:
       scored = []
@@ -586,6 +638,7 @@ class ShadowLeadVerifier:
         'leadOne_strong_handoff':l1_strong_handoff,'leadOne_handoff_from':l1_handoff_from,'leadOne_handoff_to':l1_handoff_to,
         'leadOne_handoff_gain_m':None if l1_handoff_gain_m is None else round(float(l1_handoff_gain_m),3),
         'leadOne_takeover_pending_key':self.l1_takeover_key,
+        'leadOne_teacher_camera_recovery':l1_teacher_recovery,
         'duplicate_gate_m':[DUP_DX_M,DUP_DY_M,DUP_DV_MPS],
         'path_valid':path_valid,'path_age_ms':path_age,
         'v_ego_valid':v_ego_valid,'v_ego_age_ms':vego_age,
@@ -596,6 +649,6 @@ class ShadowLeadVerifier:
         'stationary confirmation requires fresh path/vEgo plus cross-sensor support',
         'leadTwo is a cut-in/stationary-shadow candidate, not simply the second-nearest car',
         'unconfirmed radar-only objects beyond 100 m are not promoted to leadOne',
-        'V32: closer SCC+camera confirmed ego-path lead overrides sticky L1 after short persistence',
+        'V35: SCC teacher + camera path-near recovery can override a grossly disagreeing sticky L1 after persistence',
       ],
     }

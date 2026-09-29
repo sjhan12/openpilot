@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V34 monitor-only motion Kalman tracker driven by Canonical360Tracker IDs.
+"""V35 monitor-only motion Kalman tracker driven by Canonical360Tracker IDs.
 
 This module does NOT publish radarTracks/radarState and does not send CAN.
 It augments already fused physical-vehicle dictionaries with smoothed motion
@@ -49,7 +49,7 @@ LATERAL_CA_HORIZON_S = float(os.getenv('G80_KF_LAT_CA_HORIZON_S', '0.5'))
 LATERAL_PRED_MAX_SPEED_MPS = float(os.getenv('G80_KF_LAT_PRED_MAX_SPEED_MPS', '2.0'))
 LATERAL_PRED_MAX_ACCEL_MPS2 = float(os.getenv('G80_KF_LAT_PRED_MAX_ACCEL_MPS2', '1.5'))
 HIGHWAY_CUTIN_MIN_VEGO_MPS = float(os.getenv('G80_KF_HIGHWAY_CUTIN_MIN_VEGO_MPS', '5.0'))
-KF_MAX_TRACKS = max(4, int(os.getenv('G80_KF_MAX_TRACKS', '14')))
+KF_MAX_TRACKS = max(4, int(os.getenv('G80_KF_MAX_TRACKS', '12')))
 KF_FRONT_MAX_M = float(os.getenv('G80_KF_FRONT_MAX_M', '150.0'))
 KF_REAR_MAX_M = float(os.getenv('G80_KF_REAR_MAX_M', '90.0'))
 KF_LATERAL_MAX_M = float(os.getenv('G80_KF_LATERAL_MAX_M', '9.0'))
@@ -409,10 +409,17 @@ class KalmanMotionTracker:
         out.append(dict(o))
         continue
       if key not in selected_keys:
+        # V35: preserve an existing KF identity while this visible Canonical
+        # object is outside the expensive KF budget. This prevents rank churn
+        # from deleting/recreating the filter and falsely looking like a reset.
+        t_existing=self.tracks.get(key)
+        if t_existing is not None:
+          t_existing.last_seen_ns=now_ns
         d=dict(o)
         d['kalman_valid']=False
         d['kalman_api_version']=KALMAN_API_VERSION
         d['kf_skipped_reason']='ranked_out_or_outside_roi'
+        d['kf_dormant_preserved']=bool(t_existing is not None)
         out.append(d)
         ranked_out+=1
         continue
@@ -458,6 +465,7 @@ class KalmanMotionTracker:
     lateral_unstable = sum(1 for o in out if o.get('kf_d_dot') is not None and abs(float(o.get('kf_d_dot'))) > 3.0)
     canonical_key_mismatch = sum(1 for o in out if o.get('canonical_valid') and o.get('kalman_valid') and not o.get('kf_canonical_key_match', False))
     reset_suspects = sum(1 for o in out if o.get('kf_reset_suspect'))
+    dormant_preserved = sum(1 for o in out if o.get('kf_dormant_preserved'))
     return out, {
       'active_tracks': len(self.tracks),
       'visible_tracks': len(out),
@@ -472,13 +480,14 @@ class KalmanMotionTracker:
       'lateral_unstable_tracks': lateral_unstable,
       'canonical_key_mismatch_tracks': canonical_key_mismatch,
       'kf_reset_suspect_tracks': reset_suspects,
+      'dormant_preserved_tracks': dormant_preserved,
       'cutin_candidates': cutins,
       'cutin_confirmed': confirmed_cutins,
       'low_speed_lateral_candidates': low_speed_lateral,
       'lateral_prediction_limited_tracks': prediction_limited,
       'cutin_rule': 'vEgo>=5m/s + adjacent lane + TTLC 0.2..3.0s + low covariance + >=0.25s persistence',
       'lateral_prediction_model': 'CA <=0.5s then bounded CV',
-      'model': 'selective CA cartesian+Frenet; Canonical360 remains full coverage',
+      'model': 'V35 selective CA cartesian+Frenet; dormant Canonical KF identity preserved',
       'roi_m': {'front':KF_FRONT_MAX_M,'rear':KF_REAR_MAX_M,'lateral_abs':KF_LATERAL_MAX_M},
       'horizons_s': list(HORIZONS_S),
       'control_connected': False,

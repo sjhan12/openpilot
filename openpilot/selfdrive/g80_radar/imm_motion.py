@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V34 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
+"""V35 monitor-only IMM motion tracker for Canonical360Tracker vehicles.
 
 Three linear Gaussian motion hypotheses are maintained in a common 6D state:
   [s, s_dot, s_ddot, d, d_dot, d_ddot]
@@ -23,19 +23,19 @@ import numpy as np
 
 from openpilot.selfdrive.g80_radar.road_geometry import frenet_to_xy, lane_index_from_d, lane_name
 
-IMM_API_VERSION = 2
+IMM_API_VERSION = 3
 HORIZONS_S = (0.5, 1.0, 2.0, 3.0)
 MODEL_NAMES = ('CV', 'CA', 'MANEUVER')
 MODEL_CV, MODEL_CA, MODEL_MAN = 0, 1, 2
 TRACK_TTL_NS = int(float(os.getenv('G80_IMM_TRACK_TTL_S', '1.5')) * 1e9)
-IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '4.0')))
+IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '3.0')))
 IMM_PERIOD_NS = int(1e9 / IMM_HZ)
 IMM_FRONT_MAX_M = float(os.getenv('G80_IMM_FRONT_MAX_M', '125.0'))
 IMM_REAR_MAX_M = float(os.getenv('G80_IMM_REAR_MAX_M', '80.0'))
 IMM_LATERAL_MAX_M = float(os.getenv('G80_IMM_LATERAL_MAX_M', '6.3'))
 IMM_L2_MAX_M = float(os.getenv('G80_IMM_L2_MAX_M', '8.8'))
 IMM_L2_INWARD_RATE_MPS = float(os.getenv('G80_IMM_L2_INWARD_RATE_MPS', '0.12'))
-IMM_MAX_TRACKS = max(4, int(os.getenv('G80_IMM_MAX_TRACKS', '10')))
+IMM_MAX_TRACKS = max(4, int(os.getenv('G80_IMM_MAX_TRACKS', '8')))
 MAX_DT_S = float(os.getenv('G80_IMM_MAX_DT_S', '0.40'))
 MIN_DT_S = 0.01
 LANE_HALF_W_M = 1.8
@@ -451,11 +451,24 @@ class ImmMotionTracker:
     ranked_out=relevant_candidates[IMM_MAX_TRACKS:]
     skipped.extend(ranked_out)
 
-    # Full IMM evaluation runs at 4 Hz by default while Canonical360 + selective KF3 stay
-    # at 10 Hz.  New relevant identities force an immediate evaluation.  Cached
-    # model probabilities/trajectory are at most ~200 ms old and carry an age.
+    # Full IMM evaluation runs at 3 Hz by default while Canonical360 + selective KF stay
+    # at 10 Hz.  Low-priority new identities wait for the fixed 3 Hz cadence; only urgent
+    # SCC/CAM/rear-teacher/cut-in evidence may refresh early. Cached model
+    # probabilities/trajectory carry an explicit age.
     new_key=any(self._key(o) and self._key(o) not in self.tracks for o in relevant)
-    due=(self.last_eval_ns == 0 or now_ns-self.last_eval_ns >= IMM_PERIOD_NS or new_key)
+    # V35: do not let low-priority new identities force the expensive 3-model
+    # IMM on every publication cycle. Strong lead/cut-in evidence may refresh
+    # early, otherwise the fixed IMM cadence is used.
+    urgent_new=any(
+      self._key(o) and self._key(o) not in self.tracks and
+      (o.get('scc_teacher_confirmed') or o.get('camera_confirmed') or
+       o.get('rear_teacher_confirmed') or o.get('teacher_match') or
+       o.get('kf_cutin_candidate'))
+      for o in relevant
+    )
+    min_urgent_gap_ns=int(0.18e9)
+    due=(self.last_eval_ns == 0 or now_ns-self.last_eval_ns >= IMM_PERIOD_NS or
+         (urgent_new and now_ns-self.last_eval_ns >= min_urgent_gap_ns))
     if not due:
       out=[]
       relevant_keys=set()
