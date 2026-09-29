@@ -64,9 +64,9 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 
 def g80_raw_golden(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Keep the AUTO-EVENT Golden logger resident onroad; no driving-time activation needed."""
+  """V3.1: keep AUTO-EVENT logger resident so STATUS health is visible before/after driving."""
   disable_marker = os.getenv("G80_RAW_DISABLE_MARKER", "/data/radar/DISABLE_G80_RAW_GOLDEN")
-  return started and not os.path.exists(disable_marker)
+  return not os.path.exists(disable_marker)
 
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
