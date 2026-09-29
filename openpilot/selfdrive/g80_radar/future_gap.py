@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""V36 shadow Future Gap + Target-Lane Occupancy evaluator.
+"""V37 shadow Future Gap + Target-Lane Occupancy evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
-geometry for NOW/0.5/1/2/3 s.  V36 keeps FG3 geometry and adds DEC2 raw decision + conservative display hysteresis:
+geometry for NOW/0.5/1/2/3 s.  V37 keeps FG4 geometry and adds DEC3 maneuver-context handling:
+- distinguish likely intersection turns from lane changes using road curvature, speed and steering angle;
+- latch the pre-commit lane-change assessment briefly after steering commitment;
+- suppress coordinate-recenter false DANGER during the commit/rebase window while retaining a hard TTC override;
+- expose both-side preview decisions continuously for arrow HUD rendering:
 - core occupants: object centre is inside the target lane;
 - boundary overlaps: only the object footprint overlaps the target lane;
 - confirmed incoming: predicted centre enters and persists in the target lane;
 - possible incoming: footprint/one-horizon entry only.
 
 It also exposes diagnostic what-if braking scenarios and shadow-only
-SAFE_SHADOW/CAUTION_SHADOW/BLOCKED_SHADOW. Driver HUD maps these to SAFE/CHECK?/DANGER. These are diagnostic labels only and
-are not connected to planner/control.
+SAFE_SHADOW/CAUTION_SHADOW/BLOCKED_SHADOW. Driver HUD maps lane-change states to SAFE/CHECK?/DANGER and intersection turns to TURN.
+These are diagnostic labels only and are not connected to planner/control.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name
 
-FUTURE_GAP_API_VERSION = 4
+FUTURE_GAP_API_VERSION = 5
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -38,8 +42,21 @@ INCOMING_FORGET_S = 0.80
 DISPLAY_DANGER_RELEASE_S = 0.35
 DISPLAY_SAFE_ENTRY_S = 0.60
 
-# DEC2 diagnostic thresholds. These are shadow-only engineering gates, not
-# control limits and not connected to planner/CAN. V36 separates actual geometry/TTC
+# V37 maneuver-context / lane-change commit handling.
+TURN_CURVE_MATCH_MAX_SPEED_MPS = 8.5      # ~30.6 km/h
+TURN_STEERING_MIN_DEG = 35.0
+TURN_STEERING_MAX_SPEED_MPS = 14.0        # allow a brisk intersection turn to be classified
+LANE_CHANGE_COMMIT_MIN_SPEED_MPS = 5.0
+LANE_CHANGE_COMMIT_STEER_DEG = 4.0
+LANE_CHANGE_COMMIT_MIN_BLINKER_S = 0.15
+LANE_CHANGE_DECISION_HOLD_S = 1.50
+LANE_CHANGE_REBASE_S = 0.85
+LANE_CHANGE_SESSION_TIMEOUT_S = 4.5
+HARD_OVERRIDE_CLEARANCE_M = 1.5
+HARD_OVERRIDE_TTC_S = 1.5
+
+# DEC3 diagnostic thresholds. These are shadow-only engineering gates, not
+# control limits and not connected to planner/CAN. V37 preserves actual geometry/TTC
 # hazards from hypothetical braking scenarios.
 DEC_BLOCK_CLEARANCE_M = 5.0
 DEC_CAUTION_CLEARANCE_M = 12.0
@@ -207,6 +224,10 @@ class FutureGapEvaluator:
     self.api_version=FUTURE_GAP_API_VERSION
     self.incoming_hist: dict[tuple[int,str], dict] = {}
     self.display_hist = {+1:{'state':'CAUTION_SHADOW','raw':None,'raw_since_ns':0}, -1:{'state':'CAUTION_SHADOW','raw':None,'raw_since_ns':0}}
+    self.intent_hist = {
+      'side': None, 'blinker_since_ns': 0, 'committed': False, 'commit_ns': 0,
+      'latched_decision': None, 'precommit_decision': None, 'last_active_ns': 0, 'last_context': 'STANDBY'
+    }
 
   def _stabilize_incoming(self, side: dict, target_idx: int, now_ns: int) -> dict:
     now_ns=int(now_ns)
@@ -276,7 +297,7 @@ class FutureGapEvaluator:
           if float(x.get('entry_eta_s',99))<=1.5 and abs(float(x.get('entry_s_m',999)))<=25.0:
             caution.append('possible_incoming_near'); break
       if caution: level='CAUTION_SHADOW'; reasons=caution
-    return {'state':level,'reasons':reasons[:6],'policy':'DEC2 shadow; what-if braking alone is advisory CHECK only'}
+    return {'state':level,'reasons':reasons[:6],'policy':'DEC3 base shadow; what-if braking alone is advisory CHECK only'}
 
   def _stabilize_decision(self, side: dict, target_idx: int, now_ns: int) -> dict:
     raw=dict(side.get('decision_raw') or self._decision(side))
@@ -300,7 +321,128 @@ class FutureGapEvaluator:
     h['state']=cur; self.display_hist[int(target_idx)]=h
     label='DANGER' if cur=='BLOCKED_SHADOW' else ('CHECK ?' if cur=='CAUTION_SHADOW' else 'SAFE')
     reasons=raw.get('reasons',[])[:6] if cur==raw_state else ['display_hysteresis']+raw.get('reasons',[])[:5]
-    return {'state':cur,'label':label,'raw_state':raw_state,'raw_reasons':raw.get('reasons',[])[:6],'reasons':reasons,'raw_age_s':round(age_s,3),'policy':'DEC2 display hysteresis; comparison only'}
+    return {'state':cur,'label':label,'raw_state':raw_state,'raw_reasons':raw.get('reasons',[])[:6],'reasons':reasons,'raw_age_s':round(age_s,3),'policy':'DEC3 display hysteresis; comparison only'}
+
+  @staticmethod
+  def _context(active: str | None, v_ego: float, steering_angle_deg: float,
+               road_curve_direction: str | None) -> dict:
+    if active not in ('left','right'):
+      return {'kind':'STANDBY','curve_match':False,'turn_by_curve':False,'turn_by_steer':False}
+    curve = str(road_curve_direction or 'UNKNOWN').upper()
+    want = 'LEFT' if active == 'left' else 'RIGHT'
+    curve_match = curve == want
+    steer = abs(float(steering_angle_deg or 0.0))
+    speed = max(0.0, float(v_ego or 0.0))
+    turn_by_curve = bool(curve_match and speed <= TURN_CURVE_MATCH_MAX_SPEED_MPS)
+    turn_by_steer = bool(steer >= TURN_STEERING_MIN_DEG and speed <= TURN_STEERING_MAX_SPEED_MPS)
+    kind = 'TURN' if (turn_by_curve or turn_by_steer) else 'LANE_CHANGE'
+    return {'kind':kind,'curve_match':curve_match,'turn_by_curve':turn_by_curve,
+            'turn_by_steer':turn_by_steer,'curve_direction':curve,'steering_abs_deg':round(steer,2)}
+
+  @staticmethod
+  def _hard_override(side: dict) -> bool:
+    front=side.get('min_front_clearance_during_ego_overlap_m')
+    rear=side.get('min_rear_clearance_during_ego_overlap_m')
+    ft=side.get('current_front_ttc_ca_s'); rt=side.get('current_rear_ttc_ca_s')
+    def le(v,t): return v is not None and float(v) <= float(t)
+    # During lane-change coordinate recentering a zero gap can be synthetic, so
+    # require both a very small physical clearance and a very short TTC.
+    return bool((le(front,HARD_OVERRIDE_CLEARANCE_M) and le(ft,HARD_OVERRIDE_TTC_S)) or
+                (le(rear,HARD_OVERRIDE_CLEARANCE_M) and le(rt,HARD_OVERRIDE_TTC_S)))
+
+  def _apply_intent_state(self, active: str | None, active_side: dict | None,
+                          v_ego: float, steering_angle_deg: float,
+                          road_curve_direction: str | None, now_ns: int) -> dict:
+    base={'active':bool(active_side is not None),'side':active,'label':'STANDBY','state':'STANDBY',
+          'raw_state':None,'reasons':[],'front_clearance_m':None,'rear_clearance_m':None,
+          'boundary_clearance_m':None,'front_ttc_s':None,'rear_ttc_s':None,'shadow_only':True,
+          'maneuver_context':'STANDBY','phase':'STANDBY','committed':False,
+          'commit_age_s':None,'hold_remaining_s':None,'steering_angle_deg':round(float(steering_angle_deg or 0.0),2),
+          'road_curve_direction':str(road_curve_direction or 'UNKNOWN').upper()}
+    h=self.intent_hist
+
+    if active_side is None or active not in ('left','right'):
+      if h.get('last_active_ns') and int(now_ns)-int(h.get('last_active_ns',0)) > int(0.8e9):
+        self.intent_hist={'side':None,'blinker_since_ns':0,'committed':False,'commit_ns':0,
+                          'latched_decision':None,'precommit_decision':None,'last_active_ns':0,'last_context':'STANDBY'}
+      return base
+
+    if h.get('side') != active or (int(now_ns)-int(h.get('last_active_ns',0) or 0) > int(LANE_CHANGE_SESSION_TIMEOUT_S*1e9)):
+      h={'side':active,'blinker_since_ns':int(now_ns),'committed':False,'commit_ns':0,
+         'latched_decision':None,'precommit_decision':None,'last_active_ns':int(now_ns),'last_context':'STANDBY'}
+      self.intent_hist=h
+    else:
+      h['last_active_ns']=int(now_ns)
+
+    ctx=self._context(active,v_ego,steering_angle_deg,road_curve_direction)
+    h['last_context']=ctx['kind']
+    base['maneuver_context']=ctx['kind']
+    base['context_detail']=ctx
+    base['blinker_age_s']=round(max(0.0,(int(now_ns)-int(h.get('blinker_since_ns',now_ns)))/1e9),3)
+
+    dec=dict(active_side.get('decision') or {})
+    base.update({'label':dec.get('label','CHECK ?'),'state':dec.get('state','CAUTION_SHADOW'),
+                 'raw_state':dec.get('raw_state'),'reasons':dec.get('reasons',[])[:6],
+                 'front_clearance_m':active_side.get('min_front_clearance_during_ego_overlap_m'),
+                 'rear_clearance_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),
+                 'boundary_clearance_m':active_side.get('min_boundary_clearance_during_ego_overlap_m'),
+                 'front_ttc_s':active_side.get('current_front_ttc_ca_s'),
+                 'rear_ttc_s':active_side.get('current_rear_ttc_ca_s')})
+
+    if ctx['kind']=='TURN':
+      # A blinker during a low-speed, same-direction road turn should not be
+      # presented as a lane-change permission decision.
+      h['committed']=False; h['commit_ns']=0; h['latched_decision']=None; h['precommit_decision']=None
+      base.update({'label':'TURN','state':'TURN','phase':'TURNING','committed':False,
+                   'reasons':['intersection_turn_context']})
+      return base
+
+    # Lane-change context.
+    blink_age=max(0.0,(int(now_ns)-int(h.get('blinker_since_ns',now_ns)))/1e9)
+    steer=abs(float(steering_angle_deg or 0.0))
+    if (not h.get('committed') and float(v_ego)>=LANE_CHANGE_COMMIT_MIN_SPEED_MPS and
+        blink_age>=LANE_CHANGE_COMMIT_MIN_BLINKER_S and steer>=LANE_CHANGE_COMMIT_STEER_DEG):
+      h['committed']=True; h['commit_ns']=int(now_ns)
+      h['latched_decision']=dict(h.get('precommit_decision') or dec)
+
+    if not h.get('committed'):
+      h['precommit_decision']=dict(dec)
+      base['phase']='PRECHECK'
+      return base
+
+    age=max(0.0,(int(now_ns)-int(h.get('commit_ns',now_ns)))/1e9)
+    base['committed']=True; base['commit_age_s']=round(age,3)
+    lat=dict(h.get('latched_decision') or dec)
+
+    if age < LANE_CHANGE_DECISION_HOLD_S:
+      base['phase']='COMMIT_HOLD'
+      base['hold_remaining_s']=round(max(0.0,LANE_CHANGE_DECISION_HOLD_S-age),3)
+      if self._hard_override(active_side):
+        base['reasons']=['commit_hold_hard_ttc_override']+(dec.get('reasons') or [])[:5]
+      else:
+        base['state']=lat.get('state','CAUTION_SHADOW')
+        base['label']=lat.get('label','CHECK ?')
+        base['reasons']=['lane_change_commit_hold']+(lat.get('reasons') or [])[:5]
+      return base
+
+    if age < LANE_CHANGE_DECISION_HOLD_S + LANE_CHANGE_REBASE_S:
+      base['phase']='REBASING'
+      base['hold_remaining_s']=0.0
+      # Re-centering into the target lane can make the old target-lane coordinate
+      # system report zero gap/boundary overlap.  During this short window keep
+      # such geometry-only DANGER at CHECK, but do not mask a hard TTC conflict.
+      if base.get('state')=='BLOCKED_SHADOW' and not self._hard_override(active_side):
+        rr=set(base.get('reasons') or [])
+        benign_prefixes=('front_gap<=','rear_gap<=','boundary<=')
+        benign_exact={'display_hysteresis','possible_incoming_near','front_brake_scenario<=8m','ego_brake_rear<=8m'}
+        geometry_only=all((any(x.startswith(p) for p in benign_prefixes) or x in benign_exact) for x in rr) if rr else True
+        if geometry_only:
+          base['state']='CAUTION_SHADOW'; base['label']='CHECK ?'
+          base['reasons']=['lane_change_rebase']+list(base.get('reasons') or [])[:5]
+      return base
+
+    base['phase']='ACTIVE'
+    return base
 
   def _side(self, objects: list[dict], target_idx: int, a_ego: float) -> dict:
     states_by_key: dict[str,dict[float,dict]]={}
@@ -474,7 +616,9 @@ class FutureGapEvaluator:
       'scenarios':scenarios,
     }
 
-  def update(self, objects: list[dict], v_ego: float=0.0, a_ego: float=0.0, left_blinker: bool=False, right_blinker: bool=False, now_ns: int=0) -> dict:
+  def update(self, objects: list[dict], v_ego: float=0.0, a_ego: float=0.0,
+             left_blinker: bool=False, right_blinker: bool=False, now_ns: int=0,
+             steering_angle_deg: float=0.0, road_curve_direction: str | None=None) -> dict:
     if not now_ns:
       import time
       now_ns=time.monotonic_ns()
@@ -483,12 +627,38 @@ class FutureGapEvaluator:
     left['decision_raw']=self._decision(left); right['decision_raw']=self._decision(right)
     left['decision']=self._stabilize_decision(left,+1,now_ns); right['decision']=self._stabilize_decision(right,-1,now_ns)
     active=None; active_side=None
-    if left_blinker and not right_blinker: active='left'; active_side=left
-    elif right_blinker and not left_blinker: active='right'; active_side=right
-    intent={'active':bool(active_side is not None),'side':active,'label':'STANDBY','state':'STANDBY','raw_state':None,'reasons':[],'front_clearance_m':None,'rear_clearance_m':None,'boundary_clearance_m':None,'front_ttc_s':None,'rear_ttc_s':None,'shadow_only':True}
-    if active_side is not None:
-      dec=active_side.get('decision') or {}
-      intent.update({'label':dec.get('label','CHECK ?'),'state':dec.get('state','CAUTION_SHADOW'),'raw_state':dec.get('raw_state'),'reasons':dec.get('reasons',[])[:6],'front_clearance_m':active_side.get('min_front_clearance_during_ego_overlap_m'),'rear_clearance_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),'boundary_clearance_m':active_side.get('min_boundary_clearance_during_ego_overlap_m'),'front_ttc_s':active_side.get('current_front_ttc_ca_s'),'rear_ttc_s':active_side.get('current_rear_ttc_ca_s')})
-    elif left_blinker and right_blinker: intent.update({'label':'HAZARD','state':'HAZARD','reasons':['both_blinkers']})
-    return {'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG4_DEC2','decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,'vehicle_half_width_m':OBJECT_HALF_WIDTH_M,'ego':{'v_ego_mps':round(float(v_ego),3),'a_ego_mps2':round(float(a_ego),3),'left_blinker':bool(left_blinker),'right_blinker':bool(right_blinker)},'left':left,'right':right,'stats':{'visible_objects':len(objects),'left_incoming_confirmed':left['incoming_count'],'right_incoming_confirmed':right['incoming_count'],'left_incoming_stable':left['stable_incoming_count'],'right_incoming_stable':right['stable_incoming_count'],'left_incoming_possible':left['possible_incoming_count'],'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},'note':'FG4 + DEC2 shadow only: Golden-regression decision separation + asymmetric display hysteresis + blinker-directed driver comparison HUD; no planner/CAN control.'}
+    if left_blinker and not right_blinker:
+      active='left'; active_side=left
+    elif right_blinker and not left_blinker:
+      active='right'; active_side=right
+
+    if left_blinker and right_blinker:
+      intent={'active':False,'side':None,'label':'HAZARD','state':'HAZARD','raw_state':None,
+              'reasons':['both_blinkers'],'front_clearance_m':None,'rear_clearance_m':None,
+              'boundary_clearance_m':None,'front_ttc_s':None,'rear_ttc_s':None,'shadow_only':True,
+              'maneuver_context':'HAZARD','phase':'HAZARD','committed':False,'commit_age_s':None,
+              'hold_remaining_s':None,'steering_angle_deg':round(float(steering_angle_deg or 0.0),2),
+              'road_curve_direction':str(road_curve_direction or 'UNKNOWN').upper()}
+    else:
+      intent=self._apply_intent_state(active,active_side,v_ego,steering_angle_deg,road_curve_direction,now_ns)
+
+    return {
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG5_DEC3',
+      'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
+      'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),
+      'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
+      'vehicle_half_width_m':OBJECT_HALF_WIDTH_M,
+      'ego':{'v_ego_mps':round(float(v_ego),3),'a_ego_mps2':round(float(a_ego),3),
+             'left_blinker':bool(left_blinker),'right_blinker':bool(right_blinker),
+             'steering_angle_deg':round(float(steering_angle_deg or 0.0),2),
+             'road_curve_direction':str(road_curve_direction or 'UNKNOWN').upper()},
+      'left':left,'right':right,
+      'stats':{'visible_objects':len(objects),'left_incoming_confirmed':left['incoming_count'],
+               'right_incoming_confirmed':right['incoming_count'],'left_incoming_stable':left['stable_incoming_count'],
+               'right_incoming_stable':right['stable_incoming_count'],'left_incoming_possible':left['possible_incoming_count'],
+               'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
+               'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
+               'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
+      'note':'FG5 + DEC3 shadow only: turn/lane-change context + commit hold/rebase + dual-side preview HUD; no planner/CAN control.'
+    }
 
