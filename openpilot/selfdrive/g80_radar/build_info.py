@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 41
-BUILD_TAG = 'v41-web7-stage-provenance-roi-audit-fg9-webfix-signal-source-lock-goldenv2'
-LOGGER_FORMAT_VERSION = 22
+BUILD_VERSION = 42
+BUILD_TAG = 'v42-web7-legacy-visual-fg10-lane-centered-danger-webfix-signal-source-lock-goldenv2'
+LOGGER_FORMAT_VERSION = 23
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
-FUTURE_GAP_API_VERSION = 9
+FUTURE_GAP_API_VERSION = 10
 ANDROID_PROTOCOL_VERSION = 21
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'

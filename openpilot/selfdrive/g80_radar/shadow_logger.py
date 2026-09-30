@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V41: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V42: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -145,11 +145,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V41: browser-only stage audit at UI 8Hz or idle 2Hz; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V42: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual restored; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V41 retains V40 FG9: origin-aware same-key threat + explicit current/predicted rear gaps; FG8 TURN/rebase',
+          'future_gap_policy':'V42 FG10: lane-centered DANGER, outer-edge CHECK, 0.15s red-entry debounce; FG9 same-key gap + FG8 TURN/rebase retained',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V41 seven read-only stages incl diagnostic validity-only raw filter and selected L1/L2; physical sector labels are positional estimates',
+          'web_stage_contract':'V42 seven read-only stages; V40 legacy road/vehicle visual restored; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,
