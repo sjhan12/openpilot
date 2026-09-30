@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""V38R4 shadow Future Gap + Target-Lane Occupancy evaluator.
+"""V39R1 shadow Future Gap + Target-Lane Occupancy evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
-geometry for NOW/0.5/1/2/3 s.  V37 keeps FG4 geometry and adds DEC3 maneuver-context handling:
+geometry for NOW/0.5/1/2/3 s.  V40 retains FG8 maneuver context and adds origin-aware FG9 risk evidence to DEC3 maneuver-context handling:
 - distinguish likely intersection turns from lane changes using road curvature, speed and steering angle;
 - latch the pre-commit lane-change assessment briefly after steering commitment;
 - suppress coordinate-recenter false DANGER during the commit/rebase window while retaining a hard TTC override;
@@ -22,7 +22,7 @@ import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name, adjacent_lane_availability
 
-FUTURE_GAP_API_VERSION = 7
+FUTURE_GAP_API_VERSION = 9
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -42,21 +42,27 @@ INCOMING_FORGET_S = 0.80
 DISPLAY_DANGER_RELEASE_S = 0.35
 DISPLAY_SAFE_ENTRY_S = 0.60
 
-# V38R4 maneuver-context / lane-change commit handling.
+# V40 retains FG8 maneuver-context / lane-change commit handling.
 TURN_CURVE_MATCH_MAX_SPEED_MPS = 8.5      # ~30.6 km/h
 TURN_STEERING_MIN_DEG = 35.0
 TURN_STEERING_MAX_SPEED_MPS = 14.0        # allow a brisk intersection turn to be classified
 TURN_LOW_SPEED_STEERING_MIN_DEG = 18.0    # catch intersection turns before 35 deg is reached
 TURN_LOW_SPEED_MAX_MPS = 6.0              # ~21.6 km/h
-TURN_EXIT_HOLD_S = 1.80                    # prevent TURN -> lane-change flip while blinker remains on
+TURN_EXIT_HOLD_S = 1.80                    # normal release hold after explicit TURN evidence
+TURN_LOW_SPEED_LATCH_MPS = 5.0               # once TURN is seen, keep it while creeping/stopped
+TURN_WAIT_MAX_SPEED_MPS = 2.5                 # blinker + unconfirmed lane at crawl => TURN? instead of lane-change
+TURN_NO_LANE_APPROACH_MAX_MPS = 12.0          # target lane absent at urban speed => likely intersection/road turn
 LANE_CHANGE_COMMIT_MIN_SPEED_MPS = 5.0
 LANE_CHANGE_COMMIT_STEER_DEG = 4.0
 LANE_CHANGE_COMMIT_MIN_BLINKER_S = 0.15
 LANE_CHANGE_DECISION_HOLD_S = 1.50
-LANE_CHANGE_REBASE_S = 0.85
+LANE_CHANGE_REBASE_S = 1.50
 LANE_CHANGE_SESSION_TIMEOUT_S = 4.5
 HARD_OVERRIDE_CLEARANCE_M = 1.5
 HARD_OVERRIDE_TTC_S = 1.5
+HARD_OVERRIDE_CONFIRM_S = 0.20                # identity-stable hard conflict before breaking commit/rebase hold
+HARD_OVERRIDE_CONFIRM_COUNT = 2
+LANE_CHANGE_COMMIT_LANE_STABLE_S = 0.35
 
 # Road/lane geometry is noisy frame-to-frame.  Stabilize the semantic lane state
 # before it reaches the driver arrows.  These are display/shadow-only timers.
@@ -77,6 +83,16 @@ DEC_BLOCK_INCOMING_ETA_S = 2.5
 DEC_CAUTION_INCOMING_ETA_S = 3.0
 DEC_BLOCK_INCOMING_ABS_S_M = 25.0
 DEC_CAUTION_INCOMING_ABS_S_M = 40.0
+
+# FG9 separates the *current* physical gap from a future-horizon extrapolation.
+# These are diagnostic/UI-only gates.  In particular, a current FRONT target
+# must never be relabelled as a REAR vehicle just because its predicted s crosses 0.
+FG9_PREDICTED_CONFIRM_S = 0.25
+FG9_PREDICTED_MIN_COUNT = 2
+FG9_PREDICTED_FORGET_S = 0.85
+FG9_MAX_SOURCE_AGE_MS = 350.0
+FG9_CROSSING_TTC_S = 3.0
+FG9_URGENT_TTC_S = 1.5
 
 
 def _finite(v, default=None):
@@ -242,6 +258,8 @@ class FutureGapEvaluator:
       +1:{'stable':'UNCERTAIN','candidate':'UNCERTAIN','candidate_since_ns':0,'last_strong_ns':0},
       -1:{'stable':'UNCERTAIN','candidate':'UNCERTAIN','candidate_since_ns':0,'last_strong_ns':0},
     }
+    self.hard_override_hist = {'side':None,'key':None,'since_ns':0,'last_ns':0,'count':0}
+    self.fg9_prediction_hist: dict[tuple[int,str,str],dict] = {}
 
   def _stabilize_incoming(self, side: dict, target_idx: int, now_ns: int) -> dict:
     now_ns=int(now_ns)
@@ -273,7 +291,7 @@ class FutureGapEvaluator:
     return side
 
   @staticmethod
-  def _decision(side: dict) -> dict:
+  def _decision_legacy(side: dict) -> dict:
     reasons=[]
     level='SAFE_SHADOW'
     front=side.get('min_front_clearance_during_ego_overlap_m')
@@ -312,6 +330,181 @@ class FutureGapEvaluator:
             caution.append('possible_incoming_near'); break
       if caution: level='CAUTION_SHADOW'; reasons=caution
     return {'state':level,'reasons':reasons[:6],'policy':'DEC3 base shadow; what-if braking alone is advisory CHECK only'}
+
+
+  def _fg9_build_evidence(self, side: dict, target_idx: int, now_ns: int) -> dict:
+    """Link each predicted closest pass to THAT SAME vehicle's observed state.
+
+    Old DEC3 aggregated current nearest TTC and min future gap independently;
+    both may belong to different keys.  In logs 23/25 rear-gap warnings during
+    signalling were actually vehicles originally AHEAD of the ego, extrapolated
+    through s=0 and subsequently named 'rear'.  Here origin is immutable.
+    """
+    obj=side.get('fg9_object_states') or {}
+    horizon=side.get('horizons') or []
+    stable={str(t.get('key')) for t in side.get('stable_incoming') or []}
+    near=[]
+    have=set()
+    live_hist=set()
+    for key,x in obj.items():
+      s0=_finite(x.get('s')); v0=_finite(x.get('s_dot')); age=_finite(x.get('source_age_ms'),9999.0)
+      if s0 is None or v0 is None:continue
+      if not x.get('current_core') and not x.get('current_boundary') and key not in stable and not x.get('forecast_near'):
+        continue
+      origin='front' if s0>=0 else 'rear'
+      closing=bool((s0>0 and v0 < -0.25) or (s0<0 and v0>0.25))
+      ttc=abs(s0/v0) if closing else None
+      # CA TTC can be informative diagnostically, but acceleration alone is not
+      # sufficient to label a distant target DANGER if its present motion is away.
+      cur_clearance=max(0.0,abs(s0)-OBJECT_LONG_MARGIN_M-min(MAX_LONG_SIGMA_MARGIN_M,max(0.0,_finite(x.get('s_sigma'),0.0))))
+      predicted=[]
+      pred_core=[]; pred_boundary=[]
+      for h in horizon:
+        if not h.get('ego_target_overlap'):continue
+        hsec=_finite(h.get('t'),0.0)
+        for typ in ('front','rear','boundary_front','boundary_rear'):
+          item=h.get(typ) or {}
+          if str(item.get('key') or '')!=key:continue
+          c=_finite(item.get('clearance_m'))
+          if c is None:continue
+          predicted.append((c,hsec,typ,_finite(item.get('s'))))
+          if typ.startswith('boundary'):pred_boundary.append((c,hsec,typ))
+          else:pred_core.append((c,hsec,typ))
+      # Only measured point at t=0 can be an *immediate* hazard.  A path point
+      # at t=2 s can be a prediction rather than an actual nearby vehicle.
+      current_core=bool(x.get('current_core'))
+      current_boundary=bool(x.get('current_boundary'))
+      immediate=(current_core and cur_clearance<=DEC_BLOCK_CLEARANCE_M) or (current_boundary and cur_clearance<=DEC_BLOCK_BOUNDARY_M)
+      nearest=min(predicted,default=None,key=lambda a:a[0])
+      pmin=nearest[0] if nearest else None
+      ptime=nearest[1] if nearest else None
+      # Strong imminent closing evidence, including approaching rear vehicles.
+      # Only enforce this when the source is recent, lanes align, AND the
+      # identified object is stable over time; one-frame predictions stay CHECK.
+      recent=age is not None and age <= FG9_MAX_SOURCE_AGE_MS
+      future_severe=bool(pmin is not None and pmin <= DEC_BLOCK_CLEARANCE_M)
+      lane_corrob=bool(current_core or key in stable)
+      imminent=bool(closing and ttc is not None and 0.5 <= ttc <= FG9_CROSSING_TTC_S)
+      pred_key=(int(target_idx),key,origin)
+      active=bool(future_severe and recent and imminent and lane_corrob)
+      if active:
+        live_hist.add(pred_key)
+        prev=self.fg9_prediction_hist.get(pred_key)
+        if prev is None or int(now_ns)-int(prev.get('last_ns',0))>int(FG9_PREDICTED_FORGET_S*1e9):
+          prev={'since_ns':int(now_ns),'count':1,'last_ns':int(now_ns)}
+        else:
+          prev['count']=int(prev.get('count',0))+1;prev['last_ns']=int(now_ns)
+        self.fg9_prediction_hist[pred_key]=prev
+        stable_s=max(0.0,(int(now_ns)-int(prev['since_ns']))/1e9)
+        persistent=bool(prev['count']>=FG9_PREDICTED_MIN_COUNT and stable_s>=FG9_PREDICTED_CONFIRM_S)
+      else:
+        persistent=False;stable_s=0.0
+      # Real current overlap can be urgent before a two-sample predictor gate.
+      confirmed=bool(immediate or (future_severe and imminent and lane_corrob and recent and persistent))
+      item={'key':key,'origin':origin,'s_now_m':round(s0,2),'d_now_m':round(float(x.get('d') or 0.0),2),'current_gap_m':round(cur_clearance,2),
+            'current_core':current_core,'current_boundary':current_boundary,
+            'relative_s_dot_mps':round(v0,2),'closing':closing,'ttc_linear_s':round(ttc,2) if ttc is not None else None,
+            'source_age_ms':round(age,1) if age is not None else None,'source_mask':x.get('source_mask') or [],
+            'track_duration_s':round(float(x.get('track_duration_s') or 0.0),2),
+            'future_min_m':round(pmin,2) if pmin is not None else None,
+            'future_min_t_s':ptime,'future_min_kind':nearest[2] if nearest else None,
+            'forecast_core':bool(pred_core),'stable_incoming':key in stable,
+            'prediction_persistence_s':round(stable_s,3),'prediction_persistent':persistent,
+            'immediate':immediate,'predicted_severe':future_severe,'confirmed':confirmed,
+            'fresh':recent,'uncertain_prediction':bool(future_severe and not confirmed),
+            'front_crossed_into_predicted_rear':bool(origin=='front' and any(c<=5 and typ=='rear' for c,t,typ,_ in predicted)),
+            'rear_closed_into_predicted_front':bool(origin=='rear' and any(c<=5 and typ=='front' for c,t,typ,_ in predicted))}
+      near.append(item)
+    # Bound the history and published evidence.  Active risk keys stay cached;
+    # a dropped/reacquired identity must not inherit another vehicle's proof.
+    for k,h in list(self.fg9_prediction_hist.items()):
+      if int(now_ns)-int(h.get('last_ns',0))>int(FG9_PREDICTED_FORGET_S*1e9):
+        del self.fg9_prediction_hist[k]
+    near.sort(key=lambda x:(not x['confirmed'],x['future_min_m'] if x['future_min_m'] is not None else 999))
+    all_now=[x for x in near if x['current_core']]
+    front=[x['current_gap_m'] for x in all_now if x['origin']=='front']
+    rear=[x['current_gap_m'] for x in all_now if x['origin']=='rear']
+    out={'observations':near[:30],
+         'current_front_gap_m':min(front,default=None),'current_rear_gap_m':min(rear,default=None),
+         'predicted_front_min_m':side.get('min_front_clearance_during_ego_overlap_m'),
+         'predicted_rear_min_m':side.get('min_rear_clearance_during_ego_overlap_m'),
+         'near_future_predicted_count':sum(bool(x['predicted_severe']) for x in near),
+         'near_future_confirmed_count':sum(bool(x['confirmed']) for x in near),
+         'front_to_rear_predictions':sum(bool(x['front_crossed_into_predicted_rear']) for x in near),
+         'origin_aware':True}
+    side['fg9_evidence']=out
+    return out
+
+  @staticmethod
+  def _decision(side: dict) -> dict:
+    """FG9 risk tiers: immediate physical hazard / corroborated approaching /
+    prediction-only CHECK.  Never use the min future REAR gap of a FRONT car as
+    a measurement of rear-approach danger.
+    """
+    e=side.get('fg9_evidence') or {}
+    items=e.get('observations') or []
+    hard=[]; caution=[]
+    def add(lst,value):
+      if value not in lst:lst.append(value)
+    for x in items:
+      gap=x.get('current_gap_m')
+      ttc=x.get('ttc_linear_s')
+      if x.get('immediate'):
+        add(hard,'current_'+('front' if x['origin']=='front' else 'rear')+'_close')
+      elif gap is not None and x.get('current_core') and gap<=DEC_CAUTION_CLEARANCE_M:
+        add(caution,'current_'+x['origin']+'_watch')
+      if x.get('confirmed') and not x.get('immediate'):
+        if x.get('front_crossed_into_predicted_rear'):
+          add(hard,'confirmed_FRONT_crossover')
+        else:
+          add(hard,'confirmed_'+x['origin']+'_closing')
+      elif x.get('uncertain_prediction'):
+        add(caution,'unconfirmed_'+('FRONT_crossover' if x.get('front_crossed_into_predicted_rear') else x['origin']+'_forecast'))
+      if x.get('current_core') and x.get('closing') and ttc is not None:
+        if ttc<=FG9_URGENT_TTC_S and x.get('fresh'):
+          add(hard,'immediate_'+x['origin']+'_TTC')
+        elif ttc<=DEC_CAUTION_TTC_S:
+          add(caution,x['origin']+'_TTC_watch')
+    for x in side.get('stable_incoming') or []:
+      k=str(x.get('key') or '')
+      if (float(x.get('entry_eta_s',99))<=DEC_BLOCK_INCOMING_ETA_S and
+          abs(float(x.get('entry_s_m',999)))<=DEC_BLOCK_INCOMING_ABS_S_M):
+        # Incoming is already temporally confirmed by _stabilize_incoming.
+        # Corroborate with a fresh canonical object before declaring DANGER.
+        obs=next((r for r in items if r['key']==k),None)
+        if obs is not None and obs['fresh']:
+          add(hard,'stable_incoming_near')
+        else:add(caution,'incoming_source_uncertain')
+      elif float(x.get('entry_eta_s',99))<=DEC_CAUTION_INCOMING_ETA_S and abs(float(x.get('entry_s_m',999)))<=DEC_CAUTION_INCOMING_ABS_S_M:
+        add(caution,'stable_incoming')
+    if not hard:
+      for x in side.get('possible_incoming') or []:
+        if float(x.get('entry_eta_s',99))<=1.5 and abs(float(x.get('entry_s_m',999)))<=25.0:
+          add(caution,'possible_incoming_near');break
+    # Hypothetical braking scenarios only justify CHECK, not hard danger.
+    sc=side.get('scenarios') or {}
+    if any(((sc.get(name) or {}).get('min_clearance_m') is not None and (sc.get(name) or {}).get('min_clearance_m')<=8.0)
+           for name in ('front_target_brake','rear_ego_brake')):
+      add(caution,'what_if_braking')
+    # Bound FG9 against DEC3: V40 must NOT manufacture additional red warnings
+    # from an instantaneous sensor close pass that FG8 did not flag.  Equally,
+    # missing corroboration changes a legacy red to yellow, NEVER to green.
+    legacy=side.get('legacy_decision_raw') or FutureGapEvaluator._decision_legacy(side)
+    old_state=legacy.get('state')
+    if hard and old_state!='BLOCKED_SHADOW':
+      hard=[]
+      add(caution,'extra_hard_evidence_watch_only')
+    if not hard and old_state=='BLOCKED_SHADOW':
+      add(caution,'legacy_block_unconfirmed')
+    elif not hard and not caution and old_state=='CAUTION_SHADOW':
+      add(caution,'legacy_watch_unverified')
+    # If there is not enough information to confirm a lane, road gate will
+    # override the *display* separately; no prediction-only downgrade to green.
+    state='BLOCKED_SHADOW' if hard else ('CAUTION_SHADOW' if caution else 'SAFE_SHADOW')
+    return {'state':state,'reasons':(hard if hard else caution)[:6],
+            'policy':'FG9 origin-aware same-key current gap + stable future evidence; display/shadow only',
+            'predicted_only':bool(caution and not hard),
+            'diagnostic_not_permission':True}
 
   def _stabilize_lane_availability(self, availability: dict | None, target_idx: int, now_ns: int) -> dict:
     """Debounce noisy C4 lane-line/road-edge geometry for the driver preview.
@@ -368,7 +561,14 @@ class FutureGapEvaluator:
       return out
     # UNCERTAIN: retain only a genuinely hard immediate hazard as DANGER.
     hard=self._hard_override(side or {})
-    if str(out.get('state'))=='BLOCKED_SHADOW' and hard:
+    # UNCERTAIN road geometry: being near an *adjacent* car is not the same
+    # as a current ego-footprint overlap.  If there's direct physical overlap,
+    # keep red; otherwise unknown road stays CHECK ROAD until lane confirmed.
+    direct=any(bool(x.get('immediate') and x.get('fresh') and
+                    abs(float(x.get('d_now_m') if x.get('d_now_m') is not None else 999))<=EGO_HALF_WIDTH_M+OBJECT_HALF_WIDTH_M+0.2 and
+                    float(x.get('current_gap_m') if x.get('current_gap_m') is not None else 999)<=HARD_OVERRIDE_CLEARANCE_M)
+               for x in ((side or {}).get('fg9_evidence') or {}).get('observations',[]))
+    if str(out.get('state'))=='BLOCKED_SHADOW' and (hard or direct):
       out['reasons']=['road_uncertain_hard_hazard'] + list(out.get('reasons') or [])[:5]
       return out
     out['state']='CAUTION_SHADOW'; out['label_override']='CHECK ROAD'
@@ -430,14 +630,49 @@ class FutureGapEvaluator:
 
   @staticmethod
   def _hard_override(side: dict) -> bool:
-    front=side.get('min_front_clearance_during_ego_overlap_m')
-    rear=side.get('min_rear_clearance_during_ego_overlap_m')
-    ft=side.get('current_front_ttc_ca_s'); rt=side.get('current_rear_ttc_ca_s')
-    def le(v,t): return v is not None and float(v) <= float(t)
-    # During lane-change coordinate recentering a zero gap can be synthetic, so
-    # require both a very small physical clearance and a very short TTC.
-    return bool((le(front,HARD_OVERRIDE_CLEARANCE_M) and le(ft,HARD_OVERRIDE_TTC_S)) or
-                (le(rear,HARD_OVERRIDE_CLEARANCE_M) and le(rt,HARD_OVERRIDE_TTC_S)))
+    """Also fixes a pre-existing FG8 AttributeError in UNCERTAIN road gate.
+
+    Never mix current TTC of vehicle A with predicted clearance of vehicle B.
+    """
+    return FutureGapEvaluator._hard_override_candidate(side) is not None
+
+  @staticmethod
+  def _hard_override_candidate(side: dict) -> dict | None:
+    """FG9: hard override requires SAME keyed object for TTC and min clearance.
+
+    V39 combined nearest current TTC and nearest future gap for unrelated cars.
+    This could produce a synthetic hard conflict during rebase/identity churn.
+    """
+    obs=(side.get('fg9_evidence') or {}).get('observations') or []
+    can=[]
+    for x in obs:
+      gap=x.get('future_min_m')
+      ttc=x.get('ttc_linear_s')
+      if not (x.get('confirmed') and x.get('fresh') and x.get('closing')):
+        continue
+      best=min([v for v in (gap,x.get('current_gap_m') if x.get('immediate') else None) if v is not None],default=None)
+      if best is None or ttc is None or best>HARD_OVERRIDE_CLEARANCE_M or ttc>HARD_OVERRIDE_TTC_S:
+        continue
+      can.append({'side':x['origin'],'key':x['key'],'clearance_m':best,'ttc_s':ttc,'same_key':True})
+    return min(can,key=lambda x:(x['ttc_s'],x['clearance_m'])) if can else None
+
+  def _stable_hard_override(self, active: str | None, side: dict, now_ns: int) -> tuple[bool, dict | None]:
+    cand=self._hard_override_candidate(side)
+    h=self.hard_override_hist
+    if cand is None:
+      self.hard_override_hist={'side':active,'key':None,'since_ns':0,'last_ns':int(now_ns),'count':0}
+      return False,None
+    key=str(cand.get('key') or '')
+    continuous=(h.get('side')==active and h.get('key')==key and int(now_ns)-int(h.get('last_ns',0) or 0) <= int(0.9e9))
+    if continuous:
+      h['last_ns']=int(now_ns); h['count']=int(h.get('count',0))+1
+    else:
+      h={'side':active,'key':key,'since_ns':int(now_ns),'last_ns':int(now_ns),'count':1}
+      self.hard_override_hist=h
+    age=max(0.0,(int(now_ns)-int(h.get('since_ns',now_ns)))/1e9)
+    confirmed=bool(int(h.get('count',0))>=HARD_OVERRIDE_CONFIRM_COUNT and age>=HARD_OVERRIDE_CONFIRM_S)
+    diag=dict(cand); diag.update({'age_s':round(age,3),'count':int(h.get('count',0)),'confirmed':confirmed})
+    return confirmed,diag
 
   def _apply_intent_state(self, active: str | None, active_side: dict | None,
                           v_ego: float, steering_angle_deg: float,
@@ -455,24 +690,46 @@ class FutureGapEvaluator:
       if h.get('last_active_ns') and int(now_ns)-int(h.get('last_active_ns',0)) > int(0.8e9):
         self.intent_hist={'side':None,'blinker_since_ns':0,'committed':False,'commit_ns':0,
                           'latched_decision':None,'precommit_decision':None,'last_active_ns':0,'last_context':'STANDBY','last_turn_evidence_ns':0}
+        self.hard_override_hist={'side':None,'key':None,'since_ns':0,'last_ns':0,'count':0}
       return base
 
     if h.get('side') != active or (int(now_ns)-int(h.get('last_active_ns',0) or 0) > int(LANE_CHANGE_SESSION_TIMEOUT_S*1e9)):
       h={'side':active,'blinker_since_ns':int(now_ns),'committed':False,'commit_ns':0,
          'latched_decision':None,'precommit_decision':None,'last_active_ns':int(now_ns),'last_context':'STANDBY','last_turn_evidence_ns':0}
       self.intent_hist=h
+      self.hard_override_hist={'side':active,'key':None,'since_ns':0,'last_ns':0,'count':0}
     else:
       h['last_active_ns']=int(now_ns)
 
     ctx=self._context(active,v_ego,steering_angle_deg,road_curve_direction)
+    lane_meta=dict(active_side.get('lane_availability') or {})
+    lane_status=str(lane_meta.get('status') or 'UNCERTAIN').upper()
+    speed=max(0.0,float(v_ego or 0.0))
     raw_ctx=ctx['kind']
-    if raw_ctx=='TURN':
+    explicit_turn=raw_ctx=='TURN'
+    no_lane_approach=bool(raw_ctx!='TURN' and lane_status=='ABSENT' and speed<=TURN_NO_LANE_APPROACH_MAX_MPS)
+    low_speed_wait=bool(raw_ctx!='TURN' and lane_status!='CONFIRMED' and speed<=TURN_WAIT_MAX_SPEED_MPS)
+    if explicit_turn or no_lane_approach:
       h['last_turn_evidence_ns']=int(now_ns)
+      if no_lane_approach:
+        ctx=dict(ctx); ctx['kind']='TURN'; ctx['turn_approach_no_target_lane']=True
+    elif low_speed_wait:
+      # At a crawl with no confirmed adjacent lane, do not invent a lane-change
+      # permission state.  Mark it as a pending turn/road maneuver until geometry
+      # becomes clear or the blinker is cancelled.
+      ctx=dict(ctx); ctx['kind']='TURN'; ctx['turn_wait_unconfirmed_lane']=True
     else:
       lt=int(h.get('last_turn_evidence_ns',0) or 0)
-      if lt and (int(now_ns)-lt) < int(TURN_EXIT_HOLD_S*1e9):
-        ctx=dict(ctx); ctx['kind']='TURN'; ctx['turn_release_hold']=True
-        ctx['turn_hold_remaining_s']=round(max(0.0,TURN_EXIT_HOLD_S-(int(now_ns)-lt)/1e9),3)
+      if lt:
+        age=(int(now_ns)-lt)/1e9
+        keep_low_speed=bool(speed<=TURN_LOW_SPEED_LATCH_MPS)
+        keep_unconfirmed=bool(lane_status!='CONFIRMED' and speed<=TURN_CURVE_MATCH_MAX_SPEED_MPS)
+        keep_timed=bool(age<TURN_EXIT_HOLD_S)
+        if keep_low_speed or keep_unconfirmed or keep_timed:
+          ctx=dict(ctx); ctx['kind']='TURN'; ctx['turn_release_hold']=True
+          ctx['turn_hold_remaining_s']=None if (keep_low_speed or keep_unconfirmed) else round(max(0.0,TURN_EXIT_HOLD_S-age),3)
+          ctx['turn_hold_low_speed']=keep_low_speed
+          ctx['turn_hold_lane_unconfirmed']=keep_unconfirmed
     h['last_context']=ctx['kind']
     base['maneuver_context']=ctx['kind']
     base['context_detail']=ctx
@@ -481,26 +738,47 @@ class FutureGapEvaluator:
     dec=dict(active_side.get('decision') or {})
     base.update({'label':dec.get('label','CHECK ?'),'state':dec.get('state','CAUTION_SHADOW'),
                  'raw_state':dec.get('raw_state'),'reasons':dec.get('reasons',[])[:6],
-                 'front_clearance_m':active_side.get('min_front_clearance_during_ego_overlap_m'),
-                 'rear_clearance_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),
+                 'front_clearance_m':(active_side.get('fg9_evidence') or {}).get('current_front_gap_m'),
+                 'rear_clearance_m':(active_side.get('fg9_evidence') or {}).get('current_rear_gap_m'),
+                 'predicted_front_min_m':active_side.get('min_front_clearance_during_ego_overlap_m'),
+                 'predicted_rear_min_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),
                  'boundary_clearance_m':active_side.get('min_boundary_clearance_during_ego_overlap_m'),
                  'front_ttc_s':active_side.get('current_front_ttc_ca_s'),
                  'rear_ttc_s':active_side.get('current_rear_ttc_ca_s'),
                  'lane_availability':dict(active_side.get('lane_availability') or {})})
 
     if ctx['kind']=='TURN':
-      # A blinker during a low-speed, same-direction road turn should not be
-      # presented as a lane-change permission decision.
+      # Once an intersection/road turn is established, do not flip back to
+      # lane-change while creeping, while the target lane is absent/unconfirmed,
+      # or during the short steering unwind after the turn.
       h['committed']=False; h['commit_ns']=0; h['latched_decision']=None; h['precommit_decision']=None
+      self.hard_override_hist={'side':active,'key':None,'since_ns':0,'last_ns':int(now_ns),'count':0}
       hold=bool(ctx.get('turn_release_hold'))
-      base.update({'label':'TURN','state':'TURN','phase':'TURN_HOLD' if hold else 'TURNING','committed':False,
-                   'reasons':['intersection_turn_release_hold' if hold else 'intersection_turn_context']})
+      approach=bool(ctx.get('turn_approach_no_target_lane'))
+      wait=bool(ctx.get('turn_wait_unconfirmed_lane'))
+      if approach:
+        phase='TURN_APPROACH'; label='TURN ?'; reason='turn_approach_no_target_lane'
+      elif wait:
+        phase='TURN_WAIT'; label='TURN ?'; reason='turn_wait_unconfirmed_lane'
+      elif hold:
+        phase='TURN_HOLD'; label='TURN'; reason='intersection_turn_release_hold'
+      else:
+        phase='TURNING'; label='TURN'; reason='intersection_turn_context'
+      base.update({'label':label,'state':'TURN','phase':phase,'committed':False,
+                   'reasons':[reason]})
       return base
 
-    # Lane-change context.
+    # Lane-change context.  V38 log replay showed a false COMMIT while
+    # the requested side was explicitly NO LANE.  Commitment now requires a
+    # temporally stable confirmed target lane in addition to motion/steering.
     blink_age=max(0.0,(int(now_ns)-int(h.get('blinker_since_ns',now_ns)))/1e9)
     steer=abs(float(steering_angle_deg or 0.0))
-    if (not h.get('committed') and float(v_ego)>=LANE_CHANGE_COMMIT_MIN_SPEED_MPS and
+    lane_age=float(lane_meta.get('candidate_age_s') or 0.0)
+    lane_commit_ready=bool(lane_status=='CONFIRMED' and lane_age>=LANE_CHANGE_COMMIT_LANE_STABLE_S)
+    base['lane_commit_ready']=lane_commit_ready
+    base['lane_commit_status']=lane_status
+    base['lane_commit_age_s']=round(lane_age,3)
+    if (not h.get('committed') and lane_commit_ready and float(v_ego)>=LANE_CHANGE_COMMIT_MIN_SPEED_MPS and
         blink_age>=LANE_CHANGE_COMMIT_MIN_BLINKER_S and steer>=LANE_CHANGE_COMMIT_STEER_DEG):
       h['committed']=True; h['commit_ns']=int(now_ns)
       h['latched_decision']=dict(h.get('precommit_decision') or dec)
@@ -508,17 +786,21 @@ class FutureGapEvaluator:
     if not h.get('committed'):
       h['precommit_decision']=dict(dec)
       base['phase']='PRECHECK'
+      if not lane_commit_ready and lane_status!='CONFIRMED':
+        base['reasons']=['lane_change_commit_wait_for_lane']+(base.get('reasons') or [])[:5]
       return base
 
     age=max(0.0,(int(now_ns)-int(h.get('commit_ns',now_ns)))/1e9)
     base['committed']=True; base['commit_age_s']=round(age,3)
     lat=dict(h.get('latched_decision') or dec)
 
+    hard_confirmed,hard_diag=self._stable_hard_override(active,active_side,now_ns)
+    base['hard_override']=hard_diag
     if age < LANE_CHANGE_DECISION_HOLD_S:
       base['phase']='COMMIT_HOLD'
       base['hold_remaining_s']=round(max(0.0,LANE_CHANGE_DECISION_HOLD_S-age),3)
-      if self._hard_override(active_side):
-        base['reasons']=['commit_hold_hard_ttc_override']+(dec.get('reasons') or [])[:5]
+      if hard_confirmed:
+        base['reasons']=['commit_hold_stable_hard_ttc_override']+(dec.get('reasons') or [])[:5]
       else:
         base['state']=lat.get('state','CAUTION_SHADOW')
         base['label']=lat.get('label','CHECK ?')
@@ -527,18 +809,14 @@ class FutureGapEvaluator:
 
     if age < LANE_CHANGE_DECISION_HOLD_S + LANE_CHANGE_REBASE_S:
       base['phase']='REBASING'
-      base['hold_remaining_s']=0.0
-      # Re-centering into the target lane can make the old target-lane coordinate
-      # system report zero gap/boundary overlap.  During this short window keep
-      # such geometry-only DANGER at CHECK, but do not mask a hard TTC conflict.
-      if base.get('state')=='BLOCKED_SHADOW' and not self._hard_override(active_side):
-        rr=set(base.get('reasons') or [])
-        benign_prefixes=('front_gap<=','rear_gap<=','boundary<=')
-        benign_exact={'display_hysteresis','possible_incoming_near','front_brake_scenario<=8m','ego_brake_rear<=8m'}
-        geometry_only=all((any(x.startswith(p) for p in benign_prefixes) or x in benign_exact) for x in rr) if rr else True
-        if geometry_only:
-          base['state']='CAUTION_SHADOW'; base['label']='CHECK ?'
-          base['reasons']=['lane_change_rebase']+list(base.get('reasons') or [])[:5]
+      base['hold_remaining_s']=round(max(0.0,LANE_CHANGE_DECISION_HOLD_S+LANE_CHANGE_REBASE_S-age),3)
+      # During target-lane coordinate re-centering, V38 logs showed the minimum
+      # hazard key changing almost every frame (e.g. V0594 -> V0603 -> V0597).
+      # Treat an unconfirmed one-frame zero-gap/TTC as CHECK, not DANGER.  A real
+      # hard conflict still breaks through once the same canonical key persists.
+      if base.get('state')=='BLOCKED_SHADOW' and not hard_confirmed:
+        base['state']='CAUTION_SHADOW'; base['label']='CHECK ?'
+        base['reasons']=['lane_change_rebase_identity_guard']+list(base.get('reasons') or [])[:5]
       return base
 
     base['phase']='ACTIVE'
@@ -701,9 +979,29 @@ class FutureGapEvaluator:
                                    'relative_accel_mps2':round(a_rel,3),'horizons':series,
                                    'min_clearance_m':round(min(x['clearance_m'] for x in series),3)}
 
+    # FG9 per-key anchor.  These live object states never alias the
+    # minimum-gap key of a different horizon or another vehicle.
+    fg9_object_states={}
+    for k,o in obj_by_key.items():
+      st=states_by_key[k][0.0]
+      in_core=bool(current_core.get(k))
+      overlaps=bool(current_overlap.get(k))
+      has_future=any((h.get('front') or {}).get('key')==k or
+                     (h.get('rear') or {}).get('key')==k or
+                     (h.get('boundary_front') or {}).get('key')==k or
+                     (h.get('boundary_rear') or {}).get('key')==k
+                     for h in horizons if h.get('ego_target_overlap'))
+      fg9_object_states[k]={'s':st.get('s'),'d':st.get('d'),'s_dot':st.get('s_dot'),
+           's_sigma':st.get('s_sigma'),'d_sigma':st.get('d_sigma'),
+           'current_core':in_core,'current_boundary':overlaps and not in_core,
+           'origin_lane':origin_lane.get(k),'forecast_near':has_future,
+           'source_age_ms':o.get('source_age_ms',9999.0),
+           'source_mask':list(o.get('source_mask') or []),
+           'track_duration_s':o.get('canonical_track_duration_s',0.0)}
+
     return {
       'target_lane':lane_name(target_idx),'target_lane_index':target_idx,
-      'horizons':horizons,
+      'fg9_object_states':fg9_object_states, 'horizons':horizons,
       'incoming':confirmed_incoming[:12],'incoming_count':len(confirmed_incoming),
       'possible_incoming':possible_incoming[:12],'possible_incoming_count':len(possible_incoming),
       'min_front_clearance_during_ego_overlap_m':None if min_front is None else round(float(min_front),3),
@@ -729,6 +1027,13 @@ class FutureGapEvaluator:
     left['lane_availability']=self._stabilize_lane_availability(lane_availability_raw.get('left'),+1,now_ns)
     right['lane_availability']=self._stabilize_lane_availability(lane_availability_raw.get('right'),-1,now_ns)
     lane_availability={'left':dict(left['lane_availability']),'right':dict(right['lane_availability']),'fresh':bool(lane_availability_raw.get('fresh'))}
+    self._fg9_build_evidence(left,+1,now_ns)
+    self._fg9_build_evidence(right,-1,now_ns)
+    left.pop('fg9_object_states',None)
+    right.pop('fg9_object_states',None)
+    # Preserve the exact old DEC3 output to diagnose any disagreement in logs.
+    left['legacy_decision_raw']=self._decision_legacy(left)
+    right['legacy_decision_raw']=self._decision_legacy(right)
     left['decision_raw']=self._apply_road_lane_gate(self._decision(left), left['lane_availability'],left)
     right['decision_raw']=self._apply_road_lane_gate(self._decision(right), right['lane_availability'],right)
     left['decision']=self._stabilize_decision(left,+1,now_ns); right['decision']=self._stabilize_decision(right,-1,now_ns)
@@ -749,7 +1054,7 @@ class FutureGapEvaluator:
       intent=self._apply_intent_state(active,active_side,v_ego,steering_angle_deg,road_curve_direction,now_ns)
 
     return {
-      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG7_DEC3_ROAD_GATE_HYST',
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG9_ORIGIN_SAMEKEY_PREDICTED_GUARD',
       'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
       'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),
       'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
@@ -765,6 +1070,6 @@ class FutureGapEvaluator:
                'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
                'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
                'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
-      'note':'FG7 + DEC3 shadow only: stabilized road/lane gate + TURN release hold + commit hold/rebase + dual-side preview HUD; no planner/CAN control.'
+      'note':'FG9 origin-aware same-key gaps and TTC; current gap distinct from 3s forecast; FG8 TURN/commit retained; shadow only, NO permission and NO CAN control.'
     }
 
