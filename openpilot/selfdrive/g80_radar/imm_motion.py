@@ -28,14 +28,14 @@ HORIZONS_S = (0.5, 1.0, 2.0, 3.0)
 MODEL_NAMES = ('CV', 'CA', 'MANEUVER')
 MODEL_CV, MODEL_CA, MODEL_MAN = 0, 1, 2
 TRACK_TTL_NS = int(float(os.getenv('G80_IMM_TRACK_TTL_S', '1.5')) * 1e9)
-IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '3.0')))
+IMM_HZ = max(1.0, float(os.getenv('G80_IMM_HZ', '2.5')))
 IMM_PERIOD_NS = int(1e9 / IMM_HZ)
 IMM_FRONT_MAX_M = float(os.getenv('G80_IMM_FRONT_MAX_M', '125.0'))
 IMM_REAR_MAX_M = float(os.getenv('G80_IMM_REAR_MAX_M', '80.0'))
 IMM_LATERAL_MAX_M = float(os.getenv('G80_IMM_LATERAL_MAX_M', '6.3'))
 IMM_L2_MAX_M = float(os.getenv('G80_IMM_L2_MAX_M', '8.8'))
 IMM_L2_INWARD_RATE_MPS = float(os.getenv('G80_IMM_L2_INWARD_RATE_MPS', '0.12'))
-IMM_MAX_TRACKS = max(4, int(os.getenv('G80_IMM_MAX_TRACKS', '8')))
+IMM_MAX_TRACKS = max(4, int(os.getenv('G80_IMM_MAX_TRACKS', '6')))
 MAX_DT_S = float(os.getenv('G80_IMM_MAX_DT_S', '0.40'))
 MIN_DT_S = 0.01
 LANE_HALF_W_M = 1.8
@@ -451,7 +451,7 @@ class ImmMotionTracker:
     ranked_out=relevant_candidates[IMM_MAX_TRACKS:]
     skipped.extend(ranked_out)
 
-    # Full IMM evaluation runs at 3 Hz by default while Canonical360 + selective KF stay
+    # Full IMM evaluation runs at 2.5 Hz by default while Canonical360 + selective KF stay
     # at 10 Hz.  Low-priority new identities wait for the fixed 3 Hz cadence; only urgent
     # SCC/CAM/rear-teacher/cut-in evidence may refresh early. Cached model
     # probabilities/trajectory carry an explicit age.

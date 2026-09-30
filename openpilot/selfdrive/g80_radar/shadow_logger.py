@@ -5,7 +5,7 @@ Persistent G80 shadow-evaluation logger.
 Default:
   enabled
   /data/radar/shadow_YYYYMMDD_HHMMSS.jsonl.gz
-  2 Hz periodic sampling (V38 source-trace default)
+  2 Hz periodic sampling (V38R4 source-trace default)
   immediate extra sample on L1/L2/CUT-IN state changes
   30 minute rotation
   64 MB approximate uncompressed rotation
@@ -42,14 +42,14 @@ def _compact_obj(o: dict) -> dict:
     'camera_only','sensor_fusion','camera_match_cost','camera_dx_m',
     'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
     'vehicle_id','vehicle_key','canonical_id','canonical_key','canonical_valid','canonical_age_frames','canonical_track_duration_s','canonical_match_reason','canonical_match_cost','canonical_alias_overlap','canonical_gap_ms','canonical_reacquired','canonical_reacquire_count','canonical_domains','canonical_primary_domain','canonical_domain_history','canonical_source_transition','canonical_handoff_count','canonical_alias_count','canonical_candidate_count','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
-    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason',
+    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason','source_mask','source_age_ms','display_state','trace_local_key','trace_match_method','trace_unmatched','trace_canonical_domains','corner_debug_role',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','road_projection_endpoint_overshoot_m',
     'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect','kf_dormant_preserved',
     'kf_x','kf_y','kf_vx','kf_vy','kf_ax','kf_ay','kf_x_sigma','kf_y_sigma','kf_vx_sigma','kf_vy_sigma','kf_frenet_valid','kf_s','kf_s_dot','kf_s_ddot',
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
-    'kf_lateral_prediction_mode','kf_lateral_prediction_limited','kalman_trajectory',
+    'kf_lateral_prediction_mode','kf_lateral_prediction_limited',
     'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason',
     'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
     'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate'
@@ -140,9 +140,9 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V35: Canonical target 10Hz; KF4 max12 with dormant preservation; IMM3 3Hz/max8; compact mode-consistent UI',
+          'performance_policy':'V38R4: Canonical target 10Hz; KF4 max10; IMM3 2.5Hz/max6; sparse immediate log events + compact trajectory-free shadow payload',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V38R3 FG6+DEC3: source-trace UI + road/lane SAFE gate + turn/lane-change context + commit hold/rebase + dual-arrow preview HUD',
+          'future_gap_policy':'V38R4 FG7+DEC3: stabilized road/lane gate + TURN release hold + commit hold/rebase + dual-arrow preview HUD',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
         },
         'control_connected':False,
@@ -169,26 +169,25 @@ class ShadowLogger:
     V30 included per-frame new/reacquire/handoff counts, so ~75-99% of records
     became "events" and gzip/JSON work ran almost every publish.  V31 reserves
     immediate records for semantically important lead/cut-in transitions; the
-    full canonical/IMM/FG6/DEC3 state is still captured by the 2 Hz periodic stream.
+    full canonical/IMM/FG7/DEC3 state is still captured by the 2 Hz periodic stream.
     """
-    l1 = shadow.get('leadOne', {}) or {}
-    l2 = shadow.get('leadTwo', {}) or {}
+    # V38R4: immediate records are reserved for actual driver/maneuver events.
+    # Passive left/right preview decisions, path-valid toggles, lead identity churn and
+    # generic signal-probe state are captured by the 2 Hz periodic stream instead.
     st = shadow.get('stats', {}) or {}
-    fg=future_gap or {}
-    left=(fg.get('left') or {}); right=(fg.get('right') or {})
-    ego=ego_state or {}
-    tl=traffic_signal or {}
+    fg = future_gap or {}
+    di = fg.get('driver_intent', {}) or {}
+    ego = ego_state or {}
+    tl = traffic_signal or {}
     return (
-      bool(l1.get('status')), l1.get('key'), l1.get('reason'),
-      bool(l2.get('status')), l2.get('key'), l2.get('reason'),
-      int(st.get('confirmed_cutin_count', 0) or 0),
-      bool(st.get('path_valid')), bool(st.get('v_ego_valid')),
-      int((kalman_stats or {}).get('cutin_confirmed', 0) or 0),
-      int(left.get('stable_incoming_count',0) or 0), int(right.get('stable_incoming_count',0) or 0),
-      (left.get('decision') or {}).get('state'), (right.get('decision') or {}).get('state'),
+      di.get('state'), di.get('side'),
       bool(ego.get('leftBlinker')), bool(ego.get('rightBlinker')),
-      tl.get('state'), bool(tl.get('sunnypilot_green_alert')), tl.get('turn_direction'),
+      bool(st.get('leadOne_strong_handoff')),
+      bool(int(st.get('confirmed_cutin_count',0) or 0) > 0),
+      bool(int((kalman_stats or {}).get('cutin_confirmed',0) or 0) > 0),
+      bool(tl.get('green_confirmed')), bool(tl.get('sunnypilot_green_alert')),
     )
+
 
   def _rotate_due(self, now_mono: float) -> bool:
     return (
@@ -227,8 +226,10 @@ class ShadowLogger:
       'shadow':shadow,
       'sensor_fused_objects':[_compact_obj(o) for o in core.get('sensor_fused_objects',[])],
       'canonical_tracker_stats':core.get('canonical_tracker_stats',{}),
+      'view_consistency_stats':core.get('view_consistency_stats',{}),
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],
       'corner_fused_objects':[_compact_obj(o) for o in core.get('corner_fused_objects',[])],
+      'corner_candidate_objects':[_compact_obj(o) for o in core.get('corner_candidate_objects',[])[:24]],
       'front_sensor_objects':[_compact_obj(o) for o in core.get('front_sensor_objects',[])],
       'standard_front_preview':core.get('standard_front_preview',[]),
       'standard_front_preview_stats':core.get('standard_front_preview_stats',{}),
