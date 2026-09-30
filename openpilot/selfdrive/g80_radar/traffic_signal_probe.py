@@ -1,32 +1,52 @@
 #!/usr/bin/env python3
-"""Monitor-only E2E traffic-signal probe for the G80 browser HUD.
+"""Monitor-only E2E traffic-signal probe for the G80 browser/HUD.
 
-Important semantics
--------------------
-Current sunnypilot/openpilot ModelDataV2 does NOT expose a direct camera
-classification for red/green/yellow/arrow traffic-lamp pixels.  Sunnypilot's
-Green Traffic Light Alert (Beta) is an E2E behavior heuristic: while stopped,
-with no lead, the model path extending beyond ~30 m for >0.3 s is treated as a
-green/go transition.
+V39 semantics
+-------------
+openpilot/sunnypilot ModelDataV2 does not publish a direct red/green/yellow/
+arrow lamp classifier.  The old V38 probe therefore over-labelled E2E stop
+behavior as RED, which can also happen at stop signs, blocked paths, parking
+exits, and other non-signal stops.
 
-This probe makes those existing E2E cues visible so they can be compared with
-real traffic lights during shadow testing.  It never publishes control messages
-and never sends CAN.
+V39 makes the distinction explicit:
+  * STOP_HOLD      : E2E says "stay stopped"; traffic-light color unknown.
+  * RED_CANDIDATE  : conservative long/short-path stop candidate, still "RED ?".
+  * GREEN_GO       : a stop->go edge was observed from path opening / shouldStop
+                     release / sunnypilot green alert.  This is an E2E go-edge,
+                     not a direct green-lamp pixel classification.
 
-Displayed scores are heuristic evidence scores, NOT calibrated probabilities.
-Turn direction comes from modelDataV2SP.laneTurnDirection and means the model's
-planned path direction; it is NOT direct recognition of a green-arrow lamp.
+The fast-green edge deliberately watches the path horizon jump while stopped.
+In V38 logs the path frequently opened one or two samples before shouldStop
+cleared, so this can display GO earlier without pretending to see lamp pixels.
+
+This process is diagnostic only.  It never publishes controls and never sends CAN.
 """
 from __future__ import annotations
 
 import math
 
-GREEN_LIGHT_X_THRESHOLD_M = 30.0
-GREEN_CONFIRM_S = 0.30
+PROBE_VERSION = 2
 MODEL_MAX_AGE_NS = 700_000_000
 AUX_MAX_AGE_NS = 1_200_000_000
 STOPPED_MAX_MPS = 0.35
-RECENT_MOVING_CLEAR_S = 2.0
+
+APPROACH_SPEED_MPS = 1.0
+APPROACH_MEMORY_S = 10.0
+STOP_ARM_WINDOW_S = 2.5
+STOP_ARM_PATH_M = 20.0
+STOP_REARM_PATH_M = 15.0
+
+# Conservative red candidate: do not claim RED immediately from shouldStop.
+RED_CANDIDATE_HOLD_S = 6.0
+RED_CANDIDATE_PATH_MAX_M = 10.0
+
+# Stop -> go edge.  These are E2E path/action thresholds, not lamp probabilities.
+GREEN_NORMAL_PATH_M = 26.0
+GREEN_FAST_PATH_M = 28.0
+GREEN_FAST_TOTAL_JUMP_M = 18.0
+GREEN_FAST_FRAME_JUMP_M = 5.0
+GREEN_CONFIRM_S = 0.08
+GREEN_LATCH_S = 1.8
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -55,6 +75,8 @@ class TrafficSignalProbe:
   def __init__(self):
     self.model_recv_ns = 0
     self.path_horizon_m = 0.0
+    self.prev_path_horizon_m = 0.0
+    self.horizon_delta_m = 0.0
     self.should_stop = False
     self.desired_accel_mps2 = 0.0
     self.model_confidence = 'unknown'
@@ -64,6 +86,7 @@ class TrafficSignalProbe:
     self.standstill = False
     self.gas_pressed = False
     self.last_moving_ns = 0
+    self.last_approach_ns = 0
     self.stop_since_ns = 0
 
     self.turn_recv_ns = 0
@@ -72,18 +95,37 @@ class TrafficSignalProbe:
     self.plan_recv_ns = 0
     self.green_alert = False
 
-    self.green_gate_since_ns = 0
+    self.stop_armed = False
+    self.stop_armed_since_ns = 0
+    self.stop_min_horizon_m = math.inf
+    self.green_candidate_since_ns = 0
+    self.fast_edge_until_ns = 0
+    self.green_latch_until_ns = 0
+    self.green_trigger_source = 'none'
     self.last_state = 'UNKNOWN'
+
+  def _clear_stop_context(self) -> None:
+    self.stop_armed = False
+    self.stop_armed_since_ns = 0
+    self.stop_min_horizon_m = math.inf
+    self.green_candidate_since_ns = 0
+    self.fast_edge_until_ns = 0
+    self.green_latch_until_ns = 0
+    self.green_trigger_source = 'none'
 
   def update_model(self, model, recv_ns: int) -> None:
     self.model_recv_ns = int(recv_ns)
+    old_horizon = self.path_horizon_m
     try:
       xs = list(model.position.x)
       vals = [_finite(x, math.nan) for x in xs]
       vals = [x for x in vals if math.isfinite(x)]
-      self.path_horizon_m = max(vals) if vals else 0.0
+      new_horizon = max(vals) if vals else 0.0
     except Exception:
-      self.path_horizon_m = 0.0
+      new_horizon = 0.0
+    self.prev_path_horizon_m = old_horizon
+    self.path_horizon_m = new_horizon
+    self.horizon_delta_m = new_horizon - old_horizon
     try:
       self.should_stop = bool(model.action.shouldStop)
     except Exception:
@@ -115,6 +157,13 @@ class TrafficSignalProbe:
       self.stop_since_ns = 0
     elif self.stop_since_ns == 0:
       self.stop_since_ns = int(recv_ns)
+
+    if self.v_ego_mps > APPROACH_SPEED_MPS:
+      self.last_approach_ns = int(recv_ns)
+
+    # Once the car clearly leaves the stop, start a fresh candidate next time.
+    if self.v_ego_mps > 0.8 or self.gas_pressed:
+      self._clear_stop_context()
 
   def update_turn(self, msg, recv_ns: int) -> None:
     try:
@@ -152,34 +201,92 @@ class TrafficSignalProbe:
 
     stopped = bool(self.standstill or abs(self.v_ego_mps) <= STOPPED_MAX_MPS)
     stopped_for_s = 0.0 if self.stop_since_ns <= 0 else max(0.0, (now_ns - self.stop_since_ns) / 1e9)
-    recent_moving = ((now_ns - self.last_moving_ns) < int(RECENT_MOVING_CLEAR_S * 1e9)) if self.last_moving_ns > 0 else (stopped_for_s < RECENT_MOVING_CLEAR_S)
+    approach_age_s = None if self.last_approach_ns <= 0 else max(0.0, (now_ns - self.last_approach_ns) / 1e9)
+    approach_recent = bool(approach_age_s is not None and approach_age_s <= APPROACH_MEMORY_S)
 
-    # Match sunnypilot's beta green-light context as closely as possible without
-    # participating in controls: stopped, no lead, no gas, and settled after motion.
-    context_active = bool(model_fresh and stopped and not has_lead and not self.gas_pressed and not recent_moving)
-    raw_green_gate = bool(model_fresh and self.path_horizon_m > GREEN_LIGHT_X_THRESHOLD_M and not self.should_stop)
-    if context_active and raw_green_gate:
-      if self.green_gate_since_ns <= 0:
-        self.green_gate_since_ns = now_ns
-    else:
-      self.green_gate_since_ns = 0
-    green_gate_s = 0.0 if self.green_gate_since_ns <= 0 else max(0.0, (now_ns - self.green_gate_since_ns) / 1e9)
-    green_confirmed = bool(context_active and green_gate_s >= GREEN_CONFIRM_S)
+    context_active = bool(model_fresh and stopped and not has_lead and not self.gas_pressed)
+    stop_evidence = bool(self.should_stop or self.path_horizon_m < STOP_ARM_PATH_M)
+
+    # Arm only after an actual approach.  This suppresses "red" while sitting in
+    # a parking lot / booting stationary / other static non-intersection scenes.
+    if context_active and approach_recent and not self.stop_armed:
+      if stopped_for_s <= STOP_ARM_WINDOW_S and stop_evidence:
+        self.stop_armed = True
+        self.stop_armed_since_ns = now_ns
+        self.stop_min_horizon_m = self.path_horizon_m
+      elif stopped_for_s <= STOP_ARM_WINDOW_S and self.path_horizon_m < STOP_REARM_PATH_M:
+        self.stop_armed = True
+        self.stop_armed_since_ns = now_ns
+        self.stop_min_horizon_m = self.path_horizon_m
+
+    if self.stop_armed and stopped and model_fresh:
+      self.stop_min_horizon_m = min(self.stop_min_horizon_m, self.path_horizon_m)
+
+    stop_hold_s = 0.0 if self.stop_armed_since_ns <= 0 else max(0.0, (now_ns - self.stop_armed_since_ns) / 1e9)
+    baseline_h = self.stop_min_horizon_m if math.isfinite(self.stop_min_horizon_m) else self.path_horizon_m
+    horizon_jump_m = max(0.0, self.path_horizon_m - baseline_h)
+
     sp_green_alert = bool(plan_fresh and self.green_alert)
+    fast_green_edge = bool(
+      context_active and self.stop_armed and
+      self.path_horizon_m >= GREEN_FAST_PATH_M and
+      horizon_jump_m >= GREEN_FAST_TOTAL_JUMP_M and
+      (self.horizon_delta_m >= GREEN_FAST_FRAME_JUMP_M or not self.should_stop)
+    )
+    if fast_green_edge:
+      self.fast_edge_until_ns = max(self.fast_edge_until_ns, now_ns + 600_000_000)
+    fast_green_edge_active = bool(context_active and self.stop_armed and now_ns < self.fast_edge_until_ns)
 
-    # Evidence scores are deliberately simple and observable. They are NOT
-    # calibrated probabilities and are only intended for field comparison.
-    horizon_go = _clamp((self.path_horizon_m - 12.0) / 28.0)
-    action_go = 0.0 if self.should_stop else 1.0
-    accel_go = _clamp((self.desired_accel_mps2 + 0.35) / 1.35)
-    go_score = _clamp(0.62 * horizon_go + 0.28 * action_go + 0.10 * accel_go)
+    normal_green_gate = bool(
+      context_active and self.stop_armed and
+      (not self.should_stop) and self.path_horizon_m >= GREEN_NORMAL_PATH_M
+    )
+    raw_green_gate = bool(sp_green_alert or fast_green_edge_active or normal_green_gate)
+
+    if raw_green_gate:
+      if self.green_candidate_since_ns <= 0:
+        self.green_candidate_since_ns = now_ns
+      if sp_green_alert:
+        self.green_trigger_source = 'sunnypilot_green_alert'
+      elif fast_green_edge_active:
+        self.green_trigger_source = 'fast_path_open_edge'
+      else:
+        self.green_trigger_source = 'shouldStop_release_path_open'
+    else:
+      self.green_candidate_since_ns = 0
+
+    green_gate_s = 0.0 if self.green_candidate_since_ns <= 0 else max(0.0, (now_ns - self.green_candidate_since_ns) / 1e9)
+    green_confirmed = bool(sp_green_alert or (raw_green_gate and green_gate_s >= GREEN_CONFIRM_S))
     if green_confirmed:
-      go_score = max(go_score, 0.88)
+      self.green_latch_until_ns = max(self.green_latch_until_ns, now_ns + int(GREEN_LATCH_S * 1e9))
+    green_latched = bool(now_ns < self.green_latch_until_ns and self.stop_armed and stopped)
+
+    # Scores are evidence indices (0..1), not calibrated probabilities.
+    path_open = _clamp((self.path_horizon_m - 18.0) / 28.0)
+    jump_score = _clamp(horizon_jump_m / 25.0)
+    release_score = 0.0 if self.should_stop else 1.0
+    accel_go = _clamp((self.desired_accel_mps2 + 0.25) / 1.10)
+    go_score = _clamp(0.34 * path_open + 0.34 * jump_score + 0.22 * release_score + 0.10 * accel_go)
+    if fast_green_edge_active:
+      go_score = max(go_score, 0.90)
+    if green_latched:
+      go_score = max(go_score, 0.92)
     if sp_green_alert:
       go_score = max(go_score, 0.98)
-    stop_score = _clamp(0.62 * (1.0 - horizon_go) + 0.38 * (1.0 if self.should_stop else 0.0))
+
+    short_path = _clamp((20.0 - self.path_horizon_m) / 20.0)
+    hold_score = _clamp((stop_hold_s - 2.0) / 6.0)
+    approach_score = 1.0 if approach_recent else 0.0
+    stop_score = _clamp(0.35 * (1.0 if self.should_stop else 0.0) + 0.30 * short_path + 0.20 * hold_score + 0.15 * approach_score)
+
+    red_candidate = bool(
+      context_active and self.stop_armed and not green_latched and
+      stop_hold_s >= RED_CANDIDATE_HOLD_S and
+      self.should_stop and self.path_horizon_m < RED_CANDIDATE_PATH_MAX_M
+    )
 
     turn_dir = self.turn_direction if turn_fresh else 'none'
+    # Arrow is a planned turn path only.  UI should illuminate it only with GO.
     turn_score = 1.0 if turn_dir in ('left', 'right') else 0.0
 
     if not model_fresh:
@@ -188,22 +295,25 @@ class TrafficSignalProbe:
     elif has_lead and stopped:
       state = 'WAIT_LEAD'
       label = 'LEAD AHEAD'
-    elif context_active and (sp_green_alert or green_confirmed) and go_score >= 0.65:
+    elif green_latched:
       state = 'GREEN_GO'
-      label = 'GREEN OK'
-    elif context_active and (self.should_stop or stop_score >= 0.62):
-      state = 'RED_STOP_INFERRED'
-      label = 'RED/STOP ?'
+      label = 'GREEN / GO'
+    elif red_candidate:
+      state = 'RED_CANDIDATE'
+      label = 'RED ? · E2E STOP'
+    elif self.stop_armed and stopped:
+      state = 'STOP_HOLD'
+      label = 'STOP/HOLD · LIGHT ?'
     elif stopped:
       state = 'WATCH'
-      label = 'SIGNAL WATCH'
+      label = 'STOPPED · SIGNAL ?'
     else:
       state = 'DRIVING'
       label = 'DRIVING'
 
     self.last_state = state
     return {
-      'version': 1,
+      'version': PROBE_VERSION,
       'state': state,
       'label': label,
       'model_fresh': model_fresh,
@@ -214,18 +324,36 @@ class TrafficSignalProbe:
       'has_lead': bool(has_lead),
       'gas_pressed': bool(self.gas_pressed),
       'v_ego_mps': round(self.v_ego_mps, 3),
+      'approach_recent': approach_recent,
+      'approach_age_s': None if approach_age_s is None else round(approach_age_s, 2),
+      'stop_armed': bool(self.stop_armed),
+      'stop_hold_s': round(stop_hold_s, 2),
+      'stop_min_horizon_m': None if not math.isfinite(self.stop_min_horizon_m) else round(self.stop_min_horizon_m, 2),
       'path_horizon_m': round(self.path_horizon_m, 2),
-      'green_threshold_m': GREEN_LIGHT_X_THRESHOLD_M,
-      'green_gate_s': round(green_gate_s, 2),
+      'prev_path_horizon_m': round(self.prev_path_horizon_m, 2),
+      'horizon_delta_m': round(self.horizon_delta_m, 2),
+      'horizon_jump_m': round(horizon_jump_m, 2),
+      'green_normal_path_m': GREEN_NORMAL_PATH_M,
+      'green_fast_path_m': GREEN_FAST_PATH_M,
+      'green_fast_total_jump_m': GREEN_FAST_TOTAL_JUMP_M,
+      'green_gate_s': round(green_gate_s, 3),
       'green_confirm_s': GREEN_CONFIRM_S,
+      'green_latch_s': GREEN_LATCH_S,
       'raw_green_gate': raw_green_gate,
+      'fast_green_edge': fast_green_edge,
+      'fast_green_edge_active': fast_green_edge_active,
       'green_confirmed': green_confirmed,
+      'green_latched': green_latched,
+      'green_trigger_source': self.green_trigger_source if green_latched or raw_green_gate else 'none',
       'sunnypilot_green_alert': sp_green_alert,
       'sunnypilot_plan_fresh': plan_fresh,
       'should_stop': bool(self.should_stop),
       'desired_accel_mps2': round(self.desired_accel_mps2, 3),
       'go_score': round(go_score, 3),
       'stop_score': round(stop_score, 3),
+      'red_candidate': red_candidate,
+      'red_candidate_hold_s': RED_CANDIDATE_HOLD_S,
+      'red_candidate_path_max_m': RED_CANDIDATE_PATH_MAX_M,
       'turn_direction': turn_dir,
       'turn_score': round(turn_score, 3),
       'turn_source': 'modelDataV2SP.laneTurnDirection' if turn_fresh else 'none',
@@ -233,5 +361,6 @@ class TrafficSignalProbe:
       'model_confidence_note': 'ModelDataV2 confidence class; NOT traffic-light color',
       'direct_lamp_classifier': False,
       'score_type': 'heuristic_evidence_not_probability',
-      'semantics': 'GREEN/STOP inferred from E2E path/action; LEFT/RIGHT is planned path, not lamp-arrow recognition',
+      'classification_limit': 'No direct traffic-lamp classifier in ModelDataV2; RED is conservative candidate, GREEN is stop->go E2E edge',
+      'semantics': 'STOP/HOLD=E2E stop; RED?=conservative candidate only; GREEN/GO=path/action release edge; arrow=planned turn path only',
     }

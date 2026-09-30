@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 38
-BUILD_TAG = 'v38r5-source-lock-color-canon-dedup-road-hyst-turn-hold-signal-hud-kr-fg7-dec3-goldenv2'
+BUILD_VERSION = 39
+BUILD_TAG = 'v39-signal-edge-gate-source-lock-canon-dedup-road-hyst-turn-hold-hud-kr-fg7-dec3-goldenv2'
 LOGGER_FORMAT_VERSION = 21
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
