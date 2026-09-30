@@ -85,6 +85,9 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
+    # V41: identify each logger/service instance so overlapping logs can be diagnosed.
+    self.pid = os.getpid()
+    self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
     atexit.register(self.close)
 
@@ -119,6 +122,8 @@ class ShadowLogger:
         'service_version':LOGGER_SERVICE_VERSION,
         'build_tag':BUILD_TAG,
         'created':datetime.now().astimezone().isoformat(timespec='seconds'),
+        'pid':self.pid,
+        'instance_id':self.instance_id,
         'config':{
           'hz':self.hz,
           'rotate_min':self.rotate_min,
@@ -140,10 +145,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V38R4: Canonical target 10Hz; KF4 max10; IMM3 2.5Hz/max6; sparse immediate log events + compact trajectory-free shadow payload',
+          'performance_policy':'V41: browser-only stage audit at UI 8Hz or idle 2Hz; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V40 FG9: origin-aware same-key threat and explicit current/predicted rear gaps; FG8 TURN/rebase retained',
+          'future_gap_policy':'V41 retains V40 FG9: origin-aware same-key threat + explicit current/predicted rear gaps; FG8 TURN/rebase',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
+          'web_stage_contract':'V41 seven read-only stages incl diagnostic validity-only raw filter and selected L1/L2; physical sector labels are positional estimates',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -227,6 +233,8 @@ class ShadowLogger:
       'sensor_fused_objects':[_compact_obj(o) for o in core.get('sensor_fused_objects',[])],
       'canonical_tracker_stats':core.get('canonical_tracker_stats',{}),
       'view_consistency_stats':core.get('view_consistency_stats',{}),
+      'web_stage_stats':core.get('web_stage_stats',{}),
+      'web_stage_errors':core.get('web_stage_errors',[]),
       'radar_fused_objects':[_compact_obj(o) for o in core.get('radar_fused_objects',[])],
       'corner_fused_objects':[_compact_obj(o) for o in core.get('corner_fused_objects',[])],
       'corner_candidate_objects':[_compact_obj(o) for o in core.get('corner_candidate_objects',[])[:24]],
@@ -388,6 +396,8 @@ class ShadowLogger:
       'files_created':self.files_created,
       'approx_uncompressed_mb':round(self.uncompressed_bytes/1024/1024,3),
       'last_write_ns':self.last_write_ns,
+      'pid':self.pid,
+      'instance_id':self.instance_id,
       'last_error':self.last_error,
     }
 
