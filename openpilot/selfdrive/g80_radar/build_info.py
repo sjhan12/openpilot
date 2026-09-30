@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 39
-BUILD_TAG = 'v39-signal-edge-gate-source-lock-canon-dedup-road-hyst-turn-hold-hud-kr-fg7-dec3-goldenv2'
+BUILD_TAG = 'v39r1-signal-edge-lane-intent-fg8-source-lock-hud-kr-dec3-goldenv2'
 LOGGER_FORMAT_VERSION = 21
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
-FUTURE_GAP_API_VERSION = 7
+FUTURE_GAP_API_VERSION = 8
 ANDROID_PROTOCOL_VERSION = 21
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'
