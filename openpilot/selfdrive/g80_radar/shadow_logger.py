@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V45: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V46: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -146,11 +146,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V45: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V46: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V45 FG13: bounded advisory CHECK; path +left contract; same-key longitudinal+lateral time windows must overlap <=3s for DANGER; incoming outside lane needs persistence; raw precommit decision latch; FG8 TURN/rebase retained',
+          'future_gap_policy':'V46 FG14: stock BSD final override; measured outer-lane keeping exclusion; FG13 bounded CHECK and FG12 2D conflict retained; unknown inputs block green; central-line semantics NOT available',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V45 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
+          'web_stage_contract':'V46 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -189,6 +189,8 @@ class ShadowLogger:
     return (
       di.get('state'), di.get('side'),
       bool(ego.get('leftBlinker')), bool(ego.get('rightBlinker')),
+      ((fg.get('bsd') or {}).get('state') or {}).get('left'),
+      ((fg.get('bsd') or {}).get('state') or {}).get('right'),
       bool(st.get('leadOne_strong_handoff')),
       bool(int(st.get('confirmed_cutin_count',0) or 0) > 0),
       bool(int((kalman_stats or {}).get('cutin_confirmed',0) or 0) > 0),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V45 shadow Future Gap + synchronized 3-second 2D conflict evaluator.
+"""V46 shadow Future Gap + BSD priority and measured target-lane filtering.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
 geometry for NOW/0.5/1/2/3 s. V44 retains FG8 maneuver context and FG10 lane-centred lateral filtering, while FG12 requires longitudinal Time-To-Side and lateral target-lane occupancy to coincide in time:
@@ -24,8 +24,9 @@ from __future__ import annotations
 import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name, adjacent_lane_availability
+from openpilot.selfdrive.g80_radar.target_lane_gate import TargetLaneGate
 
-FUTURE_GAP_API_VERSION = 13
+FUTURE_GAP_API_VERSION = 14
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -376,6 +377,39 @@ class FutureGapEvaluator:
     self.fg9_prediction_hist: dict[tuple[int,str,str],dict] = {}
     self.fg11_tts_hist: dict[tuple[int,str],dict] = {}  # compatibility diagnostics
     self.fg12_conflict_hist: dict[tuple[int,str],dict] = {}
+    self.target_lane_gate = TargetLaneGate()
+
+  def _monitor_overrides(self, left, right, intent, active, bsd, health):
+    """Final display override: cannot be hidden by road gate, TURN or COMMIT."""
+    bsd=bsd or {}
+    health=health or {}
+    for name,side in (('left',left),('right',right)):
+      blocked=bool((bsd.get('blocked') or {}).get(name))
+      unknown=not bsd.get('available')
+      healthy=bool(health.get('radar_frames_fresh') and health.get('carstate_fresh'))
+      side['bsd_state']=(bsd.get('state') or {}).get(name,'UNKNOWN')
+      if blocked:
+        reason='stock_bsd_active' if bsd.get('fresh') else 'stock_bsd_stale_on_latched'
+        override={'state':'BLOCKED_SHADOW','label':'DANGER · BSD','raw_state':'BLOCKED_SHADOW',
+                  'reasons':[reason],'raw_reasons':[reason],'hard_urgent':True,
+                  'diagnostic_not_permission':True,'policy':'FG14 stock BSD final override'}
+        side['decision_before_bsd']=side['decision']
+        side['decision_raw']=dict(override)
+        side['decision']=dict(override)
+        if active==name:
+          intent.update(override)
+          intent.update(phase='BSD_OVERRIDE',maneuver_context='BSD',committed=False,hold_remaining_s=0.0)
+          self.intent_hist.update(committed=False,commit_ns=0,latched_decision=None,precommit_decision=None)
+      elif unknown or not healthy:
+        reasons=(['bsd_unavailable'] if unknown else [])+([] if healthy else ['monitor_input_stale'])
+        for key in ('decision_raw','decision'):
+          d=side[key]
+          if d.get('state')=='SAFE_SHADOW':
+            side[key]=dict(d,state='CAUTION_SHADOW',raw_state='CAUTION_SHADOW',
+                           label='CHECK DATA',label_override='CHECK DATA',reasons=reasons)
+        # Also prevent a stale green commit latch from overriding input loss.
+        if active==name and str(intent.get('label','')).startswith('SAFE'):
+          intent.update(state='CAUTION_SHADOW',label='CHECK DATA',reasons=reasons,phase='DATA_GUARD')
 
   def _stabilize_incoming(self, side: dict, target_idx: int, now_ns: int) -> dict:
     now_ns=int(now_ns)
@@ -606,6 +640,13 @@ class FutureGapEvaluator:
       # incoming objects remain useful but need temporal proof before becoming red.
       lateral_relevant=bool(current_core or current_boundary or stable_incoming)
       candidate=bool(fresh and lateral_relevant and within3 and (track_s>=FG12_MIN_TRACK_S or conflict_now))
+      # V45 logs contain opposing measured/IMM lane positions. A model-only
+      # conflict on the wrong measured side stays CHECK, never silent SAFE.
+      coord_conflict=any(z.get('key')==x.get('key') and z.get('coordinate_disagreement')
+                         for z in (side.get('target_lane_filter') or {}).get('objects',[]))
+      x['coordinate_disagreement']=bool(coord_conflict)
+      if coord_conflict:
+        candidate=False
       hk=(int(target_idx),str(x.get('key') or ''))
       confirmed=False; age=0.0; count=0
       if candidate and hk[1]:
@@ -703,6 +744,8 @@ class FutureGapEvaluator:
         add(hard,'side_conflict_now' if x.get('conflict_now') else 'conflict_time<=3s')
         if key and key not in hard_keys: hard_keys.append(key)
         if x.get('tts_urgent'): urgent=True
+      elif x.get('coordinate_disagreement'):
+        add(caution,'measured_predictor_lane_disagreement')
       elif x.get('tts_candidate'):
         add(caution,'conflict_pending')
       elif relevant and x.get('side_watch_within_5s'):
@@ -1277,12 +1320,18 @@ class FutureGapEvaluator:
   def update(self, objects: list[dict], v_ego: float=0.0, a_ego: float=0.0,
              left_blinker: bool=False, right_blinker: bool=False, now_ns: int=0,
              steering_angle_deg: float=0.0, road_curve_direction: str | None=None,
-             road_model: dict | None=None) -> dict:
+             road_model: dict | None=None, bsd: dict | None=None,
+             monitor_health: dict | None=None) -> dict:
     if not now_ns:
       import time
       now_ns=time.monotonic_ns()
-    left=self._stabilize_incoming(self._side(objects,+1,a_ego),+1,now_ns)
-    right=self._stabilize_incoming(self._side(objects,-1,a_ego),-1,now_ns)
+    self.target_lane_gate.update(objects,now_ns)
+    left_objects,left_audit=self.target_lane_gate.select(objects,+1,now_ns)
+    right_objects,right_audit=self.target_lane_gate.select(objects,-1,now_ns)
+    left=self._stabilize_incoming(self._side(left_objects,+1,a_ego),+1,now_ns)
+    right=self._stabilize_incoming(self._side(right_objects,-1,a_ego),-1,now_ns)
+    left['target_lane_filter']=left_audit
+    right['target_lane_filter']=right_audit
     lane_availability_raw=adjacent_lane_availability(road_model)
     left['lane_availability']=self._stabilize_lane_availability(lane_availability_raw.get('left'),+1,now_ns)
     right['lane_availability']=self._stabilize_lane_availability(lane_availability_raw.get('right'),-1,now_ns)
@@ -1315,8 +1364,11 @@ class FutureGapEvaluator:
     else:
       intent=self._apply_intent_state(active,active_side,v_ego,steering_angle_deg,road_curve_direction,now_ns)
 
+    self._monitor_overrides(left,right,intent,active,bsd,monitor_health)
     return {
-      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG13_BOUNDED_CHECK',
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG14_BSD_TARGET_LANE',
+      'bsd':bsd or {},'monitor_health':monitor_health or {},
+      'centerline_recognition_available':False,
       'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
       'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),
       'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
@@ -1332,6 +1384,5 @@ class FutureGapEvaluator:
                'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
                'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
                'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
-      'note':'FG13 bounded advisory; FG12 DANGER unchanged: same canonical object must have synchronized longitudinal side overlap and requested-lane occupancy within 3s for DANGER; one-axis/3-5s/model-only => CHECK; raw decision is latched at COMMIT to avoid stale display-red hold; shadow only, NO permission and NO CAN control.'
+      'note':'FG14: stock BSD final display priority; measured stable outer-lane tracks excluded per target side; remaining FG12 2D conflict retained. Unknown inputs do not grant green. Central-line semantics unavailable. Shadow only, NO permission and NO CAN control.'
     }
-
