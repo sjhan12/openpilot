@@ -95,26 +95,7 @@ def classify(side, side_name):
   return 'SAFE'
 
 
-def iter_samples(path):
-  if path.endswith('.part'):
-    d=zlib.decompressobj(16+zlib.MAX_WBITS); buf=b''
-    with open(path,'rb') as f:
-      while True:
-        c=f.read(1<<20)
-        if not c: break
-        try: buf+=d.decompress(c)
-        except zlib.error: break
-        while b'\n' in buf:
-          line,buf=buf.split(b'\n',1)
-          try: o=json.loads(line)
-          except Exception: continue
-          if o.get('type')=='sample': yield o
-    return
-  with gzip.open(path,'rt',errors='replace') as f:
-    for line in f:
-      try:o=json.loads(line)
-      except Exception:continue
-      if o.get('type')=='sample':yield o
+from shadow_log_reader import iter_samples
 
 
 def main():

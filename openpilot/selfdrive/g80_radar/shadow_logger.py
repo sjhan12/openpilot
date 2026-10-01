@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V44: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V45: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -135,6 +135,7 @@ class ShadowLogger:
           'kalman_model':'KF4: selective CA longitudinal + bounded lateral; dormant Canonical identity preserved',
           'imm_model':'IMM3: CV + CA + MANEUVER; 3Hz selective ROI, max 8, cached between ticks',
           'kalman_horizons_s':[0.5,1.0,2.0,3.0],
+          'model_path_y_convention':'left_positive_normalized_once',
           'coordinate_x_origin':'ego_front_bumper_display_reference',
           'decoded_object_x_adjustment_m':0.0,
           'rear_teacher_one_to_one':True,
@@ -145,11 +146,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V44: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V45: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V44 FG12: same-key longitudinal+lateral time windows must overlap <=3s for DANGER; incoming outside lane needs persistence; raw precommit decision latch; FG8 TURN/rebase retained',
+          'future_gap_policy':'V45 FG13: bounded advisory CHECK; path +left contract; same-key longitudinal+lateral time windows must overlap <=3s for DANGER; incoming outside lane needs persistence; raw precommit decision latch; FG8 TURN/rebase retained',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V44 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
+          'web_stage_contract':'V45 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,

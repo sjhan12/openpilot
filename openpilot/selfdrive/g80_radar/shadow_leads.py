@@ -84,29 +84,30 @@ def extract_model_path(model, max_points=65):
   out = []
   for i in range(0, n, step):
     x = _finite(xs[i], math.nan)
-    y = _finite(ys[i], math.nan)
+    y = -_finite(ys[i], math.nan)  # V45: normalize raw model coordinates once (+left)
     if math.isfinite(x) and math.isfinite(y):
       out.append((x, y))
   return out
 
 
 def model_path_y_left(path, d_rel):
+  """Interpolate an already normalized (+left) road-model path."""
   if not path:
     return 0.0
   if len(path) == 1:
-    return -_finite(path[0][1])
+    return _finite(path[0][1])
   xs = [_finite(p[0]) for p in path]
   i = bisect.bisect_left(xs, d_rel)
   if i <= 0:
-    return -_finite(path[0][1])
+    return _finite(path[0][1])
   if i >= len(path):
-    return -_finite(path[-1][1])
+    return _finite(path[-1][1])
   x0, y0 = path[i - 1]
   x1, y1 = path[i]
   if abs(x1 - x0) < 1e-6:
-    return -_finite(y0)
+    return _finite(y0)
   t = (d_rel - x0) / (x1 - x0)
-  return -(_finite(y0) + (_finite(y1) - _finite(y0)) * t)
+  return (_finite(y0) + (_finite(y1) - _finite(y0)) * t)
 
 
 def _lead_snapshot(lead):

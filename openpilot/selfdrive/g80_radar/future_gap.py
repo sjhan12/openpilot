@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V44 shadow Future Gap + synchronized 3-second 2D conflict evaluator.
+"""V45 shadow Future Gap + synchronized 3-second 2D conflict evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
 geometry for NOW/0.5/1/2/3 s. V44 retains FG8 maneuver context and FG10 lane-centred lateral filtering, while FG12 requires longitudinal Time-To-Side and lateral target-lane occupancy to coincide in time:
@@ -25,7 +25,7 @@ import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name, adjacent_lane_availability
 
-FUTURE_GAP_API_VERSION = 12
+FUTURE_GAP_API_VERSION = 13
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -677,12 +677,28 @@ class FutureGapEvaluator:
     e=side.get('fg12_evidence') or side.get('fg11_evidence') or side.get('fg10_evidence') or side.get('fg9_evidence') or {}
     items=e.get('observations') or []
     hard=[]; caution=[]; hard_keys=[]; urgent=False
+    caution_objects=[]; suppressed_watch=[]
+    def watch_scope(x):
+      # FG13: an axis intersection at t=100 s is not an imminent watch.
+      # Keep measured near objects and bounded model forecasts as advisory.
+      gap=_finite(x.get('current_gap_m'))
+      future=_finite(x.get('future_min_m'))
+      future_t=_finite(x.get('future_min_t_s'))
+      long_t=_finite(x.get('side_overlap_entry_s'))
+      return bool((gap is not None and gap<=FG11_NEAR_WATCH_GAP_M) or
+                  (long_t is not None and 0.0<=long_t<=FG12_CHECK_HORIZON_S) or
+                  (future is not None and future_t is not None and
+                   0.0<=future_t<=FG12_CHECK_HORIZON_S and future<=FG11_NEAR_WATCH_GAP_M))
+    object_reasons=[]
     def add(lst,value):
       if value not in lst: lst.append(value)
+      if lst is caution and value not in object_reasons: object_reasons.append(value)
     for x in items:
       key=str(x.get('key') or '')
       gap=x.get('current_gap_m')
       relevant=bool(x.get('tts_lateral_relevant'))
+      scoped=watch_scope(x)
+      object_reasons=[]
       if x.get('fg12_2d_confirmed'):
         add(hard,'side_conflict_now' if x.get('conflict_now') else 'conflict_time<=3s')
         if key and key not in hard_keys: hard_keys.append(key)
@@ -691,23 +707,31 @@ class FutureGapEvaluator:
         add(caution,'conflict_pending')
       elif relevant and x.get('side_watch_within_5s'):
         add(caution,'conflict_3_5s_watch')
-      elif x.get('side_overlap_entry_s') is not None and x.get('conflict_entry_s') is None and relevant:
+      elif x.get('side_overlap_entry_s') is not None and 0.0<=float(x['side_overlap_entry_s'])<=FG12_CHECK_HORIZON_S and x.get('conflict_entry_s') is None and relevant:
         add(caution,'longitudinal_only_watch')
-      elif x.get('lateral_lane_entry_s') is not None and x.get('conflict_entry_s') is None and relevant:
+      elif x.get('lateral_lane_entry_s') is not None and 0.0<=float(x['lateral_lane_entry_s'])<=FG12_CHECK_HORIZON_S and x.get('conflict_entry_s') is None and relevant and scoped:
         add(caution,'lateral_only_watch')
       elif relevant and gap is not None and float(gap)<=FG11_NEAR_WATCH_GAP_M:
         add(caution,'near_target_lane_watch')
-      elif x.get('edge_watch'):
+      elif x.get('edge_watch') and scoped:
         add(caution,'outer_edge_close_watch')
-      elif x.get('confirmed_prediction') or x.get('uncertain_prediction'):
+      elif (x.get('confirmed_prediction') or x.get('uncertain_prediction')) and scoped:
         add(caution,'model_forecast_watch')
+      if object_reasons:
+        caution_objects.append({'key':key,'reasons':list(object_reasons),
+                                's_m':x.get('s_now_m'),'d_m':x.get('d_now_m'),
+                                'conflict_s':x.get('conflict_entry_s')})
+      elif not scoped and not x.get('fg12_2d_confirmed') and relevant:
+        suppressed_watch.append(key)
 
     # Stable incoming is advisory unless its lateral and longitudinal windows
     # actually intersect. This removes model-only urgent red spikes seen in V43.
     for x in side.get('stable_incoming') or []:
       k=str(x.get('key') or '')
       obs=next((r for r in items if str(r.get('key') or '')==k),None)
-      if obs is None or not obs.get('fg12_2d_confirmed'):
+      if obs is None:
+        add(caution,'incoming_evidence_missing')
+      elif not obs.get('fg12_2d_confirmed') and watch_scope(obs):
         add(caution,'stable_incoming_lateral_watch')
 
     sc=side.get('scenarios') or {}
@@ -717,9 +741,12 @@ class FutureGapEvaluator:
     state='BLOCKED_SHADOW' if hard else ('CAUTION_SHADOW' if caution else 'SAFE_SHADOW')
     return {
       'state':state,'reasons':(hard if hard else caution)[:6],
-      'policy':'FG12 synchronized 2D Time-To-Conflict: same object longitudinal+requested-lane overlap <=3s => DANGER; 3-5s or one-axis/model-only => CHECK',
+      'policy':'FG13: FG12 DANGER unchanged; one-axis/model CHECK bounded to 5s or near/future clearance <=10m',
       'predicted_only':bool(caution and not hard),
       'hard_keys':hard_keys[:6],
+      'caution_objects':caution_objects[:12],
+      'suppressed_far_watch_keys':suppressed_watch[:12],
+      'check_horizon_s':FG12_CHECK_HORIZON_S,
       'hard_urgent':bool(urgent and hard),
       'min_time_to_side_s':e.get('min_2d_conflict_time_s'),
       'min_2d_conflict_time_s':e.get('min_2d_conflict_time_s'),
@@ -1289,7 +1316,7 @@ class FutureGapEvaluator:
       intent=self._apply_intent_state(active,active_side,v_ego,steering_angle_deg,road_curve_direction,now_ns)
 
     return {
-      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG12_TTS3_2D_CONFLICT',
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG13_BOUNDED_CHECK',
       'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
       'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),
       'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
@@ -1305,6 +1332,6 @@ class FutureGapEvaluator:
                'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
                'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
                'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
-      'note':'FG12: same canonical object must have synchronized longitudinal side overlap and requested-lane occupancy within 3s for DANGER; one-axis/3-5s/model-only => CHECK; raw decision is latched at COMMIT to avoid stale display-red hold; shadow only, NO permission and NO CAN control.'
+      'note':'FG13 bounded advisory; FG12 DANGER unchanged: same canonical object must have synchronized longitudinal side overlap and requested-lane occupancy within 3s for DANGER; one-axis/3-5s/model-only => CHECK; raw decision is latched at COMMIT to avoid stale display-red hold; shadow only, NO permission and NO CAN control.'
     }
 
