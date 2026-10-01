@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V42: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V43: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -145,11 +145,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V42: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual restored; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V43: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V42 FG10: lane-centered DANGER, outer-edge CHECK, 0.15s red-entry debounce; FG9 same-key gap + FG8 TURN/rebase retained',
+          'future_gap_policy':'V43 FG11: speed-based Time-To-Side; confirmed <=3s side overlap DANGER, 3-5s/edge/model-only CHECK; FG8 TURN/rebase retained',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V42 seven read-only stages; V40 legacy road/vehicle visual restored; diagnostic validity-only raw filter and selected L1/L2',
+          'web_stage_contract':'V43 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,
