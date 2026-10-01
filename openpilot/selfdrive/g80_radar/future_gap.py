@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""V43 shadow Future Gap + 3-second Time-To-Side evaluator.
+"""V44 shadow Future Gap + synchronized 3-second 2D conflict evaluator.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
-geometry for NOW/0.5/1/2/3 s. V43 retains FG8 maneuver context and FG10 lane-centred lateral filtering, but FG11 makes relative-speed Time-To-Side (TTS) the primary DANGER criterion:
-- DANGER when a fresh, target-lane-relevant vehicle will longitudinally overlap the ego side envelope within 3.0 s;
-- 3-5 s approach, boundary-only overlap and model-only forecasts are CHECK, not DANGER;
+geometry for NOW/0.5/1/2/3 s. V44 retains FG8 maneuver context and FG10 lane-centred lateral filtering, while FG12 requires longitudinal Time-To-Side and lateral target-lane occupancy to coincide in time:
+- DANGER when a fresh object is predicted to occupy the requested lane at the same time it longitudinally overlaps the ego side envelope within 3.0 s;
+- longitudinal-only TTS, lateral-only entry, 3-5 s approach, boundary-only overlap and model-only forecasts are CHECK, not DANGER;
+- model/stable-incoming objects outside the lane need persistence even when their longitudinal TTS is urgent;
 - distinguish likely intersection turns from lane changes using road curvature, speed and steering angle;
 - latch the pre-commit lane-change assessment briefly after steering commitment;
 - suppress coordinate-recenter false DANGER during the commit/rebase window while retaining a hard TTC override;
@@ -24,7 +25,7 @@ import math
 
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name, adjacent_lane_availability
 
-FUTURE_GAP_API_VERSION = 11
+FUTURE_GAP_API_VERSION = 12
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -41,7 +42,7 @@ INCOMING_EGO_MIN_MANEUVER_PROB = 0.35
 INCOMING_STABLE_S = 0.25
 INCOMING_FORGET_S = 0.80
 
-DISPLAY_DANGER_RELEASE_S = 0.25
+DISPLAY_DANGER_RELEASE_S = 0.12
 DISPLAY_DANGER_ENTRY_S = 0.15
 DISPLAY_SAFE_ENTRY_S = 0.50
 
@@ -111,7 +112,7 @@ FG10_INWARD_RATE_MPS = 0.35
 FG10_UNCERTAIN_HARD_GAP_M = 1.00
 FG10_UNCERTAIN_HARD_TTC_S = 1.00
 
-# FG11: speed-based 3-second Time-To-Side (TTS) policy.
+# FG11 longitudinal helper retained for FG12 2D timing.
 # Coordinates use ego FRONT BUMPER as x=0. With 4.8 m ego length and a
 # 2.4 m target half-length, physical longitudinal body overlap occurs when the
 # target centre is roughly in [-7.2, +2.4] m. Add 0.8 m diagnostic buffer.
@@ -128,6 +129,21 @@ FG11_URGENT_TTS_S = 1.00
 FG11_MIN_TRACK_S = 0.20
 FG11_NEAR_WATCH_GAP_M = 10.0
 FG11_UNCERTAIN_URGENT_TTS_S = 1.00
+
+# FG12: synchronized longitudinal + lateral conflict.  A 3-second longitudinal
+# TTS alone is not enough for DANGER; the same canonical object must also occupy
+# the requested lane during that time window.  Current-core objects can react
+# quickly, while outside/boundary stable-incoming objects must persist first.
+# This remains monitor/UI-only and is not a validated control threshold.
+FG12_TARGET_CENTER_HALF_BAND_M = 1.80   # one adjacent lane half width
+FG12_DANGER_HORIZON_S = 3.0
+FG12_CHECK_HORIZON_S = 5.0
+FG12_CONFIRM_S = 0.15
+FG12_CONFIRM_COUNT = 2
+FG12_FORGET_S = 0.85
+FG12_CORE_URGENT_S = 0.75
+FG12_UNCERTAIN_URGENT_S = 1.00
+FG12_MIN_TRACK_S = 0.20
 
 
 def _finite(v, default=None):
@@ -298,6 +314,39 @@ def _fg11_linear_side_interval(s0: float, v_rel: float) -> tuple[float,float | N
   return entry,b
 
 
+def _fg12_linear_lane_interval(d0: float, d_dot: float, target_center: float) -> tuple[float,float | None] | None:
+  """Linear time interval where target centre is inside requested-lane band."""
+  d=float(d0); v=float(d_dot)
+  lo=float(target_center)-FG12_TARGET_CENTER_HALF_BAND_M
+  hi=float(target_center)+FG12_TARGET_CENTER_HALF_BAND_M
+  if lo <= d <= hi:
+    if abs(v) < 1e-5:
+      return 0.0,None
+    t1=(lo-d)/v; t2=(hi-d)/v
+    exits=[t for t in (t1,t2) if t>1e-6]
+    return 0.0,(min(exits) if exits else None)
+  if abs(v) < 1e-5:
+    return None
+  t1=(lo-d)/v; t2=(hi-d)/v
+  a=min(t1,t2); b=max(t1,t2)
+  if b < 0.0:
+    return None
+  entry=max(0.0,a)
+  return (entry,b) if entry <= b else None
+
+
+def _fg12_intersection(a: tuple[float,float | None] | None, b: tuple[float,float | None] | None) -> tuple[float,float | None] | None:
+  if a is None or b is None:
+    return None
+  a0,a1=a; b0,b1=b
+  end_a=float('inf') if a1 is None else float(a1)
+  end_b=float('inf') if b1 is None else float(b1)
+  start=max(float(a0),float(b0)); end=min(end_a,end_b)
+  if start > end:
+    return None
+  return start,(None if math.isinf(end) else end)
+
+
 def _obj_summary(o: dict, st: dict, current_core: bool, current_overlap: bool) -> dict:
   return {
     'key':_key(o),'s':round(float(st['s']),3),'d':round(float(st['d']),3),
@@ -325,7 +374,8 @@ class FutureGapEvaluator:
     }
     self.hard_override_hist = {'side':None,'key':None,'since_ns':0,'last_ns':0,'count':0}
     self.fg9_prediction_hist: dict[tuple[int,str,str],dict] = {}
-    self.fg11_tts_hist: dict[tuple[int,str],dict] = {}
+    self.fg11_tts_hist: dict[tuple[int,str],dict] = {}  # compatibility diagnostics
+    self.fg12_conflict_hist: dict[tuple[int,str],dict] = {}
 
   def _stabilize_incoming(self, side: dict, target_idx: int, now_ns: int) -> dict:
     now_ns=int(now_ns)
@@ -526,84 +576,105 @@ class FutureGapEvaluator:
     side['fg9_evidence']=out  # compatibility alias for V39-V41 UI/log readers
     return out
 
-  def _fg11_enrich_evidence(self, side: dict, target_idx: int, now_ns: int) -> dict:
-    """Add speed-based Time-To-Side evidence to the existing same-key observations."""
+  def _fg12_enrich_evidence(self, side: dict, target_idx: int, now_ns: int) -> dict:
+    """Synchronize longitudinal Time-To-Side with requested-lane occupancy."""
     e=dict(side.get('fg10_evidence') or side.get('fg9_evidence') or {})
     obs=e.get('observations') or []
+    _,_,target_center=_target_bounds(target_idx)
     live=set()
     for x in obs:
       s0=_finite(x.get('s_now_m')); v0=_finite(x.get('relative_s_dot_mps'))
-      interval=_fg11_linear_side_interval(s0,v0) if s0 is not None and v0 is not None else None
-      entry=interval[0] if interval else None
-      exit_t=interval[1] if interval else None
-      overlap_now=bool(interval is not None and entry is not None and entry <= 1e-9)
-      lateral_relevant=bool(x.get('current_core') or x.get('stable_incoming'))
-      boundary_only=bool(x.get('current_boundary') and not x.get('current_core'))
+      d0=_finite(x.get('d_now_m')); vd=_finite(x.get('d_dot_mps'),0.0) or 0.0
+      long_iv=_fg11_linear_side_interval(s0,v0) if s0 is not None and v0 is not None else None
+      lat_iv=_fg12_linear_lane_interval(d0,vd,target_center) if d0 is not None else None
+      conflict_iv=_fg12_intersection(long_iv,lat_iv)
+      long_entry=long_iv[0] if long_iv else None
+      lat_entry=lat_iv[0] if lat_iv else None
+      conflict_entry=conflict_iv[0] if conflict_iv else None
+      conflict_exit=conflict_iv[1] if conflict_iv else None
+      side_now=bool(long_iv is not None and long_entry is not None and long_entry<=1e-9)
+      lane_now=bool(lat_iv is not None and lat_entry is not None and lat_entry<=1e-9)
+      conflict_now=bool(side_now and lane_now)
+      current_core=bool(x.get('current_core'))
+      current_boundary=bool(x.get('current_boundary') and not current_core)
+      stable_incoming=bool(x.get('stable_incoming'))
       fresh=bool(x.get('fresh'))
       track_s=float(x.get('track_duration_s') or 0.0)
-      within3=bool(entry is not None and entry <= FG11_DANGER_HORIZON_S)
-      within5=bool(entry is not None and entry <= FG11_CHECK_HORIZON_S)
-      urgent=bool(entry is not None and entry <= FG11_URGENT_TTS_S)
-      candidate=bool(lateral_relevant and fresh and within3 and (track_s>=FG11_MIN_TRACK_S or urgent or overlap_now))
+      within3=bool(conflict_entry is not None and conflict_entry<=FG12_DANGER_HORIZON_S)
+      within5=bool(conflict_entry is not None and conflict_entry<=FG12_CHECK_HORIZON_S)
+      # Current target-lane occupants are direct radar geometry.  Outside/boundary
+      # incoming objects remain useful but need temporal proof before becoming red.
+      lateral_relevant=bool(current_core or current_boundary or stable_incoming)
+      candidate=bool(fresh and lateral_relevant and within3 and (track_s>=FG12_MIN_TRACK_S or conflict_now))
       hk=(int(target_idx),str(x.get('key') or ''))
       confirmed=False; age=0.0; count=0
       if candidate and hk[1]:
         live.add(hk)
-        h=self.fg11_tts_hist.get(hk)
-        if h is None or int(now_ns)-int(h.get('last_ns',0))>int(FG11_FORGET_S*1e9):
+        h=self.fg12_conflict_hist.get(hk)
+        if h is None or int(now_ns)-int(h.get('last_ns',0))>int(FG12_FORGET_S*1e9):
           h={'since_ns':int(now_ns),'last_ns':int(now_ns),'count':1}
         else:
           h['last_ns']=int(now_ns); h['count']=int(h.get('count',0))+1
-        self.fg11_tts_hist[hk]=h
+        self.fg12_conflict_hist[hk]=h
         age=max(0.0,(int(now_ns)-int(h['since_ns']))/1e9); count=int(h['count'])
-        confirmed=bool(overlap_now or urgent or (count>=FG11_CONFIRM_COUNT and age>=FG11_CONFIRM_S))
-      x['side_overlap_entry_s']=None if entry is None else round(float(entry),3)
-      x['side_overlap_exit_s']=None if exit_t is None else round(float(exit_t),3)
-      x['side_overlap_now']=overlap_now
+        core_urgent=bool(current_core and conflict_entry is not None and conflict_entry<=FG12_CORE_URGENT_S)
+        # Unlike FG11, an OUTSIDE/BOUNDARY model incoming does not bypass
+        # persistence merely because longitudinal TTS is <1 s.
+        confirmed=bool(conflict_now or core_urgent or (count>=FG12_CONFIRM_COUNT and age>=FG12_CONFIRM_S))
+      x['side_overlap_entry_s']=None if long_entry is None else round(float(long_entry),3)
+      x['side_overlap_exit_s']=None if long_iv is None or long_iv[1] is None else round(float(long_iv[1]),3)
+      x['side_overlap_now']=side_now
+      x['lateral_lane_entry_s']=None if lat_entry is None else round(float(lat_entry),3)
+      x['lateral_lane_exit_s']=None if lat_iv is None or lat_iv[1] is None else round(float(lat_iv[1]),3)
+      x['lateral_lane_now']=lane_now
+      x['conflict_entry_s']=None if conflict_entry is None else round(float(conflict_entry),3)
+      x['conflict_exit_s']=None if conflict_exit is None else round(float(conflict_exit),3)
+      x['conflict_now']=conflict_now
       x['side_conflict_within_3s']=within3
       x['side_watch_within_5s']=within5
       x['tts_lateral_relevant']=lateral_relevant
-      x['tts_boundary_only']=boundary_only
+      x['tts_boundary_only']=current_boundary
       x['tts_candidate']=candidate
       x['tts_persistence_s']=round(age,3)
       x['tts_persistence_count']=count
       x['tts_confirmed']=confirmed
-      x['tts_urgent']=bool(confirmed and urgent)
-    for hk,h in list(self.fg11_tts_hist.items()):
-      if int(now_ns)-int(h.get('last_ns',0))>int(FG11_FORGET_S*1e9):
-        del self.fg11_tts_hist[hk]
-    confirmed=[x for x in obs if x.get('tts_confirmed')]
+      x['tts_urgent']=bool(confirmed and conflict_entry is not None and conflict_entry<=FG12_CORE_URGENT_S)
+      x['fg12_2d_confirmed']=confirmed
+    for hk,h in list(self.fg12_conflict_hist.items()):
+      if int(now_ns)-int(h.get('last_ns',0))>int(FG12_FORGET_S*1e9):
+        del self.fg12_conflict_hist[hk]
+    confirmed=[x for x in obs if x.get('fg12_2d_confirmed')]
     candidates=[x for x in obs if x.get('tts_candidate')]
     watches=[x for x in obs if x.get('side_watch_within_5s') and (x.get('current_core') or x.get('current_boundary') or x.get('stable_incoming'))]
-    def _min_t(rows):
-      vals=[float(x['side_overlap_entry_s']) for x in rows if x.get('side_overlap_entry_s') is not None]
+    def _min(rows,key):
+      vals=[float(x[key]) for x in rows if x.get(key) is not None]
       return min(vals) if vals else None
     e['observations']=obs
-    e['tts3_confirmed_count']=len(confirmed)
+    e['tts3_confirmed_count']=len(confirmed)  # compatibility name
     e['tts3_candidate_count']=len(candidates)
     e['tts5_watch_count']=len(watches)
-    e['min_confirmed_time_to_side_s']=_min_t(confirmed)
-    e['min_candidate_time_to_side_s']=_min_t(candidates)
-    e['min_watch_time_to_side_s']=_min_t(watches)
+    e['conflict3_confirmed_count']=len(confirmed)
+    e['min_confirmed_time_to_side_s']=_min(confirmed,'conflict_entry_s')
+    e['min_candidate_time_to_side_s']=_min(candidates,'conflict_entry_s')
+    e['min_watch_time_to_side_s']=_min(watches,'conflict_entry_s')
     e['min_time_to_side_s']=e['min_confirmed_time_to_side_s'] if e['min_confirmed_time_to_side_s'] is not None else e['min_watch_time_to_side_s']
+    e['min_2d_conflict_time_s']=e['min_time_to_side_s']
     e['side_zone_m']=[FG11_SIDE_REAR_EDGE_M,FG11_SIDE_FRONT_EDGE_M]
-    e['danger_horizon_s']=FG11_DANGER_HORIZON_S
-    e['check_horizon_s']=FG11_CHECK_HORIZON_S
-    e['primary_predictor']='current signed s + current relative s_dot; no acceleration required for red'
-    side['fg11_evidence']=e
+    e['target_lane_center_m']=round(float(target_center),3)
+    e['target_lane_center_half_band_m']=FG12_TARGET_CENTER_HALF_BAND_M
+    e['danger_horizon_s']=FG12_DANGER_HORIZON_S
+    e['check_horizon_s']=FG12_CHECK_HORIZON_S
+    e['primary_predictor']='same-key current longitudinal relative speed + current lateral lane occupancy; red requires overlapping time windows'
+    side['fg12_evidence']=e
+    side['fg11_evidence']=e  # compatibility alias for V43 UI/log readers
     side['fg10_evidence']=e
     side['fg9_evidence']=e
     return e
 
   @staticmethod
   def _decision(side: dict) -> dict:
-    """FG11: DANGER is primarily a confirmed <=3 s Time-To-Side conflict.
-
-    This deliberately downgrades static/slow edge proximity and acceleration-only
-    extrapolations to CHECK. A far but rapidly closing rear/front vehicle can still
-    become DANGER if current relative speed places it beside the ego within 3 s.
-    """
-    e=side.get('fg11_evidence') or side.get('fg10_evidence') or side.get('fg9_evidence') or {}
+    """FG12: red requires a same-object 2D time-coincident conflict <=3 s."""
+    e=side.get('fg12_evidence') or side.get('fg11_evidence') or side.get('fg10_evidence') or side.get('fg9_evidence') or {}
     items=e.get('observations') or []
     hard=[]; caution=[]; hard_keys=[]; urgent=False
     def add(lst,value):
@@ -611,50 +682,48 @@ class FutureGapEvaluator:
     for x in items:
       key=str(x.get('key') or '')
       gap=x.get('current_gap_m')
-      entry=x.get('side_overlap_entry_s')
       relevant=bool(x.get('tts_lateral_relevant'))
-      if x.get('tts_confirmed'):
-        add(hard,'side_overlap_now' if x.get('side_overlap_now') else 'time_to_side<=3s')
+      if x.get('fg12_2d_confirmed'):
+        add(hard,'side_conflict_now' if x.get('conflict_now') else 'conflict_time<=3s')
         if key and key not in hard_keys: hard_keys.append(key)
         if x.get('tts_urgent'): urgent=True
       elif x.get('tts_candidate'):
-        add(caution,'time_to_side_pending')
+        add(caution,'conflict_pending')
       elif relevant and x.get('side_watch_within_5s'):
-        add(caution,'time_to_side_3_5s_watch')
-      elif x.get('tts_boundary_only') and x.get('side_watch_within_5s'):
-        add(caution,'boundary_time_to_side_watch')
+        add(caution,'conflict_3_5s_watch')
+      elif x.get('side_overlap_entry_s') is not None and x.get('conflict_entry_s') is None and relevant:
+        add(caution,'longitudinal_only_watch')
+      elif x.get('lateral_lane_entry_s') is not None and x.get('conflict_entry_s') is None and relevant:
+        add(caution,'lateral_only_watch')
       elif relevant and gap is not None and float(gap)<=FG11_NEAR_WATCH_GAP_M:
         add(caution,'near_target_lane_watch')
       elif x.get('edge_watch'):
         add(caution,'outer_edge_close_watch')
       elif x.get('confirmed_prediction') or x.get('uncertain_prediction'):
-        # Model/acceleration forecast remains advisory; it cannot make red alone.
         add(caution,'model_forecast_watch')
 
-    # Lateral incoming without a matching <=3 s longitudinal side conflict is CHECK.
+    # Stable incoming is advisory unless its lateral and longitudinal windows
+    # actually intersect. This removes model-only urgent red spikes seen in V43.
     for x in side.get('stable_incoming') or []:
       k=str(x.get('key') or '')
       obs=next((r for r in items if str(r.get('key') or '')==k),None)
-      if obs is None or not obs.get('tts_confirmed'):
+      if obs is None or not obs.get('fg12_2d_confirmed'):
         add(caution,'stable_incoming_lateral_watch')
 
-    # V43 keeps legacy DEC3 and hypothetical braking ONLY as diagnostics. They
-    # no longer force CHECK/DANGER; otherwise the old conservative policy would
-    # defeat the requested speed-based 3-second rule.
     sc=side.get('scenarios') or {}
     what_if_watch=any(((sc.get(name) or {}).get('min_clearance_m') is not None and (sc.get(name) or {}).get('min_clearance_m')<=8.0)
                       for name in ('front_target_brake','rear_ego_brake'))
     legacy=side.get('legacy_decision_raw') or FutureGapEvaluator._decision_legacy(side)
-
     state='BLOCKED_SHADOW' if hard else ('CAUTION_SHADOW' if caution else 'SAFE_SHADOW')
     return {
       'state':state,'reasons':(hard if hard else caution)[:6],
-      'policy':'FG11 speed-based Time-To-Side: confirmed <=3s side overlap => DANGER; 3-5s/edge/model forecast => CHECK',
+      'policy':'FG12 synchronized 2D Time-To-Conflict: same object longitudinal+requested-lane overlap <=3s => DANGER; 3-5s or one-axis/model-only => CHECK',
       'predicted_only':bool(caution and not hard),
       'hard_keys':hard_keys[:6],
       'hard_urgent':bool(urgent and hard),
-      'min_time_to_side_s':e.get('min_time_to_side_s'),
-      'tts3_confirmed_count':e.get('tts3_confirmed_count',0),
+      'min_time_to_side_s':e.get('min_2d_conflict_time_s'),
+      'min_2d_conflict_time_s':e.get('min_2d_conflict_time_s'),
+      'tts3_confirmed_count':e.get('conflict3_confirmed_count',0),
       'legacy_state_diag':legacy.get('state'),'what_if_braking_diag':bool(what_if_watch),
       'diagnostic_not_permission':True,
     }
@@ -715,14 +784,14 @@ class FutureGapEvaluator:
     # FG10 UNCERTAIN: red is reserved for a truly immediate, lane-centred
     # emergency. Predicted crossings and outer-edge contact remain CHECK ROAD
     # until C4 geometry confirms the adjacent lane.
-    obs=(((side or {}).get('fg11_evidence') or (side or {}).get('fg10_evidence') or (side or {}).get('fg9_evidence') or {}).get('observations') or [])
+    obs=(((side or {}).get('fg12_evidence') or (side or {}).get('fg11_evidence') or (side or {}).get('fg10_evidence') or (side or {}).get('fg9_evidence') or {}).get('observations') or [])
     direct=any(bool(
-        x.get('fresh') and x.get('tts_lateral_relevant') and x.get('tts_confirmed') and
-        x.get('side_overlap_entry_s') is not None and float(x.get('side_overlap_entry_s'))<=FG11_UNCERTAIN_URGENT_TTS_S
+        x.get('fresh') and x.get('current_core') and x.get('fg12_2d_confirmed') and
+        x.get('conflict_entry_s') is not None and float(x.get('conflict_entry_s'))<=FG12_UNCERTAIN_URGENT_S
       ) for x in obs)
     if str(out.get('state'))=='BLOCKED_SHADOW' and direct:
       out['hard_urgent']=True
-      out['reasons']=['road_uncertain_tts_urgent'] + list(out.get('reasons') or [])[:5]
+      out['reasons']=['road_uncertain_2d_urgent'] + list(out.get('reasons') or [])[:5]
       return out
     out['state']='CAUTION_SHADOW'; out['label_override']='CHECK ROAD'
     out['reasons']=['target_lane_unconfirmed'] + [r for r in list(out.get('reasons') or []) if r!='target_lane_unconfirmed'][:5]
@@ -764,7 +833,7 @@ class FutureGapEvaluator:
     if cur=='CAUTION_SHADOW' and raw_state=='CAUTION_SHADOW' and raw.get('label_override'):
       label=str(raw.get('label_override'))
     reasons=raw.get('reasons',[])[:6] if cur==raw_state else ['display_hysteresis']+raw.get('reasons',[])[:5]
-    return {'state':cur,'label':label,'raw_state':raw_state,'raw_reasons':raw.get('reasons',[])[:6],'reasons':reasons,'raw_age_s':round(age_s,3),'policy':'FG11 display debounce: 0.15s red entry / 0.25s release; SAFE 0.50s; comparison only'}
+    return {'state':cur,'label':label,'raw_state':raw_state,'raw_reasons':raw.get('reasons',[])[:6],'reasons':reasons,'raw_age_s':round(age_s,3),'policy':'FG12 display debounce: 0.15s red entry / 0.12s release; SAFE 0.50s; comparison only'}
 
   @staticmethod
   def _context(active: str | None, v_ego: float, steering_angle_deg: float,
@@ -789,7 +858,7 @@ class FutureGapEvaluator:
 
   @staticmethod
   def _hard_override(side: dict) -> bool:
-    """Also fixes a pre-existing FG8 AttributeError in UNCERTAIN road gate.
+    """Same-key hard override helper; UNCERTAIN road gate stays conservative.
 
     Never mix current TTC of vehicle A with predicted clearance of vehicle B.
     """
@@ -797,17 +866,17 @@ class FutureGapEvaluator:
 
   @staticmethod
   def _hard_override_candidate(side: dict) -> dict | None:
-    """During COMMIT/REBASING only an urgent same-key FG11 TTS conflict breaks hold."""
-    obs=(side.get('fg11_evidence') or side.get('fg10_evidence') or side.get('fg9_evidence') or {}).get('observations') or []
+    """During COMMIT/REBASING only an urgent same-key FG12 2D conflict breaks hold."""
+    obs=(side.get('fg12_evidence') or side.get('fg11_evidence') or side.get('fg10_evidence') or side.get('fg9_evidence') or {}).get('observations') or []
     can=[]
     for x in obs:
-      t=x.get('side_overlap_entry_s')
-      if not (x.get('fresh') and x.get('tts_confirmed') and x.get('tts_lateral_relevant') and t is not None):
+      t=x.get('conflict_entry_s')
+      if not (x.get('fresh') and x.get('fg12_2d_confirmed') and x.get('tts_lateral_relevant') and t is not None):
         continue
       if float(t)>HARD_OVERRIDE_TTC_S:
         continue
       can.append({'side':x.get('origin'),'key':x.get('key'),'clearance_m':x.get('current_gap_m'),'ttc_s':float(t),
-                  'same_key':True,'fg11_tts':True})
+                  'same_key':True,'fg12_2d_conflict':True})
     return min(can,key=lambda x:(x['ttc_s'],999 if x.get('clearance_m') is None else x['clearance_m'])) if can else None
 
   def _stable_hard_override(self, active: str | None, side: dict, now_ns: int) -> tuple[bool, dict | None]:
@@ -890,18 +959,26 @@ class FutureGapEvaluator:
     base['blinker_age_s']=round(max(0.0,(int(now_ns)-int(h.get('blinker_since_ns',now_ns)))/1e9),3)
 
     dec=dict(active_side.get('decision') or {})
+    raw_commit=dict(active_side.get('decision_raw') or {})
+    raw_commit_state=str(raw_commit.get('state') or 'CAUTION_SHADOW')
+    if raw_commit_state=='BLOCKED_SHADOW': raw_commit_label='DANGER'
+    elif raw_commit_state=='SAFE_SHADOW': raw_commit_label='SAFE'
+    else: raw_commit_label=str(raw_commit.get('label_override') or 'CHECK ?')
+    commit_dec={'state':raw_commit_state,'label':raw_commit_label,'reasons':list(raw_commit.get('reasons') or [])[:6],
+                'raw_state':raw_commit_state,'raw_source':True}
     base.update({'label':dec.get('label','CHECK ?'),'state':dec.get('state','CAUTION_SHADOW'),
                  'raw_state':dec.get('raw_state'),'reasons':dec.get('reasons',[])[:6],
-                 'front_clearance_m':(active_side.get('fg11_evidence') or active_side.get('fg10_evidence') or active_side.get('fg9_evidence') or {}).get('current_front_gap_m'),
-                 'rear_clearance_m':(active_side.get('fg11_evidence') or active_side.get('fg10_evidence') or active_side.get('fg9_evidence') or {}).get('current_rear_gap_m'),
+                 'front_clearance_m':(active_side.get('fg12_evidence') or active_side.get('fg11_evidence') or active_side.get('fg10_evidence') or active_side.get('fg9_evidence') or {}).get('current_front_gap_m'),
+                 'rear_clearance_m':(active_side.get('fg12_evidence') or active_side.get('fg11_evidence') or active_side.get('fg10_evidence') or active_side.get('fg9_evidence') or {}).get('current_rear_gap_m'),
                  'predicted_front_min_m':active_side.get('min_front_clearance_during_ego_overlap_m'),
                  'predicted_rear_min_m':active_side.get('min_rear_clearance_during_ego_overlap_m'),
                  'boundary_clearance_m':active_side.get('min_boundary_clearance_during_ego_overlap_m'),
                  'front_ttc_s':active_side.get('current_front_ttc_ca_s'),
                  'rear_ttc_s':active_side.get('current_rear_ttc_ca_s'),
                  'lane_availability':dict(active_side.get('lane_availability') or {}),
-                 'time_to_side_s':(active_side.get('fg11_evidence') or {}).get('min_time_to_side_s'),
-                 'tts3_confirmed_count':(active_side.get('fg11_evidence') or {}).get('tts3_confirmed_count',0)})
+                 'time_to_side_s':(active_side.get('fg12_evidence') or active_side.get('fg11_evidence') or {}).get('min_2d_conflict_time_s'),
+                 'conflict_time_s':(active_side.get('fg12_evidence') or active_side.get('fg11_evidence') or {}).get('min_2d_conflict_time_s'),
+                 'tts3_confirmed_count':(active_side.get('fg12_evidence') or active_side.get('fg11_evidence') or {}).get('conflict3_confirmed_count',0)})
 
     if ctx['kind']=='TURN':
       # Once an intersection/road turn is established, do not flip back to
@@ -937,10 +1014,10 @@ class FutureGapEvaluator:
     if (not h.get('committed') and lane_commit_ready and float(v_ego)>=LANE_CHANGE_COMMIT_MIN_SPEED_MPS and
         blink_age>=LANE_CHANGE_COMMIT_MIN_BLINKER_S and steer>=LANE_CHANGE_COMMIT_STEER_DEG):
       h['committed']=True; h['commit_ns']=int(now_ns)
-      h['latched_decision']=dict(h.get('precommit_decision') or dec)
+      h['latched_decision']=dict(h.get('precommit_decision') or commit_dec)
 
     if not h.get('committed'):
-      h['precommit_decision']=dict(dec)
+      h['precommit_decision']=dict(commit_dec)
       base['phase']='PRECHECK'
       if not lane_commit_ready and lane_status!='CONFIRMED':
         base['reasons']=['lane_change_commit_wait_for_lane']+(base.get('reasons') or [])[:5]
@@ -1185,8 +1262,8 @@ class FutureGapEvaluator:
     lane_availability={'left':dict(left['lane_availability']),'right':dict(right['lane_availability']),'fresh':bool(lane_availability_raw.get('fresh'))}
     self._fg9_build_evidence(left,+1,now_ns)
     self._fg9_build_evidence(right,-1,now_ns)
-    self._fg11_enrich_evidence(left,+1,now_ns)
-    self._fg11_enrich_evidence(right,-1,now_ns)
+    self._fg12_enrich_evidence(left,+1,now_ns)
+    self._fg12_enrich_evidence(right,-1,now_ns)
     left.pop('fg9_object_states',None)
     right.pop('fg9_object_states',None)
     # Preserve the exact old DEC3 output to diagnose any disagreement in logs.
@@ -1212,7 +1289,7 @@ class FutureGapEvaluator:
       intent=self._apply_intent_state(active,active_side,v_ego,steering_angle_deg,road_curve_direction,now_ns)
 
     return {
-      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG11_TTS3_SPEED_BASED_SIDE_OCCUPANCY',
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG12_TTS3_2D_CONFLICT',
       'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
       'active_target':active,'driver_intent':intent,'horizons_s':list(HORIZONS_S),
       'lane_change_duration_s':LANE_CHANGE_DURATION_S,'vehicle_long_margin_m':OBJECT_LONG_MARGIN_M,
@@ -1228,6 +1305,6 @@ class FutureGapEvaluator:
                'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
                'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
                'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
-      'note':'FG11: current relative speed + signed longitudinal separation predicts side-body overlap within 3s for DANGER; 3-5s/edge/model-only => CHECK; FG8 TURN/commit retained; shadow only, NO permission and NO CAN control.'
+      'note':'FG12: same canonical object must have synchronized longitudinal side overlap and requested-lane occupancy within 3s for DANGER; one-axis/3-5s/model-only => CHECK; raw decision is latched at COMMIT to avoid stale display-red hold; shadow only, NO permission and NO CAN control.'
     }
 

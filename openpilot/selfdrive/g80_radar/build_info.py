@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 43
-BUILD_TAG = 'v43-web7-legacy-visual-fg11-tts3-speed-gap-golden-replay-webfix-signal-source-lock-goldenv2'
-LOGGER_FORMAT_VERSION = 24
+BUILD_VERSION = 44
+BUILD_TAG = 'v44-web7-legacy-visual-fg12-tts3-2d-conflict-raw-commit-latch-webfix-signal-source-lock-goldenv2'
+LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
-FUTURE_GAP_API_VERSION = 11
+FUTURE_GAP_API_VERSION = 12
 ANDROID_PROTOCOL_VERSION = 21
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'
