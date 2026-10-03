@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V46 shadow Future Gap + BSD priority and measured target-lane filtering.
+"""V47 shadow Future Gap + BSD priority and measured target-lane filtering.
 
 Consumes Canonical360 vehicles after KF4/IMM3 and computes diagnostic target-lane
 geometry for NOW/0.5/1/2/3 s. V44 retains FG8 maneuver context and FG10 lane-centred lateral filtering, while FG12 requires longitudinal Time-To-Side and lateral target-lane occupancy to coincide in time:
@@ -26,7 +26,7 @@ import math
 from openpilot.selfdrive.g80_radar.road_geometry import LANE_W_M, lane_index_from_d, lane_name, adjacent_lane_availability
 from openpilot.selfdrive.g80_radar.target_lane_gate import TargetLaneGate
 
-FUTURE_GAP_API_VERSION = 14
+FUTURE_GAP_API_VERSION = 15
 HORIZONS_S = (0.0, 0.5, 1.0, 2.0, 3.0)
 LANE_CHANGE_DURATION_S = 3.0
 EGO_HALF_WIDTH_M = 1.05
@@ -174,6 +174,21 @@ def _find_traj_point(o: dict, t: float) -> tuple[dict | None, str]:
 
 
 def _state_at(o: dict, t: float) -> dict | None:
+  # Current road projection and predictor coordinate source must agree.
+  # Old Frenet fields can survive a transition to rear/raw geometry.
+  o=dict(o)
+  expected='c4_path' if o.get('road_projection_valid') else 'ego_xy_fallback'
+  imm_source=o.get('imm_coord_source')
+  imm_age=_finite(o.get('imm_eval_age_ms'),0.0)
+  if (imm_source is not None and imm_source!=expected) or imm_age is None or not 0<=imm_age<=500:
+    o['imm_valid']=False
+  if not o.get('road_projection_valid'):
+    o['kf_frenet_valid']=False
+    # Trajectory entries do not all carry their coordinate source. Use current
+    # measured geometry until a matching predictor is available.
+    o['kalman_valid']=False
+  if not o.get('kalman_valid'):
+    o['kf_frenet_valid']=False
   if t <= 1e-9:
     if o.get('imm_valid'):
       s = _finite(o.get('imm_s')); d = _finite(o.get('imm_d'))
@@ -193,7 +208,7 @@ def _state_at(o: dict, t: float) -> dict | None:
       s = _finite(o.get('x')); d = _finite(o.get('road_d'), _finite(o.get('y')))
       vs = _finite(o.get('vx'), 0.0); acc = 0.0
       ss = _finite(o.get('kf_x_sigma'), 0.0); ds = _finite(o.get('kf_y_sigma'), 0.0)
-      vd = _finite(o.get('kf_d_dot'), _finite(o.get('kf_vy'), 0.0)) or 0.0
+      vd = 0.0
       src = 'RADAR'
     if s is None or d is None:
       return None
@@ -217,19 +232,17 @@ def _state_at(o: dict, t: float) -> dict | None:
             'lane_index':int(p.get('lane_index')) if p.get('lane_index') is not None else lane_index_from_d(d),
             'lane':p.get('lane') or lane_name(lane_index_from_d(d))}
 
-  s0 = _finite(o.get('kf_s'), _finite(o.get('kf_x'), _finite(o.get('x'))))
-  d0 = _finite(o.get('kf_d'), _finite(o.get('kf_y'), _finite(o.get('road_d'), _finite(o.get('y')))))
-  if s0 is None or d0 is None:
+  current = _state_at(o, 0.0)
+  if current is None:
     return None
-  v = _finite(o.get('kf_s_dot'), _finite(o.get('kf_vx'), _finite(o.get('vx'),0.0))) or 0.0
-  a = _finite(o.get('kf_s_ddot'), 0.0) or 0.0
-  dd = _finite(o.get('kf_d_dot'), _finite(o.get('kf_vy'),0.0)) or 0.0
+  s0,d0=current['s'],current['d']
+  v,a,dd=current['s_dot'],current['s_ddot'],current['d_dot']
   s = s0 + v*t + 0.5*a*t*t
   d = d0 + dd*t
   return {'s':s,'d':d,'s_dot':v+a*t,'s_ddot':a,'d_dot':dd,
           's_sigma':max(0.0,_finite(o.get('kf_s_sigma'),0.0) or 0.0),
           'd_sigma':max(0.0,_finite(o.get('kf_d_sigma'),0.0) or 0.0),
-          'source':'KF_CV_FALLBACK','lane_index':lane_index_from_d(d),'lane':lane_name(lane_index_from_d(d))}
+          'source':current['source']+'_CV_FALLBACK','lane_index':lane_index_from_d(d),'lane':lane_name(lane_index_from_d(d))}
 
 
 def _target_bounds(target_idx: int) -> tuple[float,float,float]:
@@ -392,7 +405,7 @@ class FutureGapEvaluator:
         reason='stock_bsd_active' if bsd.get('fresh') else 'stock_bsd_stale_on_latched'
         override={'state':'BLOCKED_SHADOW','label':'DANGER · BSD','raw_state':'BLOCKED_SHADOW',
                   'reasons':[reason],'raw_reasons':[reason],'hard_urgent':True,
-                  'diagnostic_not_permission':True,'policy':'FG14 stock BSD final override'}
+                  'diagnostic_not_permission':True,'policy':'FG15 stock BSD final override'}
         side['decision_before_bsd']=side['decision']
         side['decision_raw']=dict(override)
         side['decision']=dict(override)
@@ -744,7 +757,7 @@ class FutureGapEvaluator:
         add(hard,'side_conflict_now' if x.get('conflict_now') else 'conflict_time<=3s')
         if key and key not in hard_keys: hard_keys.append(key)
         if x.get('tts_urgent'): urgent=True
-      elif x.get('coordinate_disagreement'):
+      elif x.get('coordinate_disagreement') and scoped:
         add(caution,'measured_predictor_lane_disagreement')
       elif x.get('tts_candidate'):
         add(caution,'conflict_pending')
@@ -1366,7 +1379,7 @@ class FutureGapEvaluator:
 
     self._monitor_overrides(left,right,intent,active,bsd,monitor_health)
     return {
-      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG14_BSD_TARGET_LANE',
+      'api_version':FUTURE_GAP_API_VERSION,'mode':'SHADOW_GEOMETRY_FG15_BSD_TARGET_LANE',
       'bsd':bsd or {},'monitor_health':monitor_health or {},
       'centerline_recognition_available':False,
       'decision_enabled':True,'safe_caution_blocked_enabled':True,'decision_shadow_only':True,
@@ -1384,5 +1397,5 @@ class FutureGapEvaluator:
                'right_incoming_possible':right['possible_incoming_count'],'left_current_core':left['horizons'][0]['core_occupant_count'],
                'right_current_core':right['horizons'][0]['core_occupant_count'],'left_current_boundary':left['horizons'][0]['boundary_overlap_count'],
                'right_current_boundary':right['horizons'][0]['boundary_overlap_count']},
-      'note':'FG14: stock BSD final display priority; measured stable outer-lane tracks excluded per target side; remaining FG12 2D conflict retained. Unknown inputs do not grant green. Central-line semantics unavailable. Shadow only, NO permission and NO CAN control.'
+      'note':'FG15: stock BSD final display priority; measured stable outer-lane tracks excluded per target side; remaining FG12 2D conflict retained. Unknown inputs do not grant green. Central-line semantics unavailable. Shadow only, NO permission and NO CAN control.'
     }

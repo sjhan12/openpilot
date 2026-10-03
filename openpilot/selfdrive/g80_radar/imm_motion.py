@@ -413,6 +413,25 @@ class ImmMotionTracker:
   @staticmethod
   def _copy_cached_imm(o: dict, cached: dict, now_ns: int) -> dict:
     d=dict(o)
+    meas=_measurement(o)
+    age_ns=now_ns-int(cached.get('_cache_ns',0))
+    reason=None
+    if meas is None:
+      reason='no_current_measurement'
+    elif cached.get('imm_coord_source') != meas[4]:
+      reason='coordinate_frame_changed'
+    elif not 0 <= age_ns <= 500_000_000:
+      reason='cache_expired'
+    elif (_finite(cached.get('imm_d')) is None or
+          abs(meas[1]-float(cached['imm_d'])) > 1.8):
+      reason='lateral_position_disagreement'
+    if reason:
+      # Keep the live measured object/KF; do not attach an old-frame trajectory.
+      d={k:v for k,v in d.items() if not k.startswith('imm_')}
+      d.update(imm_valid=False,imm_api_version=IMM_API_VERSION,
+               imm_skipped_reason=reason,imm_cache_rejected=True,
+               imm_eval_age_ms=round(age_ns/1e6,2))
+      return d
     for k,v in cached.items():
       if k.startswith('imm_'):
         d[k]=v
@@ -490,6 +509,7 @@ class ImmMotionTracker:
         'eval_age_ms':round((now_ns-self.last_eval_ns)/1e6,2),'active_tracks':len(self.tracks),
         'visible_tracks':len(out),'interaction_candidates':len(relevant_candidates),'interaction_relevant_tracks':len(relevant),'skipped_tracks':len(skipped),'valid_tracks':len(valid),'max_tracks':IMM_MAX_TRACKS,
         'measurement_updates':0,'reset_suspect_tracks':0,'expected_reinitializations':0,
+        'cache_rejected_tracks':sum(bool(o.get('imm_cache_rejected')) for o in out),
         'dominant_cv':counts['CV'],'dominant_ca':counts['CA'],'dominant_maneuver':counts['MANEUVER'],
         'maneuver_candidates':sum(1 for o in valid if o.get('imm_maneuver_candidate')),
         'mean_model_probability':means,'models':list(MODEL_NAMES),'horizons_s':list(HORIZONS_S),
@@ -567,4 +587,3 @@ class ImmMotionTracker:
       'interaction_roi_m':{'front':IMM_FRONT_MAX_M,'rear':IMM_REAR_MAX_M,'lateral_primary_abs':IMM_LATERAL_MAX_M,'l2_abs':IMM_L2_MAX_M},'max_tracks':IMM_MAX_TRACKS,
       'control_connected':False,
     }
-

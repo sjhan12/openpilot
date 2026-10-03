@@ -232,6 +232,8 @@ def adjacent_lane_availability(road_model: dict | None) -> dict:
       status, reason = 'CONFIRMED', 'outer_lane_line_confirmed'
     else:
       status, reason = 'UNCERTAIN', 'insufficient_lane_geometry'
+      if not any(_path_y(path,x,clamp=False) is not None for x in LANE_GATE_SAMPLE_X_M):
+        reason = 'path_too_short_for_lane_geometry'
 
     return {
       'status': status,
@@ -278,6 +280,10 @@ def project_to_path(x: float, y: float, road_model: dict | None) -> dict | None:
   if coverage is None:
     return None
   xmin, xmax = coverage
+  # A stopped model can collapse below one metre and reverse its tiny segments.
+  # Their normals are not a reliable lane reference (observed in V46 logs).
+  if xmax-xmin < 2.0:
+    return None
   px, py = float(x), float(y)
   if px < xmin - PATH_BACK_MARGIN_M or px > xmax + PATH_PROJECTION_MARGIN_M:
     return None
@@ -342,6 +348,9 @@ def frenet_to_xy(s: float, d: float, road_model: dict | None) -> tuple[float, fl
     return None
   path = road_model.get('path', [])
   if len(path) < 2:
+    return None
+  coverage = _path_coverage(path)
+  if coverage is None or coverage[1]-coverage[0] < 2.0:
     return None
   target = float(s)
   s_acc = 0.0

@@ -1,4 +1,4 @@
-"""FG14 target-lane membership gate, using measured d history before prediction.
+"""FG15 target-lane membership gate, using measured d history before prediction.
 
 Do not discard display tracks. Exclude only from the requested-side evaluator.
 No central-line/color recognition is claimed by this module.
@@ -61,7 +61,7 @@ class TargetLaneGate:
       disagreement=False
       if h and h['trusted'] and now_ns-h['last']<=350_000_000:
         rows=list(h['rows']); d=rows[-1][1]; offset=abs(d-center)
-        predicted_d=number(o.get('imm_d')) if o.get('imm_valid') else number(o.get('kf_d')) if o.get('kf_frenet_valid') else None
+        predicted_d=number(o.get('imm_d')) if o.get('imm_valid') else number(o.get('kf_d')) if o.get('kalman_valid') and o.get('kf_frenet_valid') else None
         disagreement=bool(predicted_d is not None and abs(predicted_d-d)>1.8 and offset>1.8+1.05)
         # Passenger footprint + additional margin. A physically overlapping
         # boundary object remains relevant even with zero lateral velocity.

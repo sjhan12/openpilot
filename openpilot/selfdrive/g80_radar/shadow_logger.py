@@ -50,7 +50,7 @@ def _compact_obj(o: dict) -> dict:
     'kf_d','kf_d_dot','kf_d_ddot','kf_s_sigma','kf_d_sigma','kf_s_dot_sigma','kf_d_dot_sigma','kf_lane_index','kf_lane','kf_ttlc_s','kf_lateral_motion','kf_motion_confident',
     'kf_lateral_candidate','kf_low_speed_lateral_candidate','kf_cutin_speed_class','kf_cutin_candidate','kf_cutin_confirmed','kf_cutin_score','kf_cutin_persistence_s',
     'kf_lateral_prediction_mode','kf_lateral_prediction_limited',
-    'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason',
+    'imm_valid','imm_api_version','imm_track_key','imm_age_frames','imm_age_s','imm_coord_source','imm_reset_suspect','imm_reset_count','imm_reinit_count','imm_reinit_reason','imm_eval_age_ms','imm_interaction_relevant','imm_skipped_reason','imm_cache_rejected',
     'imm_s','imm_s_dot','imm_s_ddot','imm_d','imm_d_dot','imm_d_ddot','imm_s_sigma','imm_d_sigma','imm_d_dot_sigma',
     'imm_prob_cv','imm_prob_ca','imm_prob_maneuver','imm_dominant_model','imm_lane_index','imm_lane','imm_ttlc_s','imm_motion_confident','imm_maneuver_candidate'
   )
@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V46: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V47: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -146,11 +146,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V46: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V47: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V46 FG14: stock BSD final override; measured outer-lane keeping exclusion; FG13 bounded CHECK and FG12 2D conflict retained; unknown inputs block green; central-line semantics NOT available',
+          'future_gap_policy':'V47 FG15: stock BSD final override; measured outer-lane keeping exclusion; FG13 bounded CHECK and FG12 2D conflict retained; unknown inputs block green; central-line semantics NOT available',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V46 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
+          'web_stage_contract':'V47 seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,
@@ -220,6 +220,10 @@ class ShadowLogger:
       'runtime_versions':core.get('runtime_versions',{}),
       'runtime_mismatch':bool(core.get('runtime_mismatch',False)),
       'coordinate_frame':core.get('coordinate_frame',{}),
+      # Preserve geometry inputs so CHECK ROAD can be replayed without guessing
+      # lane-line positions from probabilities alone. No images are recorded.
+      'road_geometry_input':{k:(core.get('road_model',{}) or {}).get(k)
+                             for k in ('valid','fresh','age_ms','path','lane_lines','road_edges')},
       'road_model_summary':{
         'fresh':(core.get('road_model',{}) or {}).get('fresh'),
         'age_ms':(core.get('road_model',{}) or {}).get('age_ms'),
