@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 47
-BUILD_TAG = 'v47-web7-legacy-visual-fg15-bsd-target-lane-path-sign-raw-commit-latch-webfix-signal-source-lock-goldenv2-coordinate-cache-guard1'
+BUILD_VERSION = 48
+BUILD_TAG = 'v48h-web8h-log-tuned-geometry-rear28-front44-fg15-bsd-target-lane-path-sign-raw-commit-latch-source-lock-goldenv2-coordinate-cache-guard1'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
