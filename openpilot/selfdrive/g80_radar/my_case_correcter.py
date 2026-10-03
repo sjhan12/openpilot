@@ -22,6 +22,7 @@ Default key map (Linux EV_KEY codes):
   F18 188 = RIGHT DANGER
 """
 
+import uuid
 import math
 import csv
 import glob
@@ -39,8 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "g80_v49_ml_case_v1"
-COLLECTOR_VERSION = 2
+SCHEMA = "g80_v49_ml_case_v2"
+COLLECTOR_VERSION = 3
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -58,6 +59,11 @@ DEFAULT_KEYMAP = {
   KEY_F17: ("RIGHT", "CHECK"),
   KEY_F18: ("RIGHT", "DANGER"),
 }
+
+EGO_EXTRA_FIELDS = ('steeringRateDeg', 'steeringTorque', 'steeringPressed',
+                    'yawRate', 'lateralAcceleration', 'brakePressed', 'gasPressed')
+EGO_BOOL_FIELDS = {'steeringPressed', 'brakePressed', 'gasPressed'}
+
 
 # Native Linux struct input_event on comma four/aarch64:
 #   struct timeval { long sec; long usec; }; u16 type; u16 code; s32 value
@@ -253,7 +259,7 @@ class _InputThread(threading.Thread):
 
 class _PendingCase:
   def __init__(self, press: KeyPress, start_ns: int, end_ns: int, part_path: Path, final_path: Path,
-               pre_s: float, post_s: float, build_meta: dict):
+               pre_s: float, post_s: float, build_meta: dict, session_id: str):
     self.press = press
     self.start_ns = int(start_ns)
     self.end_ns = int(end_ns)
@@ -266,6 +272,16 @@ class _PendingCase:
     self.last_written_ns = 0
     meta = {
       'type': 'case_meta', 'schema': SCHEMA, 'collector_version': COLLECTOR_VERSION,
+      'session_id': session_id,
+      'label_scope': 'selected_side_at_key_receipt; not every frame in window',
+      'label_clock': 'userspace time.monotonic_ns at key receipt; human reaction delay unknown',
+      'window_usage': {
+        'prediction_input': 'frames with mono_ns <= press_mono_ns only',
+        'post_trigger': 'outcome_validation_only; exclude from current-time prediction inputs',
+        'post_duration_sec': float(post_s),
+        'outcome_is_ground_truth': False,
+        'note': 'Post frames are observations; no executed lane change or safety outcome is assumed.'
+      },
       'side': press.side, 'label': press.label, 'key_code': press.code,
       'key_device': press.device, 'press_mono_ns': int(press.mono_ns),
       'pre_sec': float(pre_s), 'post_sec': float(post_s),
@@ -316,6 +332,13 @@ class MLCaseCollector:
     self.min_interval_ns = int(1e9 / self.sample_hz)
     self.ring = deque()  # (mono_ns, serialized frame); RAM only
     self.last_sample_ns = 0
+    self.session_id = uuid.uuid4().hex
+    self._ego_extra = {k: None for k in EGO_EXTRA_FIELDS}
+    self._ego_present = {k: False for k in EGO_EXTRA_FIELDS}
+    self._ego_recv_ns = 0
+    self._ego_log_ns = 0
+    self._ego_valid = False
+    self._ego_updates = 0
     self.key_q: queue.SimpleQueue = queue.SimpleQueue()
     self.stop_evt = threading.Event()
     self.pending: list[_PendingCase] = []
@@ -327,6 +350,49 @@ class MLCaseCollector:
     if start_keyboard:
       self._thread = _InputThread(self.key_q, DEFAULT_KEYMAP, self.stop_evt)
       self._thread.start()
+
+  def update_ego(self, car_state, recv_ns: int, log_ns: int = 0, valid: bool = True):
+    """Called at the existing live_service carState receive point.
+
+    Missing schema fields are null, never inferred from zero. A present Cap'n
+    Proto default value does NOT prove that the vehicle supplies that signal.
+    """
+    try:
+      values = {}; present = {}
+      for key in EGO_EXTRA_FIELDS:
+        try:
+          value = car_state[key] if isinstance(car_state, dict) else getattr(car_state, key)
+          present[key] = value is not None
+          if key in EGO_BOOL_FIELDS:
+            values[key] = bool(value) if value is not None else None
+          else:
+            values[key] = _finite_or_none(value)
+        except Exception:
+          present[key] = False
+          values[key] = None
+      self._ego_extra = values
+      self._ego_present = present
+      self._ego_recv_ns = int(recv_ns)
+      self._ego_log_ns = int(log_ns)
+      self._ego_valid = bool(valid)
+      self._ego_updates += 1
+    except Exception as e:
+      self.last_error = 'update_ego: ' + repr(e)
+
+  def _add_ego_extension(self, frame: dict, now_ns: int):
+    age_ms = (now_ns-self._ego_recv_ns)/1e6 if self._ego_recv_ns else None
+    fresh = bool(self._ego_valid and age_ms is not None and 0 <= age_ms <= 500)
+    ego = dict(frame.get('ego_state') or {})
+    # Keep original vEgo/aEgo/angle/blinker fields exactly as supplied by V49.
+    ego.update(self._ego_extra)
+    frame['ego_state'] = ego
+    frame['ego_state_extension_meta'] = {
+      'source': 'carState', 'hook_received': bool(self._ego_updates),
+      'recv_mono_ns': self._ego_recv_ns or None, 'message_log_mono_ns': self._ego_log_ns or None,
+      'message_valid': self._ego_valid, 'age_ms': age_ms, 'fresh': fresh,
+      'schema_field_present': dict(self._ego_present),
+      'sensor_support_verified': False,
+      'note': 'Stored values may be stale or schema defaults. Use freshness and verify vehicle support; absent fields are null.'}
 
   def enabled(self) -> bool:
     return not self.disable_marker.exists()
@@ -378,7 +444,7 @@ class MLCaseCollector:
     start_ns = press.mono_ns - int(self.pre_s * 1e9)
     end_ns = press.mono_ns + int(self.post_s * 1e9)
     part, final = self._paths(press)
-    p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.post_s, build_meta)
+    p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.post_s, build_meta, self.session_id)
     try:
       for mono_ns, line in self.ring:
         p.add(mono_ns, line)
@@ -417,6 +483,8 @@ class MLCaseCollector:
       self.last_sample_ns = now_ns
 
       frame = _compact_frame(core, raw_objects, filtered_objects, now_ns)
+      frame['session_id'] = self.session_id
+      self._add_ego_extension(frame, now_ns)
       line = json.dumps(frame, separators=(',', ':'), allow_nan=False)
       self.ring.append((now_ns, line))
       self._trim_ring(now_ns)
@@ -462,6 +530,8 @@ class MLCaseCollector:
   def status(self) -> dict:
     return {
       'schema': SCHEMA, 'collector_version': COLLECTOR_VERSION, 'enabled': self.enabled(),
+      'session_id': self.session_id, 'ego_extension_hook_received': bool(self._ego_updates),
+      'ego_extension_fields_present': dict(self._ego_present),
       'keyboard_running': bool(self._thread and self._thread.is_alive()),
       'input_devices': len(self._thread.fds) if self._thread else 0, 'pre_sec': self.pre_s, 'post_sec': self.post_s,
       'sample_hz': self.sample_hz, 'ram_frames': len(self.ring), 'pending_cases': len(self.pending),

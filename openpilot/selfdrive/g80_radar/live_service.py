@@ -570,6 +570,12 @@ def main():
     csmsg=messaging.recv_one_or_none(carstate_sock)
     if csmsg is not None:
       cs_recv_ns=time.monotonic_ns()
+      # ML_COLLECTOR_V3_EGO_HOOK
+      try:
+        if ml_case_collector is not None:
+          ml_case_collector.update_ego(csmsg.carState, cs_recv_ns, int(csmsg.logMonoTime), bool(csmsg.valid))
+      except Exception:
+        pass
       bsd_monitor.refresh_support(cs_recv_ns)
       bsd_monitor.update(csmsg.carState,cs_recv_ns,int(csmsg.logMonoTime),bool(csmsg.valid))
       carstate_valid=bool(bsd_monitor.valid)
