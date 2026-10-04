@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""G80 V49 event-triggered ML case collector.
+"""G80 V50 event-triggered ML case collector.
 
 Design goals
 ------------
 * NO continuous training-data writes.
 * Keep only a short history in RAM.
+* Fast 10 Hz training snapshot + 2 Hz diagnostic context.
+* Disk/gzip work is deferred to a background writer after the post window.
 * A keypad press creates one labelled case containing PRE seconds before the
   press and POST seconds after the press.
-* Runs inside V49 g80radard/live_service so training data is exactly the V49
+* Runs inside V50 g80radard/live_service so training data is exactly the V50
   state that a later inference module can consume.
-* Collector failures must never stop V49 radar monitoring.
+* Collector failures must never stop V50 radar monitoring.
 
 Default key map (Linux EV_KEY codes):
   F13 183 = LEFT SAFE
@@ -40,8 +42,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "g80_v49_ml_case_v2"
-COLLECTOR_VERSION = 3
+SCHEMA = "g80_v50_ml_case_v1"
+COLLECTOR_VERSION = 5
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -105,7 +107,7 @@ def _plain(v: Any):
 
 
 def _compact_object(o: dict) -> dict:
-  """Keep V49 identity, geometry, motion and provenance fields for ML/replay."""
+  """Keep V50 identity, geometry, motion and provenance fields for ML/replay."""
   # Full trajectories are intentionally retained: approaching/cut-in history is
   # valuable for training, and data is written only on labelled events.
   keys = (
@@ -139,7 +141,7 @@ def _compact_object(o: dict) -> dict:
 
 
 def _compact_frame(core: dict, raw_objects, filtered_objects, now_ns: int) -> dict:
-  """Snapshot inputs useful to a later PC-trained V49 inference model."""
+  """Snapshot inputs useful to a later PC-trained V50 inference model."""
   return {
     'type': 'frame',
     'mono_ns': int(now_ns),
@@ -153,7 +155,7 @@ def _compact_frame(core: dict, raw_objects, filtered_objects, now_ns: int) -> di
     'front_sensor_objects': [_compact_object(o) for o in (core.get('front_sensor_objects', []) or [])],
     'corner_fused_objects': [_compact_object(o) for o in (core.get('corner_fused_objects', []) or [])],
     'camera_leads': [_compact_object(o) for o in (core.get('camera_leads', []) or [])],
-    # V49 raw/validity-gated radar snapshots are supplied directly by live_service,
+    # V50 raw/validity-gated radar snapshots are supplied directly by live_service,
     # so this collector does not need to keep the browser awake.
     'raw_objects': [_compact_object(o) for o in (raw_objects or [])],
     'filtered_objects': [_compact_object(o) for o in (filtered_objects or [])],
@@ -257,7 +259,105 @@ class _InputThread(threading.Thread):
           self.out_q.put(KeyPress(now_ns, int(code), side, label, name))
 
 
+
+def _compact_road_model(road: dict) -> dict:
+  """Keep only lane/path geometry needed by the ML model at the fast rate."""
+  road = road or {}
+  keys = (
+    'valid','fresh','age_ms','curve_direction','path','lane_lines','road_edges',
+    'lane_line_probs','road_edge_stds','confident_lane_lines','path_x_min_m','path_x_max_m',
+    'path_y_20m','path_y_40m','path_y_60m','lane_width_m','left_lane_width_m','right_lane_width_m',
+  )
+  return {k: _plain(road.get(k)) for k in keys if k in road and road.get(k) is not None}
+
+
+def _compact_gap_side(side: dict) -> dict:
+  side = side or {}
+  evidence = side.get('fg12_evidence') or side.get('fg11_evidence') or side.get('fg10_evidence') or {}
+  return {
+    'target_lane': side.get('target_lane'),
+    'target_lane_index': side.get('target_lane_index'),
+    'incoming_count': side.get('incoming_count'),
+    'stable_incoming_count': side.get('stable_incoming_count'),
+    'possible_incoming_count': side.get('possible_incoming_count'),
+    'min_front_clearance_during_ego_overlap_m': side.get('min_front_clearance_during_ego_overlap_m'),
+    'min_rear_clearance_during_ego_overlap_m': side.get('min_rear_clearance_during_ego_overlap_m'),
+    'min_boundary_clearance_during_ego_overlap_m': side.get('min_boundary_clearance_during_ego_overlap_m'),
+    'min_abs_separation_during_ego_overlap_m': side.get('min_abs_separation_during_ego_overlap_m'),
+    'current_front_ttc_ca_s': side.get('current_front_ttc_ca_s'),
+    'current_rear_ttc_ca_s': side.get('current_rear_ttc_ca_s'),
+    'decision': _plain(side.get('decision', {})),
+    'bsd_state': side.get('bsd_state'),
+    'lane_availability': _plain(side.get('lane_availability', {})),
+    'evidence_summary': {
+      k: _plain(evidence.get(k)) for k in (
+        'current_front_gap_m','current_rear_gap_m','predicted_front_min_m','predicted_rear_min_m',
+        'near_future_predicted_count','near_future_confirmed_count','tts3_confirmed_count',
+        'tts3_candidate_count','tts5_watch_count','conflict3_confirmed_count',
+        'min_confirmed_time_to_side_s','min_candidate_time_to_side_s','min_watch_time_to_side_s',
+        'min_time_to_side_s','min_2d_conflict_time_s') if evidence.get(k) is not None
+    },
+  }
+
+
+def _compact_future_gap(fg: dict) -> dict:
+  fg = fg or {}
+  return {
+    'api_version': fg.get('api_version'),
+    'mode': fg.get('mode'),
+    'decision_enabled': fg.get('decision_enabled'),
+    'decision_shadow_only': fg.get('decision_shadow_only'),
+    'centerline_recognition_available': fg.get('centerline_recognition_available'),
+    'bsd': _plain(fg.get('bsd', {})),
+    'monitor_health': _plain(fg.get('monitor_health', {})),
+    'driver_intent': _plain(fg.get('driver_intent', {})),
+    'lane_availability': _plain(fg.get('lane_availability', {})),
+    'stats': _plain(fg.get('stats', {})),
+    'left': _compact_gap_side(fg.get('left', {})),
+    'right': _compact_gap_side(fg.get('right', {})),
+  }
+
+
+def _fast_frame(core: dict, now_ns: int) -> dict:
+  """10 Hz ML input snapshot. Avoid duplicate view arrays and huge FG internals."""
+  return {
+    'type': 'frame',
+    'frame_kind': 'training_fast',
+    'mono_ns': int(now_ns),
+    'runtime_versions': _plain(core.get('runtime_versions', {})),
+    'runtime_mismatch': bool(core.get('runtime_mismatch', False)),
+    'coordinate_frame': _plain(core.get('coordinate_frame', {})),
+    'ego_state': _plain(core.get('ego_state', {})),
+    'road_model': _compact_road_model(core.get('road_model', {})),
+    # Canonical360 is the intended ML object input. Keep the rich per-object fields/trajectories.
+    'sensor_fused_objects': [_compact_object(o) for o in (core.get('sensor_fused_objects', []) or [])],
+    'future_gap_summary': _compact_future_gap(core.get('future_gap', {})),
+    'scc_teacher': _plain(core.get('scc_teacher', {})),
+    'teacher_rear': _plain(core.get('teacher_rear', [])),
+  }
+
+
+def _context_detail(core: dict, raw_objects, filtered_objects) -> dict:
+  """2 Hz diagnostic snapshot retained so later fusion/debug work is still possible."""
+  return {
+    'raw_objects': [_compact_object(o) for o in (raw_objects or [])],
+    'filtered_objects': [_compact_object(o) for o in (filtered_objects or [])],
+    'radar_fused_objects': [_compact_object(o) for o in (core.get('radar_fused_objects', []) or [])],
+    'front_sensor_objects': [_compact_object(o) for o in (core.get('front_sensor_objects', []) or [])],
+    'corner_fused_objects': [_compact_object(o) for o in (core.get('corner_fused_objects', []) or [])],
+    'camera_leads': [_compact_object(o) for o in (core.get('camera_leads', []) or [])],
+    'future_gap_full': _plain(core.get('future_gap', {})),
+    'zones': _plain(core.get('zones', {})),
+    'canonical_tracker_stats': _plain(core.get('canonical_tracker_stats', {})),
+    'kalman_motion_stats': _plain(core.get('kalman_motion_stats', {})),
+    'imm_motion_stats': _plain(core.get('imm_motion_stats', {})),
+    'camera_fusion_stats': _plain(core.get('camera_fusion_stats', {})),
+    'corner_fusion_stats': _plain(core.get('corner_fusion_stats', {})),
+  }
+
+
 class _PendingCase:
+  """RAM-only pending case. No filesystem/gzip calls occur on the radar loop."""
   def __init__(self, press: KeyPress, start_ns: int, end_ns: int, part_path: Path, final_path: Path,
                pre_s: float, post_s: float, build_meta: dict, session_id: str):
     self.press = press
@@ -265,12 +365,12 @@ class _PendingCase:
     self.end_ns = int(end_ns)
     self.part_path = part_path
     self.final_path = final_path
-    self.fp = gzip.open(part_path, 'wt', encoding='utf-8', compresslevel=3)
     self.frame_count = 0
     self.first_frame_ns = 0
     self.last_frame_ns = 0
     self.last_written_ns = 0
-    meta = {
+    self.frames: list[dict] = []
+    self.meta = {
       'type': 'case_meta', 'schema': SCHEMA, 'collector_version': COLLECTOR_VERSION,
       'session_id': session_id,
       'label_scope': 'selected_side_at_key_receipt; not every frame in window',
@@ -282,56 +382,127 @@ class _PendingCase:
         'outcome_is_ground_truth': False,
         'note': 'Post frames are observations; no executed lane change or safety outcome is assumed.'
       },
+      'performance_profile': {
+        'training_fast_hz': None,
+        'diagnostic_context_hz': None,
+        'writer': 'background JSON+gzip after post window; no serialization/disk I/O in radar publish loop',
+        'shadow_log_required_for_training': False,
+      },
       'side': press.side, 'label': press.label, 'key_code': press.code,
       'key_device': press.device, 'press_mono_ns': int(press.mono_ns),
       'pre_sec': float(pre_s), 'post_sec': float(post_s),
       'window_start_ns': int(start_ns), 'window_end_ns': int(end_ns),
       'created_wall_time': datetime.now().astimezone().isoformat(timespec='milliseconds'),
       'build': _plain(build_meta),
-      'note': 'Frames before press came from RAM ring buffer; disk file is created only after a label key press.',
+      'note': 'Pre/post frames are RAM buffered. File creation/compression happens on a background writer only after capture.',
     }
-    self.fp.write(json.dumps(meta, separators=(',', ':')) + '\n')
 
-  def add(self, mono_ns: int, line: str):
+  def add(self, mono_ns: int, frame: dict):
     mono_ns = int(mono_ns)
     if mono_ns < self.start_ns or mono_ns > self.end_ns or mono_ns <= self.last_written_ns:
       return
-    self.fp.write(line + '\n')
+    self.frames.append(frame)
     self.frame_count += 1
     if not self.first_frame_ns:
       self.first_frame_ns = mono_ns
     self.last_frame_ns = mono_ns
     self.last_written_ns = mono_ns
 
-  def finish(self):
-    end = {
-      'type': 'case_end', 'frame_count': int(self.frame_count),
+  def finish_record(self, truncated: bool = False) -> dict:
+    return {
+      'type': 'case_end', 'frame_count': int(self.frame_count), 'truncated': bool(truncated),
       'first_frame_ns': int(self.first_frame_ns), 'last_frame_ns': int(self.last_frame_ns),
       'actual_pre_sec': None if not self.first_frame_ns else round((self.press.mono_ns - self.first_frame_ns) / 1e9, 3),
       'actual_post_sec': None if not self.last_frame_ns else round((self.last_frame_ns - self.press.mono_ns) / 1e9, 3),
     }
-    self.fp.write(json.dumps(end, separators=(',', ':')) + '\n')
-    self.fp.close()
-    os.replace(self.part_path, self.final_path)
 
-  def abort(self):
+
+class _CaseWriter(threading.Thread):
+  """Background-only gzip/file writer so ML labels cannot block V50 rendering/fusion."""
+  def __init__(self, owner):
+    super().__init__(name='g80-ml-writer', daemon=True)
+    self.owner = owner
+    self.q: queue.Queue = queue.Queue(maxsize=16)
+
+  def submit(self, p: _PendingCase, truncated: bool = False) -> bool:
     try:
-      self.fp.close()
+      self.q.put_nowait((p, bool(truncated)))
+      return True
+    except queue.Full:
+      self.owner.last_error = 'ML writer queue full; case not saved'
+      return False
+
+  def _manifest(self, p: _PendingCase):
+    path = self.owner.base_dir / 'manifest.csv'
+    new = not path.exists()
+    self.owner.base_dir.mkdir(parents=True, exist_ok=True)
+    with path.open('a', newline='', encoding='utf-8') as f:
+      w = csv.writer(f)
+      if new:
+        w.writerow(['file','side','label','press_mono_ns','frames','actual_pre_sec','actual_post_sec'])
+      pre = '' if not p.first_frame_ns else round((p.press.mono_ns - p.first_frame_ns) / 1e9, 3)
+      post = '' if not p.last_frame_ns else round((p.last_frame_ns - p.press.mono_ns) / 1e9, 3)
+      w.writerow([str(p.final_path.relative_to(self.owner.base_dir)), p.press.side, p.press.label,
+                  p.press.mono_ns, p.frame_count, pre, post])
+
+  def _write(self, p: _PendingCase, truncated: bool):
+    try:
+      p.final_path.parent.mkdir(parents=True, exist_ok=True)
+      p.meta['performance_profile']['training_fast_hz'] = self.owner.sample_hz
+      p.meta['performance_profile']['diagnostic_context_hz'] = self.owner.context_hz
+      with gzip.open(p.part_path, 'wt', encoding='utf-8', compresslevel=1) as fp:
+        fp.write(json.dumps(p.meta, separators=(',', ':')) + '\n')
+        for frame in p.frames:
+          fp.write(json.dumps(frame, separators=(',', ':'), allow_nan=False) + '\n')
+        fp.write(json.dumps(p.finish_record(truncated), separators=(',', ':')) + '\n')
+      os.replace(p.part_path, p.final_path)
+      self._manifest(p)
+      self.owner.saved_cases += 1
+      self.owner.last_saved_file = str(p.final_path)
+      print(f'[G80 ML] saved {p.final_path} ({p.frame_count} frames, bg writer)', flush=True)
+    except Exception as e:
+      self.owner.last_error = 'writer: ' + repr(e)
+      try:
+        if p.part_path.exists():
+          p.part_path.unlink()
+      except Exception:
+        pass
+
+  def run(self):
+    while True:
+      item = self.q.get()
+      try:
+        if item is None:
+          return
+        p, truncated = item
+        self._write(p, truncated)
+      finally:
+        self.q.task_done()
+
+  def close(self):
+    try:
+      self.q.put(None, timeout=0.5)
     except Exception:
-      pass
+      return
+    self.join(timeout=3.0)
 
 
 class MLCaseCollector:
-  """RAM-history + key-triggered case recorder for V49."""
+  """Low-overhead RAM history + key-triggered labelled case recorder for V50."""
   def __init__(self, start_keyboard: bool = True):
-    self.base_dir = Path(os.getenv('G80_ML_CASE_DIR', '/data/radar/ml_cases_v49'))
+    self.base_dir = Path(os.getenv('G80_ML_CASE_DIR', '/data/radar/ml_cases_v50'))
     self.disable_marker = Path(os.getenv('G80_ML_DISABLE_MARKER', '/data/radar/DISABLE_G80_ML_CASES'))
     self.pre_s = _env_number('G80_ML_PRE_SEC', 5.0, 1.0, 15.0)
     self.post_s = _env_number('G80_ML_POST_SEC', 3.0, 1.0, 15.0)
     self.sample_hz = _env_number('G80_ML_SAMPLE_HZ', 10.0, 2.0, 10.0)
+    self.context_hz = _env_number('G80_ML_CONTEXT_HZ', 2.0, 0.5, 4.0)
+    self.idle_hz = _env_number('G80_ML_IDLE_HZ', 2.0, 0.5, 5.0)
     self.min_interval_ns = int(1e9 / self.sample_hz)
-    self.ring = deque()  # (mono_ns, serialized frame); RAM only
+    self.context_interval_ns = int(1e9 / self.context_hz)
+    self.idle_interval_ns = int(1e9 / self.idle_hz)
+    self.ring = deque()  # (mono_ns, compact plain-Python frame); RAM only
     self.last_sample_ns = 0
+    self.last_context_ns = 0
     self.session_id = uuid.uuid4().hex
     self._ego_extra = {k: None for k in EGO_EXTRA_FIELDS}
     self._ego_present = {k: False for k in EGO_EXTRA_FIELDS}
@@ -346,17 +517,16 @@ class MLCaseCollector:
     self.saved_cases = 0
     self.last_saved_file = ''
     self.last_error = ''
+    self._enabled_cache = True
+    self._enabled_check_ns = 0
     self._thread = None
     if start_keyboard:
       self._thread = _InputThread(self.key_q, DEFAULT_KEYMAP, self.stop_evt)
       self._thread.start()
+    self._writer = _CaseWriter(self)
+    self._writer.start()
 
   def update_ego(self, car_state, recv_ns: int, log_ns: int = 0, valid: bool = True):
-    """Called at the existing live_service carState receive point.
-
-    Missing schema fields are null, never inferred from zero. A present Cap'n
-    Proto default value does NOT prove that the vehicle supplies that signal.
-    """
     try:
       values = {}; present = {}
       for key in EGO_EXTRA_FIELDS:
@@ -383,7 +553,6 @@ class MLCaseCollector:
     age_ms = (now_ns-self._ego_recv_ns)/1e6 if self._ego_recv_ns else None
     fresh = bool(self._ego_valid and age_ms is not None and 0 <= age_ms <= 500)
     ego = dict(frame.get('ego_state') or {})
-    # Keep original vEgo/aEgo/angle/blinker fields exactly as supplied by V49.
     ego.update(self._ego_extra)
     frame['ego_state'] = ego
     frame['ego_state_extension_meta'] = {
@@ -394,11 +563,14 @@ class MLCaseCollector:
       'sensor_support_verified': False,
       'note': 'Stored values may be stale or schema defaults. Use freshness and verify vehicle support; absent fields are null.'}
 
-  def enabled(self) -> bool:
-    return not self.disable_marker.exists()
+  def enabled(self, now_ns: int | None = None) -> bool:
+    now_ns = int(now_ns or time.monotonic_ns())
+    if now_ns - self._enabled_check_ns >= 1_000_000_000 or self._enabled_check_ns == 0:
+      self._enabled_cache = not self.disable_marker.exists()
+      self._enabled_check_ns = now_ns
+    return self._enabled_cache
 
   def inject_label(self, side: str, label: str, press_ns: int | None = None):
-    """Test hook; not used by normal driving."""
     side = side.upper(); label = label.upper()
     code = next((k for k, v in DEFAULT_KEYMAP.items() if v == (side, label)), 0)
     if not code:
@@ -414,7 +586,6 @@ class MLCaseCollector:
   def _paths(self, press: KeyPress) -> tuple[Path, Path]:
     day = datetime.now().astimezone().strftime('%Y%m%d')
     out_dir = self.base_dir / day
-    out_dir.mkdir(parents=True, exist_ok=True)
     wall = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')[:-3]
     self.counter += 1
     stem = f'{wall}_{press.side}_{press.label}_{self.counter:04d}'
@@ -422,37 +593,20 @@ class MLCaseCollector:
     part = out_dir / f'{stem}.jsonl.gz.part'
     return part, final
 
-  def _manifest(self, p: _PendingCase):
-    path = self.base_dir / 'manifest.csv'
-    new = not path.exists()
-    self.base_dir.mkdir(parents=True, exist_ok=True)
-    with path.open('a', newline='', encoding='utf-8') as f:
-      w = csv.writer(f)
-      if new:
-        w.writerow(['file','side','label','press_mono_ns','frames','actual_pre_sec','actual_post_sec'])
-      pre = '' if not p.first_frame_ns else round((p.press.mono_ns - p.first_frame_ns) / 1e9, 3)
-      post = '' if not p.last_frame_ns else round((p.last_frame_ns - p.press.mono_ns) / 1e9, 3)
-      w.writerow([str(p.final_path.relative_to(self.base_dir)), p.press.side, p.press.label,
-                  p.press.mono_ns, p.frame_count, pre, post])
-
   def _start_case(self, press: KeyPress, build_meta: dict):
-    if not self.enabled():
+    if not self.enabled(press.mono_ns):
       return
     if len(self.pending) >= 8:
-      self.last_error = "Too many pending cases (limit 8)"
+      self.last_error = 'Too many pending cases (limit 8)'
       return
     start_ns = press.mono_ns - int(self.pre_s * 1e9)
     end_ns = press.mono_ns + int(self.post_s * 1e9)
     part, final = self._paths(press)
     p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.post_s, build_meta, self.session_id)
-    try:
-      for mono_ns, line in self.ring:
-        p.add(mono_ns, line)
-    except Exception:
-      p.abort()
-      raise
+    for mono_ns, frame in self.ring:
+      p.add(mono_ns, frame)
     self.pending.append(p)
-    print(f'[G80 ML] {press.side} {press.label} -> capture {self.pre_s:.1f}s before / {self.post_s:.1f}s after', flush=True)
+    print(f'[G80 ML] {press.side} {press.label} -> RAM capture {self.pre_s:.1f}s before / {self.post_s:.1f}s after', flush=True)
 
   def _finish_due(self, now_ns: int):
     keep = []
@@ -460,51 +614,9 @@ class MLCaseCollector:
       if now_ns < p.end_ns:
         keep.append(p)
         continue
-      try:
-        p.finish()
-        self._manifest(p)
-        self.saved_cases += 1
-        self.last_saved_file = str(p.final_path)
-        print(f'[G80 ML] saved {p.final_path} ({p.frame_count} frames)', flush=True)
-      except Exception as e:
-        self.last_error = repr(e)
-        p.abort()
+      if not self._writer.submit(p, False):
+        self.last_error = 'writer queue full; finished case dropped'
     self.pending = keep
-
-  def update(self, core: dict, now_ns: int, raw_objects=None, filtered_objects=None):
-    """Call once per V49 publish loop (10 Hz). Never raises into live_service."""
-    try:
-      now_ns = int(now_ns)
-      # Even when disabled, finish already-triggered cases cleanly; do not start new ones.
-      if self.last_sample_ns and now_ns - self.last_sample_ns < self.min_interval_ns * 0.85:
-        self._drain_keys(core.get('runtime_versions', {}))
-        self._finish_due(now_ns)
-        return
-      self.last_sample_ns = now_ns
-
-      frame = _compact_frame(core, raw_objects, filtered_objects, now_ns)
-      frame['session_id'] = self.session_id
-      self._add_ego_extension(frame, now_ns)
-      line = json.dumps(frame, separators=(',', ':'), allow_nan=False)
-      self.ring.append((now_ns, line))
-      self._trim_ring(now_ns)
-
-      # Existing cases receive the current post-trigger frame.
-      healthy = []
-      for p in self.pending:
-        try:
-          p.add(now_ns, line)
-          healthy.append(p)
-        except Exception as e:
-          self.last_error = repr(e)
-          p.abort()
-      self.pending = healthy
-
-      self._drain_keys(core.get('runtime_versions', {}))
-      self._finish_due(now_ns)
-    except Exception as e:
-      self.last_error = repr(e)
-      # This module is monitor-only. V49 must continue even if storage/HID fails.
 
   def _drain_keys(self, build_meta: dict):
     while True:
@@ -517,15 +629,62 @@ class MLCaseCollector:
       except Exception as e:
         self.last_error = repr(e)
 
+  def _idle_state(self, core: dict) -> bool:
+    ego = core.get('ego_state', {}) or {}
+    try:
+      v = abs(float(ego.get('vEgo', 0.0) or 0.0))
+    except Exception:
+      v = 0.0
+    return (v < 0.5 and not bool(ego.get('leftBlinker')) and not bool(ego.get('rightBlinker'))
+            and len(core.get('sensor_fused_objects', []) or []) == 0 and not self.pending)
+
+  def update(self, core: dict, now_ns: int, raw_objects=None, filtered_objects=None):
+    """Call once per V50 publish loop. No filesystem/gzip work is done here."""
+    try:
+      now_ns = int(now_ns)
+      self._drain_keys(core.get('runtime_versions', {}))
+
+      if not self.enabled(now_ns) and not self.pending:
+        if self.ring:
+          self.ring.clear()
+        return
+
+      interval_ns = self.idle_interval_ns if self._idle_state(core) else self.min_interval_ns
+      if self.last_sample_ns and now_ns - self.last_sample_ns < interval_ns * 0.85:
+        self._finish_due(now_ns)
+        return
+      self.last_sample_ns = now_ns
+
+      frame = _fast_frame(core, now_ns)
+      frame['session_id'] = self.session_id
+      self._add_ego_extension(frame, now_ns)
+
+      # Expensive duplicate/raw/full-rule snapshots are only added at 2 Hz.
+      if self.last_context_ns == 0 or now_ns - self.last_context_ns >= self.context_interval_ns * 0.85:
+        frame['context_detail'] = _context_detail(core, raw_objects, filtered_objects)
+        self.last_context_ns = now_ns
+
+      # V50: no json.dumps() in the radar publish loop. Serialize only in the background writer.
+      self.ring.append((now_ns, frame))
+      self._trim_ring(now_ns)
+
+      for p in self.pending:
+        p.add(now_ns, frame)
+      self._finish_due(now_ns)
+    except Exception as e:
+      self.last_error = repr(e)
+
   def close(self):
     self.stop_evt.set()
     if self._thread is not None:
       self._thread.join(timeout=0.6)
       for fd in list(self._thread.fds):
         self._thread._drop(fd)
+    # Preserve already-labelled data on a normal shutdown, marking incomplete post windows.
     for p in self.pending:
-      p.abort()
+      self._writer.submit(p, True)
     self.pending.clear()
+    self._writer.close()
 
   def status(self) -> dict:
     return {
@@ -533,15 +692,20 @@ class MLCaseCollector:
       'session_id': self.session_id, 'ego_extension_hook_received': bool(self._ego_updates),
       'ego_extension_fields_present': dict(self._ego_present),
       'keyboard_running': bool(self._thread and self._thread.is_alive()),
-      'input_devices': len(self._thread.fds) if self._thread else 0, 'pre_sec': self.pre_s, 'post_sec': self.post_s,
-      'sample_hz': self.sample_hz, 'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
+      'input_devices': len(self._thread.fds) if self._thread else 0,
+      'pre_sec': self.pre_s, 'post_sec': self.post_s,
+      'sample_hz': self.sample_hz, 'context_hz': self.context_hz, 'idle_hz': self.idle_hz,
+      'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
+      'writer_queue': self._writer.q.qsize(),
       'saved_cases': self.saved_cases, 'last_saved_file': self.last_saved_file,
       'output_dir': str(self.base_dir), 'last_error': self.last_error,
+      'disk_policy': 'labelled ML cases only; background writer',
+      'serialization_policy': 'RAM dict only in radar loop; JSON+gzip only in background writer',
     }
 
 
 def _key_test():
-  print('G80 V49 ML keypad test. Press F13..F18; Ctrl-C to stop.')
+  print('G80 V50 ML keypad test. Press F13..F18; Ctrl-C to stop.')
   print('F13 LEFT SAFE | F14 LEFT CHECK | F15 LEFT DANGER | F16 RIGHT SAFE | F17 RIGHT CHECK | F18 RIGHT DANGER')
   q = queue.SimpleQueue(); stop = threading.Event(); t = _InputThread(q, DEFAULT_KEYMAP, stop); t.start()
   try:
@@ -560,4 +724,4 @@ if __name__ == '__main__':
   if '--key-test' in sys.argv:
     _key_test()
   else:
-    print('This module is integrated into V49 live_service. Use --key-test to test the two keypads.')
+    print('This module is integrated into V50 live_service. Use --key-test to test the two keypads.')

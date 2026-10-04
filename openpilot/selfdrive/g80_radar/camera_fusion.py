@@ -155,6 +155,26 @@ def _strong_cross_sensor_evidence(a, b):
   return False
 
 
+def _time_aligned_duplicate(a, b):
+  """Short radar slot handoff: compare at the newer receive time, not old x.
+
+  No extrapolated coordinates enter the output. Keep the existing 4.8 m group
+  envelope and complete-link guard; never apply this fallback to camera-only
+  hypotheses, opposite motion, missing time/speed, or adjacent-lane returns.
+  """
+  if a.get('source') not in ('corner_fused', 'front_track') or b.get('source') not in ('corner_fused', 'front_track'):
+    return False
+  vals = [_finite(o.get(k)) for o in (a, b) for k in ('x', 'y', 'vx', 'recv_ns')]
+  if any(v is None for v in vals): return False
+  ax, ay, av, at, bx, by, bv, bt = vals
+  dt = abs(at-bt)/1e9
+  if min(at,bt) <= 0 or not .01 <= dt <= .25: return False
+  if abs(ay-by) > .8 or abs(av-bv) > 1.5 or av*bv <= 0 or min(abs(av),abs(bv)) < 6: return False
+  newest = max(at,bt)
+  aligned_dx = abs(ax+av*(newest-at)/1e9-bx-bv*(newest-bt)/1e9)
+  return aligned_dx <= 1.5 and aligned_dx < abs(ax-bx)-.2
+
+
 def _pair_vehicle_compatible(a, b):
   """True when two detections can fit inside one passenger-car footprint.
 
@@ -167,7 +187,7 @@ def _pair_vehicle_compatible(a, b):
   if None in (ax,ay,bx,by) or not _speed_compatible(a,b):
     return False
   dx=abs(ax-bx); dy=abs(ay-by)
-  if _near_speed_duplicate(a,b):
+  if _time_aligned_duplicate(a,b) or _near_speed_duplicate(a,b):
     return True
   sa=str(a.get('source','')); sb=str(b.get('source',''))
   if sa==sb=='corner_fused':
@@ -242,13 +262,16 @@ def _aggregate_vehicle_group(group):
   out['vehicle_span_y_m']=round(max(ys)-min(ys),3)
   if len(group)>1:
     
-    if any(_near_speed_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
+    if any(_time_aligned_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
+      out['vehicle_merge_reason']='time_aligned_radar'
+    elif any(_near_speed_duplicate(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
       out['vehicle_merge_reason']='near_speed'
     elif any(_strong_cross_sensor_evidence(group[i],group[j]) for i in range(len(group)) for j in range(i+1,len(group))):
       out['vehicle_merge_reason']='evidence_footprint'
     else:
       out['vehicle_merge_reason']='conservative_footprint'
-  out['recv_ns']=max(int(o.get('recv_ns',0) or 0) for o in group)
+  out['vehicle_latest_recv_ns']=max(int(o.get('recv_ns',0) or 0) for o in group)
+  out['recv_ns']=int(anchor.get('recv_ns',0) or 0)
 
   # Evidence is OR/max aggregated so removing duplicate rectangles never removes
   # a useful camera/SCC/front/rear confirmation carried by another member.
@@ -329,6 +352,7 @@ def fuse_vehicle_footprints(objects):
   fused.extend(passthrough)
   fused.sort(key=lambda o:float(o.get('x',0.0)))
   return fused, {
+    'time_aligned_clusters':sum(o.get('vehicle_merge_reason')=='time_aligned_radar' for o in fused),
     'vehicle_objects_before':len(objects),
     'vehicle_objects_after':len(fused),
     'vehicle_duplicates_merged':max(0,len(objects)-len(fused)),
