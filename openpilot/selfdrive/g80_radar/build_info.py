@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 50
-BUILD_TAG = 'v50-ml-only-perf-ramdict-bgwriter-shadowoff-goldenoff-v49core-rear18-front44-fg15-bsd-target-lane-path-sign-raw-commit-latch-source-lock'
+BUILD_TAG = 'v50r1-deadline-can-drain-publish-jitter-fix-ml-only-shadowoff-goldenoff-v49core-rear18-front44-fg15-bsd-target-lane'
+RELEASE_NAME = 'V50R1'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3

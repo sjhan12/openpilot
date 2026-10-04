@@ -16,7 +16,7 @@ from openpilot.selfdrive.g80_radar.shadow_leads import ShadowLeadVerifier,snapsh
 from openpilot.selfdrive.g80_radar.shadow_logger import ShadowLogger, LOGGER_SERVICE_VERSION
 from openpilot.selfdrive.g80_radar.front_standard_preview import StandardFrontPreview
 from openpilot.selfdrive.g80_radar.road_geometry import extract_road_model,road_model_with_age,path_as_tuples,annotate_objects
-from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG, COORDINATE_X_ORIGIN, EGO_DISPLAY_LENGTH_M, EGO_DISPLAY_CENTER_X_M, OBJECT_X_ADJUSTMENT_M, FUTURE_GAP_API_VERSION as BUILD_FUTURE_GAP_API_VERSION
+from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG, RELEASE_NAME, COORDINATE_X_ORIGIN, EGO_DISPLAY_LENGTH_M, EGO_DISPLAY_CENTER_X_M, OBJECT_X_ADJUSTMENT_M, FUTURE_GAP_API_VERSION as BUILD_FUTURE_GAP_API_VERSION
 from openpilot.selfdrive.g80_radar.kalman_motion import KalmanMotionTracker, KALMAN_API_VERSION
 from openpilot.selfdrive.g80_radar.canonical_tracker import Canonical360Tracker
 from openpilot.selfdrive.g80_radar.imm_motion import ImmMotionTracker, IMM_API_VERSION
@@ -33,6 +33,9 @@ HTTP_PORT=int(os.getenv('G80_RADAR_HTTP_PORT','28992'))
 WEB_STATUS_PATH=Path(os.getenv('G80_RADAR_WEB_STATUS_PATH','/data/radar/g80_web_status.json'))
 STATE_PATH=Path(os.getenv('G80_RADAR_STATE_PATH','/dev/shm/g80_radar.json'))
 PUBLISH_HZ=float(os.getenv('G80_RADAR_PUBLISH_HZ','10'))
+CAN_DRAIN_MAX_MSGS=max(32,int(os.getenv('G80_CAN_DRAIN_MAX_MSGS','2000')))
+CAN_DRAIN_GUARD_MS=max(2.0,float(os.getenv('G80_CAN_DRAIN_GUARD_MS','8.0')))
+CAN_DRAIN_GUARD_S=CAN_DRAIN_GUARD_MS/1000.0
 state_lock=threading.Lock()
 browser_lock=threading.Lock()
 browser_last_poll_ns=0
@@ -57,11 +60,11 @@ def _optional_sub_sock(name):
   except Exception:
     return None
 
-latest_state={'version':BUILD_VERSION,'sensor_fused_objects':[],'corner_fused_objects':[],'front_objects':[],'standard_front_preview':[],'filtered_objects':[],'raw_objects':[],'traffic_signal_probe':{}}
+latest_state={'version':BUILD_VERSION,'release':RELEASE_NAME,'sensor_fused_objects':[],'corner_fused_objects':[],'front_objects':[],'standard_front_preview':[],'filtered_objects':[],'raw_objects':[],'traffic_signal_probe':{}}
 latest_state_json=json.dumps(latest_state,separators=(',',':')).encode()
 
 HTML=r'''<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><title>G80 V50 · Seven-Stage Radar Lab</title>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><title>G80 V50R1 · Seven-Stage Radar Lab</title>
 <style>
 :root{--bg:#07111a;--panel:#0c1d29;--line:#2b4859;--text:#e7f4fa;--muted:#91abba;--cyan:#28dae3;--navy:#236cff;--pink:#ff559e;--lime:#7fe16e;--orange:#ff982e;--gold:#f6c744;--red:#fb4967}
 *{box-sizing:border-box}html,body{margin:0;height:100%;width:100%;background:var(--bg);color:var(--text);font-family:Arial,'Noto Sans KR',sans-serif;overflow:hidden}
@@ -105,7 +108,7 @@ footer{flex:none;border-top:1px solid #284658;background:#07131c;padding:3px 11p
 @media(max-width:770px){.panel{width:210px}.brand strong{font-size:14px}.brand .sub{font-size:9px}.stagebar span{max-width:65vw}.signal{left:53%;min-height:76px;width:60vw;gap:7px;padding:7px 10px}.lamp{height:18px;width:18px;font-size:13px}.signal-text strong{font-size:12px}.big-arrow{height:70px;width:41px}}
 </style></head>
 <body>
-<header><div class="brand"><strong>G80 5-RADAR <span style="color:#2fdbf6">V50</span> · STAGE LAB</strong><div class="sub">7 STAGES · FG15 BSD + TARGET LANE · ML CASE ONLY · SHADOW LOG OFF</div></div><span class="conn" id="conn">● CONNECTING</span></header>
+<header><div class="brand"><strong>G80 5-RADAR <span style="color:#2fdbf6">V50R1</span> · STAGE LAB</strong><div class="sub">7 STAGES · FG15 BSD + TARGET LANE · ML CASE ONLY · SHADOW LOG OFF</div></div><span class="conn" id="conn">● CONNECTING</span></header>
 <div class="toolbar"><div class="tabRail" id="modes">
 <button data-mode="raw">RAW<span class="small">DECODE</span></button>
 <button data-mode="raw_filtered">RAW FILTERED<span class="small">VALIDITY ONLY</span></button>
@@ -217,12 +220,12 @@ function updateArrows(){const fg=state?.future_gap||{},di=fg.driver_intent||{};f
 function updateSignal(){qs('signalPanel').classList.toggle('off',!signalOn);qs('signalToggle').textContent=signalOn?'SIGNAL ON':'SIGNAL OFF';if(!state)return;const t=state.traffic_signal_probe||{},st=String(t.state||'UNKNOWN'),turn=String(t.turn_direction||'NONE');for(const id of ['lr','ly','la','lg'])qs(id).classList.remove('on');let text='SIGNAL UNKNOWN',color='#d7edf5';if(st==='GREEN_GO'){qs('lg').classList.add('on');text='GREEN / GO · E2E';color='#66eda0'}else if(st==='RED_CANDIDATE'){qs('ly').classList.add('on');text='RED ? · INFERRED STOP';color='#fbd38e'}else if(st.includes('STOP')||st==='WATCH'){qs('ly').classList.add('on');text=String(t.label||'STOP/HOLD · LIGHT ?');color='#ebd28d'}else if(st==='WAIT_LEAD'){text='LEAD AHEAD';}else if(st==='DRIVING'){text='DRIVING · LIGHT ?'}
  if(st==='GREEN_GO'&&['LEFT','RIGHT'].includes(turn)){qs('la').classList.add('on');qs('la').textContent=turn==='LEFT'?'←':'→'}else qs('la').textContent='↔';qs('sigTitle').textContent=text;qs('sigTitle').style.color=color;qs('sigMeta').textContent=`path ${n(t.path_horizon_m)}m · stop ${t.should_stop===true?'1':t.should_stop===false?'0':'?'} · SP green ${t.sunnypilot_green_alert?'1':'0'} · plan ${turn}`;
 }
-function updateUI(){const d=MODE_INFO[mode],audit=state.web_stage_stats||{},cnt=audit.counts||{},fg=state.future_gap||{},di=fg.driver_intent||{},sig=state.traffic_signal_probe||{},rm=state.road_model||{},performance=state.performance_stats||{};
+function updateUI(){const d=MODE_INFO[mode],audit=state.web_stage_stats||{},cnt=audit.counts||{},fg=state.future_gap||{},di=fg.driver_intent||{},sig=state.traffic_signal_probe||{},rm=state.road_model||{},performance=state.performance_stats||{},dg=state.diagnostics||{};
  qs('stageName').textContent=d[0];qs('stageDesc').textContent=d[1];qs('stageMeaning').textContent=d[1];qs('stageLabel').textContent=d[0]+' · '+visible.length+' objects';qs('stageNote').textContent= mode==='all'?'ONE V-ID PER OBJECT · FRONT ALREADY INCLUDED':mode==='raw_filtered'?'NO CROSS-SOURCE DEDUP · RAW VALIDITY':'MONITOR ONLY · SENSOR PROVENANCE';
  const modes=['raw','raw_filtered','corner_fused','front_fused','all','l1l2','std'];qs('stageCounts').innerHTML=modes.map(k=>`<div class="modecount ${k===mode?'chosen':''}"><span>${k==='raw_filtered'?'RAW FILT':k==='corner_fused'?'CORNER':k==='front_fused'?'FRONT':k==='all'?'360+FRONT':k==='l1l2'?'L1/L2':k.toUpperCase()}</span><b>${Number(cnt[k]??dataList(KEYS[k]).length)}</b></div>`).join('');
  const mismatches=state.web_stage_errors||[],miss=Number(audit.front_unmatched_inside_view_roi||0),oor=Number(audit.front_outside_view_roi||0);qs('stageAudit').innerHTML=`<b>RAW → FILTER:</b> ${cnt.raw??0} → ${cnt.raw_filtered??0} (실제 융합 입력 ${cnt.production_filtered??0})<br><b>FRONT ROI:</b> 캐노니컬 out ${oor}, 내부 trace 미연결 ${miss}<br><b>Canonical key 중복:</b> ${audit.canonical_duplicate_keys??0} · <b>계약:</b> <span style="color:${mismatches.length?'#fa8192':'#80e7a3'}">${mismatches.length?mismatches.join(', '):'OK'}</span>`;
  const left=fg.left?.decision||{},right=fg.right?.decision||{},s=fg.stats||{},fmt=v=>v==null?'--':n(v)+'m';const le=fg.left?.fg11_evidence||fg.left?.fg10_evidence||fg.left?.fg9_evidence||{},re=fg.right?.fg11_evidence||fg.right?.fg10_evidence||fg.right?.fg9_evidence||{};
- qs('telemetry').innerHTML=[['서버 버전',String(state.runtime_versions?.tag||'--').split('-').slice(0,2).join('-')],['FG/WEB',String(state.runtime_versions?.future_gap_api||'?')+' / '+String(state.version||'?')],['현재 모드',mode.toUpperCase()],['ROAD',rm.fresh?'FRESH '+n(rm.age_ms,0)+'ms':'STALE'],['Driver intent',String(di.state||'STANDBY')],['LEFT / RIGHT',(left.label||'--')+' / '+(right.label||'--')],['LEFT reason',(left.reasons||[]).join(', ')||'--'],['RIGHT reason',(right.reasons||[]).join(', ')||'--'],['NOW rear L/R',fmt(le.current_rear_gap_m)+' / '+fmt(re.current_rear_gap_m)],['2D CONFLICT L/R',fmt((fg.left?.fg12_evidence||fg.left?.fg11_evidence||{}).min_2d_conflict_time_s)+' / '+fmt((fg.right?.fg12_evidence||fg.right?.fg11_evidence||{}).min_2d_conflict_time_s)],['PRED rear L/R',fmt(le.predicted_rear_min_m)+' / '+fmt(re.predicted_rear_min_m)],['Core cycle',n(performance.processing_ms)+' ms'],['Publish',n(performance.publish_interval_ms)+' ms'],['Shadow log',state.shadow_logger?.enabled?'LOGGING':'OFF']].map(([a,b])=>`<div class="metric"><span>${a}</span><b>${b}</b></div>`).join('');
+ qs('telemetry').innerHTML=[['서버 버전',String(state.runtime_versions?.tag||'--').split('-').slice(0,2).join('-')],['FG/WEB',String(state.runtime_versions?.future_gap_api||'?')+' / '+String(state.version||'?')],['현재 모드',mode.toUpperCase()],['ROAD',rm.fresh?'FRESH '+n(rm.age_ms,0)+'ms':'STALE'],['Driver intent',String(di.state||'STANDBY')],['LEFT / RIGHT',(left.label||'--')+' / '+(right.label||'--')],['LEFT reason',(left.reasons||[]).join(', ')||'--'],['RIGHT reason',(right.reasons||[]).join(', ')||'--'],['NOW rear L/R',fmt(le.current_rear_gap_m)+' / '+fmt(re.current_rear_gap_m)],['2D CONFLICT L/R',fmt((fg.left?.fg12_evidence||fg.left?.fg11_evidence||{}).min_2d_conflict_time_s)+' / '+fmt((fg.right?.fg12_evidence||fg.right?.fg11_evidence||{}).min_2d_conflict_time_s)],['PRED rear L/R',fmt(le.predicted_rear_min_m)+' / '+fmt(re.predicted_rear_min_m)],['Core cycle',n(performance.processing_ms)+' ms'],['CAN drain',n(performance.input_drain_ms)+' ms'],['CAN lag',n(dg.last_transport_lag_ms)+' ms'],['Publish',n(performance.publish_interval_ms)+' ms'],['Publish late',n(performance.publish_lateness_ms)+' ms'],['Sched skips',String(performance.missed_publish_cycles_total??0)],['Shadow log',state.shadow_logger?.enabled?'LOGGING':'OFF']].map(([a,b])=>`<div class="metric"><span>${a}</span><b>${b}</b></div>`).join('');
  qs('objTitle').textContent=d[0]+' · NEAREST';const rows=visible.slice().sort((a,b)=>Math.abs(Number(a.x))-Math.abs(Number(b.x))).slice(0,35);qs('objects').innerHTML=rows.length?rows.map(o=>{const color=col(o),p=origin(o),local=o.trace_local_key||o.key||'',c=String(o.canonical_key||''),badge=mode==='raw'||mode==='raw_filtered'?`${String(o.stage_origin||o.sensor||'')} · ${local}`:mode==='std'?String(o.preview_quality||'CANDIDATE'):mode==='l1l2'?String(o.shadow_validation_state||'SHADOW'):mask(o).join('+')||p;
  return `<div class="row"><span class="dot" style="background:${color}"></span><div><span class="label">${traceLabel(o).replaceAll('<','&lt;')}</span><div class="detail">${badge.replaceAll('<','&lt;')} ${mode!=='raw'&&mode!=='raw_filtered'&&o.canonical_key?` · ${String(o.trace_match_method||'')}`:''}</div></div><span class="value">${n(o.x)}m<br>${n(o.y)}y<br>${o.vx==null?'--':n(o.vx)+'m/s'}</span></div>`}).join(''):'<span class="desc">이 단계에서 표시할 객체가 없습니다.</span>';
  qs('reference').innerHTML=`<b style="color:#367dff">FRONT</b> · <b style="color:#1bdded">FL</b> · <b style="color:#ff61a8">FR</b> · <b style="color:#89e773">RL</b> · <b style="color:#ffa03d">RR</b><br>코너 색은 위치상의 사분면을 근거로 합니다. A/B 실제 센서 소유권이 4개 코너별로 확정됐다는 뜻은 아닙니다.<br><br>front fused는 abs(y)≤5.8m의 기존 내부 ROI로 제한됩니다. RAW FILTERED는 그룹1 미검증 후보를 제외하며 cross-sensor merge 전 단계를 관찰합니다.<br><br>STD 품질 및 E2E 신호 상태는 제어 검증용 표시입니다.`;
@@ -233,7 +236,7 @@ function setRange(k){if(!LONG_RANGE[k])return;rangeMode=k;document.querySelector
 document.querySelectorAll('[data-mode]').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));
 document.querySelectorAll('[data-range]').forEach(b=>b.addEventListener('click',()=>setRange(b.dataset.range)));
 qs('signalToggle').onclick=()=>{signalOn=!signalOn;setPref('g80_signal',signalOn?'1':'0');updateSignal()};qs('hud').onclick=()=>window.open('/hud','_blank');qs('fs').onclick=async()=>{try{document.fullscreenElement?await document.exitFullscreen():await document.documentElement.requestFullscreen()}catch(_){}};
-let failures=0;async function poll(){try{const r=await fetch('/state',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);state=await r.json();lastRx=Date.now();failures=0;const rt=state.runtime_versions||{},bad=!!state.runtime_mismatch;qs('conn').textContent=`● LIVE V${state.version||'?'} FG${rt.future_gap_api||'?'} · ${n(state.performance_stats?.publish_interval_ms,0)}ms${bad?' · RUNTIME MISMATCH':''}`;qs('conn').className='conn '+(bad?'bad':'good');visible=stageItems();updateUI();draw();for(const[k,v]of canonColor){if(Date.now()-v.seen>15000)canonColor.delete(k)}}catch(e){failures++;qs('conn').textContent='● WEB /STATE UNAVAILABLE '+failures;qs('conn').className='conn bad';for(const side of ['left','right']){qs(side+'Arrow').className='big-arrow off';qs(side+'Label').textContent=side.toUpperCase()+' CHECK DATA'}}setTimeout(poll,200)}
+let failures=0;async function poll(){try{const r=await fetch('/state',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);state=await r.json();lastRx=Date.now();failures=0;const rt=state.runtime_versions||{},bad=!!state.runtime_mismatch;const pf=state.performance_stats||{}, rel=state.release||('V'+(state.version||'?'));qs('conn').textContent=`● LIVE ${rel} FG${rt.future_gap_api||'?'} · CORE ${n(pf.processing_ms,1)}ms · PUB ${n(pf.publish_interval_ms,0)}ms${bad?' · RUNTIME MISMATCH':''}`;qs('conn').className='conn '+(bad?'bad':'good');visible=stageItems();updateUI();draw();for(const[k,v]of canonColor){if(Date.now()-v.seen>15000)canonColor.delete(k)}}catch(e){failures++;qs('conn').textContent='● WEB /STATE UNAVAILABLE '+failures;qs('conn').className='conn bad';for(const side of ['left','right']){qs(side+'Arrow').className='big-arrow off';qs(side+'Label').textContent=side.toUpperCase()+' CHECK DATA'}}setTimeout(poll,200)}
 window.addEventListener('resize',()=>{if(state)draw()});updateSignal();poll();
 </script></body></html>
 '''
@@ -254,7 +257,7 @@ class H(BaseHTTPRequestHandler):
   def do_GET(self):
     path=self.path.split('?')[0]
     if path=='/health':
-      b=json.dumps({'ok':True,'build':BUILD_VERSION,'tag':BUILD_TAG,'port':HTTP_PORT,'pid':os.getpid()},separators=(',',':')).encode()
+      b=json.dumps({'ok':True,'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'port':HTTP_PORT,'pid':os.getpid()},separators=(',',':')).encode()
       self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
     elif path=='/state':
       mark_browser_active()
@@ -277,7 +280,7 @@ def _web_status(state:str, error:str=''):
     tmp=WEB_STATUS_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps({
       'state':state,'host':HTTP_HOST,'port':HTTP_PORT,'pid':os.getpid(),
-      'build':BUILD_VERSION,'tag':BUILD_TAG,'error':error,'mono_ns':time.monotonic_ns()
+      'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'error':error,'mono_ns':time.monotonic_ns()
     },separators=(',',':')))
     tmp.replace(WEB_STATUS_PATH)
   except Exception:
@@ -514,12 +517,23 @@ def main():
   radar_recv={'corner_A':0,'corner_B':0,'front':0}
   carstate_valid=False
   diag={'corner_A_frames':0,'corner_B_frames':0,'corner_decoded_total':0,'corner_rear_total':0,'corner_front_total':0,'corner_A_by_bus':{},'corner_B_by_bus':{},'scc_frames_by_bus':{},'scc_teacher_updates':0,'model_frames':0,'camera_leads_latest':0,'model_transport_lag_ms':None,'last_transport_lag_ms':None}
+  period=1.0/max(PUBLISH_HZ,1.0)
+  # Never let continuous CAN backlog monopolize the 10 Hz publication deadline.
+  # Keep a small guard for model/carState reads + fusion; unconsumed CAN remains queued.
+  can_guard_s=min(CAN_DRAIN_GUARD_S, period*0.45)
   next_pub=time.monotonic();next_debug_write=0.0;next_ui_update=0.0;next_web_stage_audit=0.0;web_stage_stats={};web_stage_errors=[];last_pub_ns=0;last_processing_ms=0.0;last_udp_ms=0.0;last_ui_ms=0.0;last_ui_kb=0.0;last_stage_ms={}
+  input_drain_accum_ms=0.0;input_msgs_accum=0;input_frames_accum=0;can_deadline_breaks_total=0;can_deadline_hit_since_pub=False;missed_publish_cycles_total=0;last_scheduler_skips=0
   while True:
-    processed=0
-    for _ in range(2000):
+    processed=0;processed_frames=0;deadline_break=False;drain_t0=time.perf_counter()
+    for _ in range(CAN_DRAIN_MAX_MSGS):
+      # R1 deadline guard: do not pull another queued CAN Event when publication is due.
+      # Because the socket is non-conflated, messages not pulled here remain for the next loop.
+      if time.monotonic() >= (next_pub-can_guard_s):
+        deadline_break=True
+        break
       msg=messaging.recv_one_or_none(can_sock)
       if msg is None: break
+      processed_frames += len(msg.can)
       recv_ns=time.monotonic_ns();can_log_ns=int(msg.logMonoTime);diag['last_transport_lag_ms']=round((recv_ns-can_log_ns)/1e6,3)
       for f in msg.can:
         bus,addr,dat=int(f.src),int(f.address),bytes(f.dat)
@@ -554,6 +568,12 @@ def main():
               e['bus']=bus;e['recv_ns']=recv_ns
             rear_teacher_by_bus[bus]=rt
       processed+=1
+    input_drain_accum_ms += (time.perf_counter()-drain_t0)*1000.0
+    input_msgs_accum += processed
+    input_frames_accum += processed_frames
+    if deadline_break and not can_deadline_hit_since_pub:
+      can_deadline_breaks_total += 1
+      can_deadline_hit_since_pub=True
 
     mmsg=messaging.recv_one_or_none(model_sock)
     if mmsg is not None:
@@ -604,6 +624,9 @@ def main():
 
     now=time.monotonic()
     if now>=next_pub:
+      publish_lateness_ms=max(0.0,(now-next_pub)*1000.0)
+      cycle_input_drain_ms=input_drain_accum_ms;cycle_input_msgs=input_msgs_accum;cycle_input_frames=input_frames_accum
+      input_drain_accum_ms=0.0;input_msgs_accum=0;input_frames_accum=0;can_deadline_hit_since_pub=False
       now_ns=time.monotonic_ns()
       scc_teacher=choose_scc_teacher(scc_teacher_by_bus,SCC_BUS,now_ns)
       fresh_rear={}
@@ -684,9 +707,9 @@ def main():
                         'object_x_preserved':True,'note':'ego pictogram front edge is x=0; decoded object x is unchanged'}
       # Core state is always produced because radar fusion/teacher logic and the
       # Android UDP stream must remain live even with no browser connected.
-      runtime_versions={'build':BUILD_VERSION,'tag':BUILD_TAG,'logger':LOGGER_SERVICE_VERSION,'kalman_api':KALMAN_API_VERSION,'imm_api':IMM_API_VERSION,'future_gap_api':FUTURE_GAP_API_VERSION,'android_protocol':PROTOCOL_VERSION}
+      runtime_versions={'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'logger':LOGGER_SERVICE_VERSION,'kalman_api':KALMAN_API_VERSION,'imm_api':IMM_API_VERSION,'future_gap_api':FUTURE_GAP_API_VERSION,'android_protocol':PROTOCOL_VERSION}
       runtime_mismatch=(BUILD_VERSION!=50 or LOGGER_SERVICE_VERSION!=BUILD_VERSION or KALMAN_API_VERSION!=4 or IMM_API_VERSION!=3 or FUTURE_GAP_API_VERSION!=15 or BUILD_FUTURE_GAP_API_VERSION!=15 or PROTOCOL_VERSION!=21)
-      core={'version':BUILD_VERSION,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'objects':sensor_fused_view,
+      core={'version':BUILD_VERSION,'release':RELEASE_NAME,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'objects':sensor_fused_view,
             'sensor_fused_objects':sensor_fused_view,'all_fused_objects':sensor_fused_view,'canonical360_objects':sensor_fused_view,
             'radar_fused_objects':radar_all_view,
             'web_stage_stats':web_stage_stats,'web_stage_errors':web_stage_errors,
@@ -712,7 +735,8 @@ def main():
       except Exception as e:
         core['ml_case_collector'] = {'enabled': False, 'last_error': repr(e)}
       interval_ms=None if last_pub_ns==0 else (now_ns-last_pub_ns)/1e6
-      core['performance_stats']={'processing_ms':round(last_processing_ms,2),'publish_interval_ms':None if interval_ms is None else round(interval_ms,2),'target_hz':PUBLISH_HZ,'local_kf_replicas_disabled':True,'imm_target_hz':imm_stats.get('target_hz',2.5),'stage_ms':{k:round(v,2) for k,v in stage_ms.items()},'udp_json_ms':round(last_udp_ms,2),'ui_json_ms':round(last_ui_ms,2),'logger_event_policy':'V50 ML-only: shadow log hard-disabled; labelled ML cases only; RAM dict capture + background JSON/gzip'}
+      core_processing_ms=(time.perf_counter()-pub_start)*1000.0
+      core['performance_stats']={'processing_ms':round(core_processing_ms,2),'publish_work_ms':round(last_processing_ms,2),'publish_interval_ms':None if interval_ms is None else round(interval_ms,2),'publish_lateness_ms':round(publish_lateness_ms,2),'target_hz':PUBLISH_HZ,'input_drain_ms':round(cycle_input_drain_ms,2),'can_messages_drained':cycle_input_msgs,'can_frames_drained':cycle_input_frames,'can_drain_guard_ms':round(can_guard_s*1000.0,2),'can_deadline_breaks_total':can_deadline_breaks_total,'missed_publish_cycles_last':last_scheduler_skips,'missed_publish_cycles_total':missed_publish_cycles_total,'local_kf_replicas_disabled':True,'imm_target_hz':imm_stats.get('target_hz',2.5),'stage_ms':{k:round(v,2) for k,v in stage_ms.items()},'udp_json_ms':round(last_udp_ms,2),'ui_json_ms':round(last_ui_ms,2),'logger_event_policy':'V50R1 ML-only: deadline-aware CAN drain; shadow log hard-disabled; labelled ML cases only; RAM dict capture + background JSON/gzip'}
 
       # V50 ML-only: continuous shadow logging is hard-disabled. No shadow file I/O occurs.
       core['shadow_logger']=shadow_logger.status()
@@ -724,6 +748,7 @@ def main():
       except OSError:
         pass
       last_udp_ms=(time.perf_counter()-udp_t0)*1000.0
+      core['performance_stats']['udp_json_ms']=round(last_udp_ms,2)
 
       # V35: compact browser state is cached at 8 Hz.  The core loop remains
       # independent; duplicate canonical arrays are not serialized four times.
@@ -740,9 +765,9 @@ def main():
           'diagnostics':dict(diag,ui_sleeping=not ui_active),
           'browser_active':ui_active,
           'notes':{
-            'ui':'v50-ml-only-web8h-vehicle-geometry-rear-room-fg15-bsd-target-lane-source-lock-hud-kr',
+            'ui':'v50r1-deadline-can-drain-web8h-ml-only-fg15-bsd-target-lane-source-lock-hud-kr',
             'display_scale':'SHORT/LONG 1:1 + WIDE + DRIVE perspective; source-traceable Canonical C4-road overlay',
-            'browser_policy':'8Hz cached seven-stage browser data; RAW FILTERED does not cross-source dedup; no control changes',
+            'browser_policy':'8Hz cached seven-stage browser data; 10Hz publish protected by deadline-aware CAN drain; no control changes',
             'udp':'Android final sensor-fusion packet on 28991',
             'control':'disabled',
             'integration':'NOT connected to RadarInterface/radarTracks/radard',
@@ -768,7 +793,7 @@ def main():
           latest_state.clear();latest_state.update(out);latest_state_json=b
         next_ui_update=now+1.0/max(UI_STATE_HZ,1.0)
       elif not ui_active and now>=next_ui_update:
-        compact={'version':BUILD_VERSION,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'browser_active':False,
+        compact={'version':BUILD_VERSION,'release':RELEASE_NAME,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'browser_active':False,
                  'performance_stats':dict(core['performance_stats'],ui_json_kb=round(last_ui_kb,2),ui_state_hz=UI_STATE_HZ),
                  'ml_case_collector':core.get('ml_case_collector',{}),'shadow_logger':core.get('shadow_logger',{}),'diagnostics':dict(diag,ui_sleeping=True)}
         b=json.dumps(compact,separators=(',',':')).encode()
@@ -781,9 +806,12 @@ def main():
       last_processing_ms=(time.perf_counter()-pub_start)*1000.0
       interval_ms=None if last_pub_ns==0 else (now_ns-last_pub_ns)/1e6
       last_pub_ns=now_ns
-      # Fixed-phase scheduler: processing time no longer gets added to the 100 ms period.
-      period=1.0/max(PUBLISH_HZ,1.0);next_pub+=period;end_now=time.monotonic()
+      # Fixed-phase R1 scheduler. If a publish itself overruns one or more deadlines,
+      # skip those expired slots explicitly and expose the count in /state.
+      next_pub+=period;end_now=time.monotonic();last_scheduler_skips=0
       if next_pub<end_now:
-        next_pub += (int((end_now-next_pub)/period)+1)*period
+        last_scheduler_skips=(int((end_now-next_pub)/period)+1)
+        missed_publish_cycles_total += last_scheduler_skips
+        next_pub += last_scheduler_skips*period
     if processed==0: time.sleep(.002)
 if __name__=='__main__': main()

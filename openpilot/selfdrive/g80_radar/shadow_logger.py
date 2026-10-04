@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""V50 shadow logger compatibility shim.
+"""V50R1 shadow logger compatibility shim.
 
-V50 is ML-case-only. Continuous shadow logging is hard-disabled in code.
+V50R1 is ML-case-only. Continuous shadow logging is hard-disabled in code.
 This module keeps the old ShadowLogger API so live_service remains compatible,
 but it never creates, opens, writes, rotates, flushes, or renames any file.
 """
@@ -37,5 +37,5 @@ class ShadowLogger:
       'last_write_ns': 0,
       'path': None,
       'last_error': '',
-      'policy': 'V50 ML-only: continuous shadow log permanently disabled',
+      'policy': 'V50R1 ML-only: continuous shadow log permanently disabled',
     }
