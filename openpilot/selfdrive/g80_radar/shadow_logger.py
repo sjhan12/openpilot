@@ -42,7 +42,7 @@ def _compact_obj(o: dict) -> dict:
     'camera_only','sensor_fusion','camera_match_cost','camera_dx_m',
     'camera_dy_m','camera_dv_mps','recv_ns','log_ns',
     'vehicle_id','vehicle_key','canonical_id','canonical_key','canonical_valid','canonical_age_frames','canonical_track_duration_s','canonical_match_reason','canonical_match_cost','canonical_alias_overlap','canonical_gap_ms','canonical_reacquired','canonical_reacquire_count','canonical_domains','canonical_primary_domain','canonical_domain_history','canonical_source_transition','canonical_handoff_count','canonical_alias_count','canonical_candidate_count','vehicle_anchor_key','vehicle_member_count','vehicle_duplicates_merged','vehicle_footprint_merged',
-    'vehicle_latest_recv_ns','vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason','source_mask','source_age_ms','display_state','trace_local_key','trace_match_method','trace_unmatched','trace_canonical_domains','corner_debug_role',
+    'vehicle_span_x_m','vehicle_span_y_m','vehicle_cluster_keys','vehicle_cluster_sources','vehicle_merge_reason','source_mask','source_age_ms','display_state','trace_local_key','trace_match_method','trace_unmatched','trace_canonical_domains','corner_debug_role',
     'camera_hypothesis_keys','camera_hypothesis_count','camera_hypotheses_merged',
     'road_s','road_d','road_path_x','road_path_y','road_lane_index','road_lane','road_lane_source','road_projection_valid','road_projection_endpoint_overshoot_m',
     'preview_quality','kalman_valid','kalman_track_key','kalman_age_frames','kalman_age_s','kf_canonical_key_match','kf_reset_suspect','kf_dormant_preserved',
@@ -85,7 +85,7 @@ class ShadowLogger:
     self.last_error = ''
     self.last_signature = None
     self.last_write_ns = 0
-    # V49: identify each logger/service instance so overlapping logs can be diagnosed.
+    # V48: identify each logger/service instance so overlapping logs can be diagnosed.
     self.pid = os.getpid()
     self.instance_id = f'{self.pid}-{time.monotonic_ns()}'
 
@@ -146,11 +146,11 @@ class ShadowLogger:
           'canonical360_ttl_s':1.5,
           'canonical360_identity_safety':'tight cluster aliases + 650ms reacquire diagnostic',
           'scc_teacher_policy':'path-aware final-object match; adjacent-lane streak cannot confirm; SCC+CAM strong L1 handoff',
-          'performance_policy':'V49H: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
+          'performance_policy':'V48H: browser-only seven-stage audit at UI 8Hz or idle 2Hz; legacy V40 road/vehicle visual; KF4 max10; IMM3 2.5Hz/max6; sparse immediate shadow events',
           'future_gap_evaluator':True,
-          'future_gap_policy':'V49H FG15: stock BSD final override; measured outer-lane keeping exclusion; FG13 bounded CHECK and FG12 2D conflict retained; unknown inputs block green; central-line semantics NOT available',
+          'future_gap_policy':'V48H FG15: stock BSD final override; measured outer-lane keeping exclusion; FG13 bounded CHECK and FG12 2D conflict retained; unknown inputs block green; central-line semantics NOT available',
           'traffic_signal_probe':'monitor-only E2E heuristic: path/action + sunnypilot green alert + modelDataV2SP turn path; scores are not probabilities',
-          'web_stage_contract':'V49H seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
+          'web_stage_contract':'V48H seven read-only stages; V40 legacy road/vehicle visual; diagnostic validity-only raw filter and selected L1/L2',
         },
         'control_connected':False,
         'publishes_radarState':False,
