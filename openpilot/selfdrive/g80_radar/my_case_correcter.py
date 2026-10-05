@@ -11,6 +11,12 @@ Design goals
 * Disk/gzip work is deferred to a background writer after the post window.
 * A keypad press creates one labelled case containing PRE seconds before the
   press and POST seconds after the press.
+* Optional AUTO-LC refined capture: when FG15 confirms a lane-change COMMIT,
+  collect a separate weak-label case automatically. One physical lane-change is
+  latched to one case only; re-arming requires blinker OFF + FG15 intent idle.
+* AUTO_SAFE_CANDIDATE requires ACTIVE-phase evidence and no hard hazard. Partial
+  or hazardous executions are AUTO_REVIEW, never silently promoted to SAFE.
+* Background JSON/gzip writes are chunk-yielded to reduce GIL/CPU bursts.
 * Runs inside V50 g80radard/live_service so training data is exactly the V50
   state that a later inference module can consume.
 * Collector failures must never stop V50 radar monitoring.
@@ -43,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "g80_v50_ml_case_v1"
-COLLECTOR_VERSION = 5
+COLLECTOR_VERSION = 7
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -66,10 +72,20 @@ EGO_EXTRA_FIELDS = ('steeringRateDeg', 'steeringTorque', 'steeringPressed',
                     'yawRate', 'lateralAcceleration', 'brakePressed', 'gasPressed')
 EGO_BOOL_FIELDS = {'steeringPressed', 'brakePressed', 'gasPressed'}
 
+AUTO_LC_SAFE_LABEL = 'AUTO_SAFE_CANDIDATE'
+AUTO_LC_REVIEW_LABEL = 'AUTO_REVIEW'
+
 
 # Native Linux struct input_event on comma four/aarch64:
 #   struct timeval { long sec; long usec; }; u16 type; u16 code; s32 value
 _INPUT_EVENT = struct.Struct("@llHHi")
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+  raw = os.getenv(name)
+  if raw is None:
+    return bool(default)
+  return str(raw).strip().lower() not in ('0', 'false', 'no', 'off', 'disable', 'disabled')
 
 
 def _env_number(name, default, low, high):
@@ -78,6 +94,14 @@ def _env_number(name, default, low, high):
     return max(low, min(high, value)) if math.isfinite(value) else default
   except (ValueError, TypeError):
     return default
+
+
+def _env_int(name, default, low, high):
+  try:
+    value = int(float(os.getenv(name, str(default))))
+    return max(int(low), min(int(high), value))
+  except (ValueError, TypeError):
+    return int(default)
 
 
 def _finite_or_none(v: Any):
@@ -359,7 +383,9 @@ def _context_detail(core: dict, raw_objects, filtered_objects) -> dict:
 class _PendingCase:
   """RAM-only pending case. No filesystem/gzip calls occur on the radar loop."""
   def __init__(self, press: KeyPress, start_ns: int, end_ns: int, part_path: Path, final_path: Path,
-               pre_s: float, post_s: float, build_meta: dict, session_id: str):
+               pre_s: float, post_s: float, build_meta: dict, session_id: str,
+               label_source: str = 'manual_key', output_root: Path | None = None,
+               extra_meta: dict | None = None):
     self.press = press
     self.start_ns = int(start_ns)
     self.end_ns = int(end_ns)
@@ -389,6 +415,8 @@ class _PendingCase:
         'shadow_log_required_for_training': False,
       },
       'side': press.side, 'label': press.label, 'key_code': press.code,
+      'label_source': str(label_source),
+      'training_default_include': bool(label_source == 'manual_key'),
       'key_device': press.device, 'press_mono_ns': int(press.mono_ns),
       'pre_sec': float(pre_s), 'post_sec': float(post_s),
       'window_start_ns': int(start_ns), 'window_end_ns': int(end_ns),
@@ -396,6 +424,9 @@ class _PendingCase:
       'build': _plain(build_meta),
       'note': 'Pre/post frames are RAM buffered. File creation/compression happens on a background writer only after capture.',
     }
+    self.output_root = Path(output_root) if output_root is not None else final_path.parent
+    if extra_meta:
+      self.meta.update(_plain(extra_meta))
 
   def add(self, mono_ns: int, frame: dict):
     mono_ns = int(mono_ns)
@@ -423,43 +454,62 @@ class _CaseWriter(threading.Thread):
     super().__init__(name='g80-ml-writer', daemon=True)
     self.owner = owner
     self.q: queue.Queue = queue.Queue(maxsize=16)
+    self.active = False
+    self.last_write_ms = 0.0
+    self.max_write_ms = 0.0
+    self.write_count = 0
+    self.last_started_ns = 0
 
   def submit(self, p: _PendingCase, truncated: bool = False) -> bool:
     try:
       self.q.put_nowait((p, bool(truncated)))
+      try:
+        self.owner.writer_queue_peak = max(int(self.owner.writer_queue_peak), int(self.q.qsize()))
+      except Exception:
+        pass
       return True
     except queue.Full:
       self.owner.last_error = 'ML writer queue full; case not saved'
       return False
 
   def _manifest(self, p: _PendingCase):
-    path = self.owner.base_dir / 'manifest.csv'
+    root = Path(p.output_root)
+    path = root / 'manifest.csv'
     new = not path.exists()
-    self.owner.base_dir.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     with path.open('a', newline='', encoding='utf-8') as f:
       w = csv.writer(f)
       if new:
         w.writerow(['file','side','label','press_mono_ns','frames','actual_pre_sec','actual_post_sec'])
       pre = '' if not p.first_frame_ns else round((p.press.mono_ns - p.first_frame_ns) / 1e9, 3)
       post = '' if not p.last_frame_ns else round((p.last_frame_ns - p.press.mono_ns) / 1e9, 3)
-      w.writerow([str(p.final_path.relative_to(self.owner.base_dir)), p.press.side, p.press.label,
+      w.writerow([str(p.final_path.relative_to(root)), p.press.side, p.press.label,
                   p.press.mono_ns, p.frame_count, pre, post])
 
   def _write(self, p: _PendingCase, truncated: bool):
+    t0 = time.perf_counter_ns()
+    self.active = True
+    self.last_started_ns = time.monotonic_ns()
     try:
       p.final_path.parent.mkdir(parents=True, exist_ok=True)
       p.meta['performance_profile']['training_fast_hz'] = self.owner.sample_hz
       p.meta['performance_profile']['diagnostic_context_hz'] = self.owner.context_hz
+      p.meta['performance_profile']['writer_yield_every_frames'] = self.owner.writer_yield_every_frames
+      p.meta['performance_profile']['writer_yield_ms'] = round(self.owner.writer_yield_s * 1000.0, 3)
       with gzip.open(p.part_path, 'wt', encoding='utf-8', compresslevel=1) as fp:
         fp.write(json.dumps(p.meta, separators=(',', ':')) + '\n')
-        for frame in p.frames:
+        for i, frame in enumerate(p.frames, 1):
           fp.write(json.dumps(frame, separators=(',', ':'), allow_nan=False) + '\n')
+          # The writer is a separate thread but shares the Python process/GIL.
+          # Yield in small chunks so radar/UI scheduling wins over file throughput.
+          if self.owner.writer_yield_every_frames > 0 and i % self.owner.writer_yield_every_frames == 0:
+            time.sleep(self.owner.writer_yield_s)
         fp.write(json.dumps(p.finish_record(truncated), separators=(',', ':')) + '\n')
       os.replace(p.part_path, p.final_path)
       self._manifest(p)
       self.owner.saved_cases += 1
       self.owner.last_saved_file = str(p.final_path)
-      print(f'[G80 ML] saved {p.final_path} ({p.frame_count} frames, bg writer)', flush=True)
+      print(f'[G80 ML] saved {p.final_path} ({p.frame_count} frames, yielding bg writer)', flush=True)
     except Exception as e:
       self.owner.last_error = 'writer: ' + repr(e)
       try:
@@ -467,6 +517,12 @@ class _CaseWriter(threading.Thread):
           p.part_path.unlink()
       except Exception:
         pass
+    finally:
+      dt_ms = (time.perf_counter_ns() - t0) / 1e6
+      self.last_write_ms = dt_ms
+      self.max_write_ms = max(self.max_write_ms, dt_ms)
+      self.write_count += 1
+      self.active = False
 
   def run(self):
     while True:
@@ -491,7 +547,23 @@ class MLCaseCollector:
   """Low-overhead RAM history + key-triggered labelled case recorder for V50."""
   def __init__(self, start_keyboard: bool = True):
     self.base_dir = Path(os.getenv('G80_ML_CASE_DIR', '/data/radar/ml_cases_v50'))
+    self.auto_lc_dir = Path(os.getenv('G80_ML_AUTO_LC_DIR', '/data/radar/ml_cases_v50_auto_lanechange'))
     self.disable_marker = Path(os.getenv('G80_ML_DISABLE_MARKER', '/data/radar/DISABLE_G80_ML_CASES'))
+    self.auto_lc_disable_marker = Path(os.getenv('G80_ML_AUTO_LC_DISABLE_MARKER', '/data/radar/DISABLE_G80_AUTO_LC'))
+    self.auto_lc_config_enabled = _env_bool('G80_ML_AUTO_LC_ENABLE', True)
+    self.auto_lc_cooldown_s = _env_number('G80_ML_AUTO_LC_COOLDOWN_SEC', 5.0, 1.0, 30.0)
+    # Re-arm only after the previous maneuver is truly over: both blinkers OFF
+    # and FG15 intent idle continuously for this interval. This is the primary
+    # duplicate-prevention mechanism; cooldown is only a secondary guard.
+    self.auto_lc_rearm_off_s = _env_number('G80_ML_AUTO_LC_REARM_OFF_SEC', 0.8, 0.3, 3.0)
+    # Automatic lane-change cases need a little more post time than manual labels
+    # so FG15 can reach ACTIVE and the blinker can auto-cancel after lane crossing.
+    self.auto_lc_post_s = _env_number('G80_ML_AUTO_LC_POST_SEC', 4.5, 3.0, 8.0)
+    self.auto_lc_min_progress_s = _env_number('G80_ML_AUTO_LC_MIN_PROGRESS_SEC', 2.4, 1.0, 3.0)
+    # Background writer cooperatively yields the GIL/CPU. Defaults add only a few
+    # tens of milliseconds to file completion while limiting one long CPU burst.
+    self.writer_yield_every_frames = _env_int('G80_ML_WRITER_YIELD_EVERY_FRAMES', 4, 1, 32)
+    self.writer_yield_s = _env_number('G80_ML_WRITER_YIELD_MS', 1.0, 0.0, 10.0) / 1000.0
     self.pre_s = _env_number('G80_ML_PRE_SEC', 5.0, 1.0, 15.0)
     self.post_s = _env_number('G80_ML_POST_SEC', 3.0, 1.0, 15.0)
     self.sample_hz = _env_number('G80_ML_SAMPLE_HZ', 10.0, 2.0, 10.0)
@@ -516,6 +588,23 @@ class MLCaseCollector:
     self.counter = 0
     self.saved_cases = 0
     self.last_saved_file = ''
+    self.auto_candidate = None
+    self.auto_saved_cases = 0
+    self.auto_review_cases = 0
+    self.auto_rejected_cases = 0
+    self.auto_last_trigger_ns = 0
+    self.auto_last_completed_ns = 0
+    self.auto_last_result = ''
+    self.auto_armed = True
+    self.auto_latched_side = None
+    self.auto_rearm_since_ns = 0
+    self.auto_rearm_count = 0
+    self.auto_capture_last_ms = 0.0
+    self.auto_capture_max_ms = 0.0
+    self.auto_capture_ema_ms = 0.0
+    self.writer_queue_peak = 0
+    self._auto_enabled_cache = bool(self.auto_lc_config_enabled)
+    self._auto_enabled_check_ns = 0
     self.last_error = ''
     self._enabled_cache = True
     self._enabled_check_ns = 0
@@ -602,11 +691,263 @@ class MLCaseCollector:
     start_ns = press.mono_ns - int(self.pre_s * 1e9)
     end_ns = press.mono_ns + int(self.post_s * 1e9)
     part, final = self._paths(press)
-    p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.post_s, build_meta, self.session_id)
+    p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.post_s, build_meta, self.session_id,
+                     label_source='manual_key', output_root=self.base_dir)
     for mono_ns, frame in self.ring:
       p.add(mono_ns, frame)
     self.pending.append(p)
     print(f'[G80 ML] {press.side} {press.label} -> RAM capture {self.pre_s:.1f}s before / {self.post_s:.1f}s after', flush=True)
+
+  def auto_lc_enabled(self, now_ns: int | None = None) -> bool:
+    now_ns = int(now_ns or time.monotonic_ns())
+    if now_ns - self._auto_enabled_check_ns >= 1_000_000_000 or self._auto_enabled_check_ns == 0:
+      self._auto_enabled_cache = bool(self.auto_lc_config_enabled and not self.auto_lc_disable_marker.exists())
+      self._auto_enabled_check_ns = now_ns
+    return self._auto_enabled_cache
+
+  def _auto_paths(self, side: str) -> tuple[Path, Path]:
+    day = datetime.now().astimezone().strftime('%Y%m%d')
+    out_dir = self.auto_lc_dir / day
+    wall = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    self.counter += 1
+    stem = f'{wall}_AUTO_LC_{side.upper()}_{self.counter:04d}'
+    final = out_dir / f'{stem}.jsonl.gz'
+    part = out_dir / f'{stem}.jsonl.gz.part'
+    return part, final
+
+  @staticmethod
+  def _matching_blinker(ego: dict, side: str) -> bool:
+    if side == 'LEFT':
+      return bool(ego.get('leftBlinker')) and not bool(ego.get('rightBlinker'))
+    return bool(ego.get('rightBlinker')) and not bool(ego.get('leftBlinker'))
+
+  def _update_auto_rearm(self, ego: dict, intent: dict, now_ns: int):
+    """One physical lane-change may create only one auto case.
+
+    After a trigger, do not arm again merely because the fixed capture window
+    ended.  Require BOTH blinkers off and FG15 driver intent idle continuously.
+    This prevents a long ACTIVE phase from re-triggering the same maneuver.
+    """
+    if self.auto_armed or self.auto_candidate is not None:
+      return
+    both_off = not bool(ego.get('leftBlinker')) and not bool(ego.get('rightBlinker'))
+    intent_idle = not bool(intent.get('active')) and not bool(intent.get('committed'))
+    if both_off and intent_idle:
+      if not self.auto_rearm_since_ns:
+        self.auto_rearm_since_ns = int(now_ns)
+      elif now_ns - self.auto_rearm_since_ns >= int(self.auto_lc_rearm_off_s * 1e9):
+        self.auto_armed = True
+        self.auto_latched_side = None
+        self.auto_rearm_since_ns = 0
+        self.auto_rearm_count += 1
+        self.auto_last_result = 'AUTO-LC re-armed after blinker-off + intent-idle'
+    else:
+      self.auto_rearm_since_ns = 0
+
+  def _discard_auto_candidate(self, reason: str):
+    if self.auto_candidate is not None:
+      side = self.auto_candidate.get('side', '?')
+      self.auto_rejected_cases += 1
+      self.auto_last_result = f'{side} discarded: {reason}'
+      self.auto_candidate = None
+      self.auto_last_completed_ns = time.monotonic_ns()
+      print(f'[G80 ML AUTO] {side} candidate discarded ({reason})', flush=True)
+
+  def _start_auto_lane_change(self, core: dict, now_ns: int, side: str, intent: dict):
+    side = str(side).upper()
+    if side not in ('LEFT', 'RIGHT') or self.auto_candidate is not None or not self.auto_armed:
+      return
+    if self.auto_last_trigger_ns and now_ns - self.auto_last_trigger_ns < int(self.auto_lc_cooldown_s * 1e9):
+      return
+    press = KeyPress(int(now_ns), 0, side, AUTO_LC_SAFE_LABEL, 'AUTO_LANE_CHANGE_FG15_COMMIT')
+    start_ns = int(now_ns) - int(self.pre_s * 1e9)
+    end_ns = int(now_ns) + int(self.auto_lc_post_s * 1e9)
+    part, final = self._auto_paths(side)
+    trigger_phase = str(intent.get('phase') or '')
+    extra = {
+      'weak_label': True,
+      'training_default_include': False,
+      'auto_lane_change': {
+        'version': 2,
+        'trigger': 'FG15 driver_intent committed=True in LANE_CHANGE context',
+        'interpretation': 'executed-lane-change weak-label candidate, NOT proof of objective safety',
+        'review_required_before_promoting_to_manual_SAFE': True,
+        'one_case_per_maneuver_latch': True,
+        'rearm_policy': f'both blinkers OFF + FG15 intent idle for {self.auto_lc_rearm_off_s:.1f}s',
+        'safe_candidate_requires': 'FG15 ACTIVE phase observed + no DANGER/BSD/hard-override/emergency-decel',
+        'partial_execution_policy': 'REBASING without ACTIVE => AUTO_REVIEW',
+        'trigger_phase': trigger_phase,
+        'trigger_label': intent.get('label'),
+        'trigger_state': intent.get('state'),
+        'trigger_commit_age_s': intent.get('commit_age_s'),
+        'lane_commit_ready': intent.get('lane_commit_ready'),
+        'lane_commit_status': intent.get('lane_commit_status'),
+      }
+    }
+    p = _PendingCase(press, start_ns, end_ns, part, final, self.pre_s, self.auto_lc_post_s,
+                     core.get('runtime_versions', {}), self.session_id,
+                     label_source='auto_lane_change_weak', output_root=self.auto_lc_dir, extra_meta=extra)
+    for mono_ns, frame in self.ring:
+      p.add(mono_ns, frame)
+    self.auto_candidate = {
+      'case': p, 'side': side, 'start_ns': int(now_ns), 'max_commit_age_s': 0.0,
+      'saw_commit_hold': trigger_phase == 'COMMIT_HOLD',
+      'saw_rebasing': trigger_phase == 'REBASING',
+      'saw_active': trigger_phase == 'ACTIVE',
+      'saw_blinker_off': False, 'saw_turn_context': False,
+      'saw_danger': False, 'saw_bsd_block': False, 'saw_hard_override': False,
+      'saw_emergency_decel': False, 'min_a_ego': 99.0, 'max_abs_steer_deg': 0.0,
+      'samples': 0,
+    }
+    # Disarm immediately. Re-arming happens only after this whole maneuver has
+    # ended, not when the fixed +4.5 s capture window happens to end.
+    self.auto_armed = False
+    self.auto_latched_side = side
+    self.auto_rearm_since_ns = 0
+    self.auto_last_trigger_ns = int(now_ns)
+    self.auto_last_result = f'{side} auto candidate started'
+    print(f'[G80 ML AUTO] {side} lane-change COMMIT -> candidate capture', flush=True)
+
+  def _observe_auto_lane_change(self, core: dict, now_ns: int, frame: dict):
+    fg = core.get('future_gap', {}) or {}
+    intent = fg.get('driver_intent', {}) or {}
+    ego = core.get('ego_state', {}) or {}
+
+    if not self.auto_lc_enabled(now_ns):
+      # If the user disables AUTO-LC while a capture is live, do not leave a
+      # zombie candidate that can retain RAM forever. Do not write a partial weak label.
+      if self.auto_candidate is not None:
+        self._discard_auto_candidate('auto_disabled_mid_capture')
+      return
+
+    if self.auto_candidate is None:
+      self._update_auto_rearm(ego, intent, now_ns)
+      if not self.auto_armed:
+        return
+      side_l = str(intent.get('side') or '').lower()
+      side = side_l.upper()
+      matching = self._matching_blinker(ego, side) if side in ('LEFT', 'RIGHT') else False
+      phase = str(intent.get('phase') or '')
+      if (bool(intent.get('active')) and bool(intent.get('committed')) and
+          str(intent.get('maneuver_context') or '') == 'LANE_CHANGE' and
+          side in ('LEFT', 'RIGHT') and matching and
+          phase in ('COMMIT_HOLD', 'REBASING', 'ACTIVE')):
+        self._start_auto_lane_change(core, now_ns, side, intent)
+      return
+
+    c = self.auto_candidate
+    p: _PendingCase = c['case']
+    side = c['side']
+    c['samples'] += 1
+    p.add(now_ns, frame)
+
+    phase = str(intent.get('phase') or '')
+    if phase == 'COMMIT_HOLD': c['saw_commit_hold'] = True
+    if phase == 'REBASING': c['saw_rebasing'] = True
+    if phase == 'ACTIVE': c['saw_active'] = True
+    if str(intent.get('maneuver_context') or '') == 'TURN': c['saw_turn_context'] = True
+    if not self._matching_blinker(ego, side): c['saw_blinker_off'] = True
+
+    try:
+      c['max_commit_age_s'] = max(float(c['max_commit_age_s']), float(intent.get('commit_age_s') or 0.0))
+    except Exception:
+      pass
+    try:
+      c['max_abs_steer_deg'] = max(float(c['max_abs_steer_deg']), abs(float(ego.get('steeringAngleDeg') or 0.0)))
+    except Exception:
+      pass
+    try:
+      a = float(ego.get('aEgo') or 0.0)
+      c['min_a_ego'] = min(float(c['min_a_ego']), a)
+      if a <= -3.5:
+        c['saw_emergency_decel'] = True
+    except Exception:
+      pass
+
+    side_key = side.lower()
+    side_state = fg.get(side_key, {}) or {}
+    dec = side_state.get('decision', {}) or {}
+    if str(dec.get('state') or '') == 'BLOCKED_SHADOW' or str(dec.get('label') or '').upper().startswith('DANGER'):
+      c['saw_danger'] = True
+    bsd = fg.get('bsd', {}) or {}
+    blocked = bsd.get('blocked', {}) or {}
+    if bool(blocked.get(side_key)):
+      c['saw_bsd_block'] = True
+    hard = intent.get('hard_override') or {}
+    if isinstance(hard, dict) and bool(hard.get('confirmed')):
+      c['saw_hard_override'] = True
+
+    if now_ns < p.end_ns:
+      return
+
+    progressed = bool(c['saw_rebasing'] or c['saw_active'])
+    executed_confident = bool(c['saw_active'])
+    hazard = bool(c['saw_danger'] or c['saw_bsd_block'] or c['saw_hard_override'] or c['saw_emergency_decel'])
+    reject = bool(c['saw_turn_context'] or not progressed)
+
+    auto_meta = p.meta.setdefault('auto_lane_change', {})
+    if executed_confident and c['saw_blinker_off']:
+      completion_confidence = 'HIGH'
+    elif executed_confident:
+      completion_confidence = 'MEDIUM'
+    elif progressed:
+      completion_confidence = 'PARTIAL'
+    else:
+      completion_confidence = 'LOW'
+    auto_meta.update({
+      'saw_commit_hold': bool(c['saw_commit_hold']),
+      'saw_rebasing': bool(c['saw_rebasing']),
+      'saw_active': bool(c['saw_active']),
+      'saw_blinker_off': bool(c['saw_blinker_off']),
+      'saw_turn_context': bool(c['saw_turn_context']),
+      'saw_danger': bool(c['saw_danger']),
+      'saw_bsd_block': bool(c['saw_bsd_block']),
+      'saw_hard_override': bool(c['saw_hard_override']),
+      'saw_emergency_decel': bool(c['saw_emergency_decel']),
+      'min_a_ego_mps2': None if c['min_a_ego'] > 90 else round(float(c['min_a_ego']), 3),
+      'max_abs_steering_deg': round(float(c['max_abs_steer_deg']), 2),
+      'max_commit_age_s': round(float(c['max_commit_age_s']), 3),
+      'progressed': progressed,
+      'executed_confident': executed_confident,
+      'hazard_seen': hazard,
+      'completion_confidence': completion_confidence,
+    })
+
+    if reject:
+      self.auto_rejected_cases += 1
+      self.auto_last_result = f'{side} rejected: turn_or_no_lane_change_progress'
+      print(f'[G80 ML AUTO] {side} candidate discarded (turn/no lane-change progress)', flush=True)
+    else:
+      # A physical lane change is useful positive evidence, but it is still not
+      # objective ground truth. Only a full ACTIVE progression with no observed
+      # hard hazard becomes AUTO_SAFE_CANDIDATE. Partial/hazard cases go REVIEW.
+      if hazard:
+        p.press.label = AUTO_LC_REVIEW_LABEL
+        p.meta['label'] = AUTO_LC_REVIEW_LABEL
+        p.meta['training_default_include'] = False
+        p.meta['auto_lane_change']['promotion_reason'] = 'hazard_or_emergency_evidence_seen'
+        self.auto_review_cases += 1
+      elif not executed_confident:
+        p.press.label = AUTO_LC_REVIEW_LABEL
+        p.meta['label'] = AUTO_LC_REVIEW_LABEL
+        p.meta['training_default_include'] = False
+        p.meta['auto_lane_change']['promotion_reason'] = 'partial_progress_without_FG15_ACTIVE'
+        self.auto_review_cases += 1
+      else:
+        p.press.label = AUTO_LC_SAFE_LABEL
+        p.meta['label'] = AUTO_LC_SAFE_LABEL
+        p.meta['training_default_include'] = False
+        p.meta['auto_lane_change']['promotion_reason'] = 'FG15_ACTIVE_execution_without_observed_hard_hazard'
+        self.auto_saved_cases += 1
+      if not self._writer.submit(p, False):
+        self.last_error = 'writer queue full; auto lane-change case dropped'
+      self.auto_last_result = f'{side} saved as {p.press.label}; waiting for maneuver release before re-arm'
+      print(f'[G80 ML AUTO] {side} -> {p.press.label}', flush=True)
+
+    self.auto_candidate = None
+    self.auto_last_completed_ns = int(now_ns)
+    # Deliberately remain disarmed. _update_auto_rearm() will arm only after the
+    # blinker is OFF and FG15 intent is idle for the configured release interval.
 
   def _finish_due(self, now_ns: int):
     keep = []
@@ -636,7 +977,8 @@ class MLCaseCollector:
     except Exception:
       v = 0.0
     return (v < 0.5 and not bool(ego.get('leftBlinker')) and not bool(ego.get('rightBlinker'))
-            and len(core.get('sensor_fused_objects', []) or []) == 0 and not self.pending)
+            and len(core.get('sensor_fused_objects', []) or []) == 0 and not self.pending
+            and self.auto_candidate is None)
 
   def update(self, core: dict, now_ns: int, raw_objects=None, filtered_objects=None):
     """Call once per V50 publish loop. No filesystem/gzip work is done here."""
@@ -644,7 +986,10 @@ class MLCaseCollector:
       now_ns = int(now_ns)
       self._drain_keys(core.get('runtime_versions', {}))
 
-      if not self.enabled(now_ns) and not self.pending:
+      collector_enabled = self.enabled(now_ns)
+      if not collector_enabled and self.auto_candidate is not None:
+        self._discard_auto_candidate('collector_disabled_mid_capture')
+      if not collector_enabled and not self.pending:
         if self.ring:
           self.ring.clear()
         return
@@ -668,6 +1013,15 @@ class MLCaseCollector:
       self.ring.append((now_ns, frame))
       self._trim_ring(now_ns)
 
+      # AUTO-LC detection is RAM/state-machine work only. Keep its own timing so
+      # any regression is visible without conflating it with background file I/O.
+      _auto_t0 = time.perf_counter_ns()
+      self._observe_auto_lane_change(core, now_ns, frame)
+      _auto_ms = (time.perf_counter_ns() - _auto_t0) / 1e6
+      self.auto_capture_last_ms = _auto_ms
+      self.auto_capture_max_ms = max(self.auto_capture_max_ms, _auto_ms)
+      self.auto_capture_ema_ms = _auto_ms if self.auto_capture_ema_ms <= 0 else (0.95 * self.auto_capture_ema_ms + 0.05 * _auto_ms)
+
       for p in self.pending:
         p.add(now_ns, frame)
       self._finish_due(now_ns)
@@ -684,6 +1038,12 @@ class MLCaseCollector:
     for p in self.pending:
       self._writer.submit(p, True)
     self.pending.clear()
+    # Do not promote an unfinished automatic lane change on shutdown.
+    if self.auto_candidate is not None:
+      self.auto_rejected_cases += 1
+      self.auto_last_result = 'unfinished auto lane-change discarded on shutdown'
+      self.auto_candidate = None
+      self.auto_armed = False
     self._writer.close()
 
   def status(self) -> dict:
@@ -698,9 +1058,38 @@ class MLCaseCollector:
       'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
       'writer_queue': self._writer.q.qsize(),
       'saved_cases': self.saved_cases, 'last_saved_file': self.last_saved_file,
-      'output_dir': str(self.base_dir), 'last_error': self.last_error,
-      'disk_policy': 'labelled ML cases only; background writer',
-      'serialization_policy': 'RAM dict only in radar loop; JSON+gzip only in background writer',
+      'output_dir': str(self.base_dir),
+      'auto_lane_change': {
+        'enabled': self.auto_lc_enabled(),
+        'output_dir': str(self.auto_lc_dir),
+        'candidate_active': self.auto_candidate is not None,
+        'armed': bool(self.auto_armed),
+        'latched_side': self.auto_latched_side,
+        'rearm_off_sec': self.auto_lc_rearm_off_s,
+        'rearm_count': self.auto_rearm_count,
+        'post_sec': self.auto_lc_post_s,
+        'saved_safe_candidates': self.auto_saved_cases,
+        'saved_review_cases': self.auto_review_cases,
+        'rejected_cases': self.auto_rejected_cases,
+        'last_result': self.auto_last_result,
+        'capture_last_ms': round(self.auto_capture_last_ms, 4),
+        'capture_ema_ms': round(self.auto_capture_ema_ms, 4),
+        'capture_max_ms': round(self.auto_capture_max_ms, 4),
+        'label_policy': 'AUTO_SAFE_CANDIDATE requires FG15 ACTIVE + no hard hazard; weak label; training_default_include=false',
+      },
+      'writer': {
+        'active': bool(self._writer.active),
+        'queue': self._writer.q.qsize(),
+        'queue_peak': int(self.writer_queue_peak),
+        'write_count': int(self._writer.write_count),
+        'last_write_ms': round(self._writer.last_write_ms, 2),
+        'max_write_ms': round(self._writer.max_write_ms, 2),
+        'yield_every_frames': int(self.writer_yield_every_frames),
+        'yield_ms': round(self.writer_yield_s * 1000.0, 3),
+      },
+      'last_error': self.last_error,
+      'disk_policy': 'manual labels + separate AUTO-LC weak-label cases; cooperative-yield background writer only',
+      'serialization_policy': 'RAM dict only in radar loop; JSON+gzip only in yielding background writer',
     }
 
 
