@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""G80 V50 event-triggered ML case collector.
+"""G80 V51 event-triggered ML case collector.
 
 Design goals
 ------------
@@ -17,9 +17,9 @@ Design goals
 * AUTO_SAFE_CANDIDATE requires ACTIVE-phase evidence and no hard hazard. Partial
   or hazardous executions are AUTO_REVIEW, never silently promoted to SAFE.
 * Background JSON/gzip writes are chunk-yielded to reduce GIL/CPU bursts.
-* Runs inside V50 g80radard/live_service so training data is exactly the V50
+* Runs inside V51 g80radard/live_service so training data is exactly the V51
   state that a later inference module can consume.
-* Collector failures must never stop V50 radar monitoring.
+* Collector failures must never stop V51 radar monitoring.
 
 Default key map (Linux EV_KEY codes):
   F13 183 = LEFT SAFE
@@ -48,8 +48,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "g80_v50_ml_case_v1"
-COLLECTOR_VERSION = 7
+SCHEMA = "g80_v51_ml_case_v1"
+COLLECTOR_VERSION = 9
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -131,7 +131,7 @@ def _plain(v: Any):
 
 
 def _compact_object(o: dict) -> dict:
-  """Keep V50 identity, geometry, motion and provenance fields for ML/replay."""
+  """Keep V51 identity, geometry, motion and provenance fields for ML/replay."""
   # Full trajectories are intentionally retained: approaching/cut-in history is
   # valuable for training, and data is written only on labelled events.
   keys = (
@@ -165,7 +165,7 @@ def _compact_object(o: dict) -> dict:
 
 
 def _compact_frame(core: dict, raw_objects, filtered_objects, now_ns: int) -> dict:
-  """Snapshot inputs useful to a later PC-trained V50 inference model."""
+  """Snapshot inputs useful to a later PC-trained V51 inference model."""
   return {
     'type': 'frame',
     'mono_ns': int(now_ns),
@@ -179,7 +179,7 @@ def _compact_frame(core: dict, raw_objects, filtered_objects, now_ns: int) -> di
     'front_sensor_objects': [_compact_object(o) for o in (core.get('front_sensor_objects', []) or [])],
     'corner_fused_objects': [_compact_object(o) for o in (core.get('corner_fused_objects', []) or [])],
     'camera_leads': [_compact_object(o) for o in (core.get('camera_leads', []) or [])],
-    # V50 raw/validity-gated radar snapshots are supplied directly by live_service,
+    # V51 raw/validity-gated radar snapshots are supplied directly by live_service,
     # so this collector does not need to keep the browser awake.
     'raw_objects': [_compact_object(o) for o in (raw_objects or [])],
     'filtered_objects': [_compact_object(o) for o in (filtered_objects or [])],
@@ -355,6 +355,9 @@ def _fast_frame(core: dict, now_ns: int) -> dict:
     'road_model': _compact_road_model(core.get('road_model', {})),
     # Canonical360 is the intended ML object input. Keep the rich per-object fields/trajectories.
     'sensor_fused_objects': [_compact_object(o) for o in (core.get('sensor_fused_objects', []) or [])],
+    # V51: StarPilot-derived side-window vision is a 10 Hz feature snapshot,
+    # but remains SHADOW evidence and is not allowed to rewrite FG labels here.
+    'side_vision': _plain(core.get('side_vision', {})),
     'future_gap_summary': _compact_future_gap(core.get('future_gap', {})),
     'scc_teacher': _plain(core.get('scc_teacher', {})),
     'teacher_rear': _plain(core.get('teacher_rear', [])),
@@ -449,7 +452,7 @@ class _PendingCase:
 
 
 class _CaseWriter(threading.Thread):
-  """Background-only gzip/file writer so ML labels cannot block V50 rendering/fusion."""
+  """Background-only gzip/file writer so ML labels cannot block V51 rendering/fusion."""
   def __init__(self, owner):
     super().__init__(name='g80-ml-writer', daemon=True)
     self.owner = owner
@@ -493,6 +496,12 @@ class _CaseWriter(threading.Thread):
     try:
       p.final_path.parent.mkdir(parents=True, exist_ok=True)
       p.meta['performance_profile']['training_fast_hz'] = self.owner.sample_hz
+      _ints = list(self.owner.capture_intervals_ns)
+      _avg = (sum(_ints) / len(_ints)) if _ints else 0
+      p.meta['performance_profile']['actual_capture_hz'] = round(1e9 / _avg, 3) if _avg > 0 else None
+      p.meta['performance_profile']['max_frame_gap_ms'] = round(max(_ints) / 1e6, 3) if _ints else None
+      p.meta['performance_profile']['capture_missed_slots'] = int(self.owner.capture_missed_slots)
+      p.meta['performance_profile']['capture_policy'] = 'real V51 snapshots only; no interpolation/duplicate frames'
       p.meta['performance_profile']['diagnostic_context_hz'] = self.owner.context_hz
       p.meta['performance_profile']['writer_yield_every_frames'] = self.owner.writer_yield_every_frames
       p.meta['performance_profile']['writer_yield_ms'] = round(self.owner.writer_yield_s * 1000.0, 3)
@@ -544,10 +553,10 @@ class _CaseWriter(threading.Thread):
 
 
 class MLCaseCollector:
-  """Low-overhead RAM history + key-triggered labelled case recorder for V50."""
+  """Low-overhead RAM history + key-triggered labelled case recorder for V51."""
   def __init__(self, start_keyboard: bool = True):
-    self.base_dir = Path(os.getenv('G80_ML_CASE_DIR', '/data/radar/ml_cases_v50'))
-    self.auto_lc_dir = Path(os.getenv('G80_ML_AUTO_LC_DIR', '/data/radar/ml_cases_v50_auto_lanechange'))
+    self.base_dir = Path(os.getenv('G80_ML_CASE_DIR', '/data/radar/ml_cases_v51'))
+    self.auto_lc_dir = Path(os.getenv('G80_ML_AUTO_LC_DIR', '/data/radar/ml_cases_v51_auto_lanechange'))
     self.disable_marker = Path(os.getenv('G80_ML_DISABLE_MARKER', '/data/radar/DISABLE_G80_ML_CASES'))
     self.auto_lc_disable_marker = Path(os.getenv('G80_ML_AUTO_LC_DISABLE_MARKER', '/data/radar/DISABLE_G80_AUTO_LC'))
     self.auto_lc_config_enabled = _env_bool('G80_ML_AUTO_LC_ENABLE', True)
@@ -575,6 +584,11 @@ class MLCaseCollector:
     self.ring = deque()  # (mono_ns, compact plain-Python frame); RAM only
     self.last_sample_ns = 0
     self.last_context_ns = 0
+    # Measure actual ML snapshot cadence; never synthesize duplicate frames.
+    self.capture_intervals_ns = deque(maxlen=128)
+    self.capture_samples = 0
+    self.capture_missed_slots = 0
+    self.capture_max_gap_ns = 0
     self.session_id = uuid.uuid4().hex
     self._ego_extra = {k: None for k in EGO_EXTRA_FIELDS}
     self._ego_present = {k: False for k in EGO_EXTRA_FIELDS}
@@ -797,6 +811,7 @@ class MLCaseCollector:
       'saw_blinker_off': False, 'saw_turn_context': False,
       'saw_danger': False, 'saw_bsd_block': False, 'saw_hard_override': False,
       'saw_emergency_decel': False, 'min_a_ego': 99.0, 'max_abs_steer_deg': 0.0,
+      'saw_side_vision_active': False, 'max_side_vision_score': 0.0,
       'samples': 0,
     }
     # Disarm immediately. Re-arming happens only after this whole maneuver has
@@ -877,6 +892,19 @@ class MLCaseCollector:
     if isinstance(hard, dict) and bool(hard.get('confirmed')):
       c['saw_hard_override'] = True
 
+    # V51 camera evidence is deliberately observational.  Log whether the
+    # StarPilot-derived side vision saw a car during the executed maneuver, but
+    # do not let an unvalidated camera model promote/demote AUTO_SAFE labels.
+    sv = core.get('side_vision', {}) or {}
+    sv_side = sv.get(side_key, {}) or {}
+    try:
+      if bool(sv.get('usable')) and bool(sv_side.get('effective_active', sv_side.get('active'))):
+        c['saw_side_vision_active'] = True
+      score = float(sv_side.get('score') or sv_side.get('raw_confidence') or 0.0)
+      c['max_side_vision_score'] = max(float(c['max_side_vision_score']), score)
+    except Exception:
+      pass
+
     if now_ns < p.end_ns:
       return
 
@@ -904,6 +932,9 @@ class MLCaseCollector:
       'saw_bsd_block': bool(c['saw_bsd_block']),
       'saw_hard_override': bool(c['saw_hard_override']),
       'saw_emergency_decel': bool(c['saw_emergency_decel']),
+      'saw_side_vision_active': bool(c['saw_side_vision_active']),
+      'max_side_vision_score': round(float(c['max_side_vision_score']), 4),
+      'side_vision_policy': 'logged for correlation only; excluded from AUTO_SAFE promotion in V51',
       'min_a_ego_mps2': None if c['min_a_ego'] > 90 else round(float(c['min_a_ego']), 3),
       'max_abs_steering_deg': round(float(c['max_abs_steer_deg']), 2),
       'max_commit_age_s': round(float(c['max_commit_age_s']), 3),
@@ -981,7 +1012,7 @@ class MLCaseCollector:
             and self.auto_candidate is None)
 
   def update(self, core: dict, now_ns: int, raw_objects=None, filtered_objects=None):
-    """Call once per V50 publish loop. No filesystem/gzip work is done here."""
+    """Call once per V51 publish loop. No filesystem/gzip work is done here."""
     try:
       now_ns = int(now_ns)
       self._drain_keys(core.get('runtime_versions', {}))
@@ -998,7 +1029,17 @@ class MLCaseCollector:
       if self.last_sample_ns and now_ns - self.last_sample_ns < interval_ns * 0.85:
         self._finish_due(now_ns)
         return
+      # Keep the existing low-overhead sampling path. Measure the real cadence
+      # delivered by live_service instead of interpolating/duplicating stale frames.
+      if self.last_sample_ns:
+        gap_ns = max(0, now_ns - self.last_sample_ns)
+        self.capture_intervals_ns.append(gap_ns)
+        self.capture_max_gap_ns = max(self.capture_max_gap_ns, gap_ns)
+        nominal_slots = max(1, int(round(gap_ns / max(self.min_interval_ns, 1))))
+        if nominal_slots > 1:
+          self.capture_missed_slots += nominal_slots - 1
       self.last_sample_ns = now_ns
+      self.capture_samples += 1
 
       frame = _fast_frame(core, now_ns)
       frame['session_id'] = self.session_id
@@ -1009,7 +1050,7 @@ class MLCaseCollector:
         frame['context_detail'] = _context_detail(core, raw_objects, filtered_objects)
         self.last_context_ns = now_ns
 
-      # V50: no json.dumps() in the radar publish loop. Serialize only in the background writer.
+      # V51: no json.dumps() in the radar publish loop. Serialize only in the background writer.
       self.ring.append((now_ns, frame))
       self._trim_ring(now_ns)
 
@@ -1047,6 +1088,14 @@ class MLCaseCollector:
     self._writer.close()
 
   def status(self) -> dict:
+    intervals = list(self.capture_intervals_ns)
+    if intervals:
+      avg_gap_ns = sum(intervals) / len(intervals)
+      actual_capture_hz = (1e9 / avg_gap_ns) if avg_gap_ns > 0 else None
+      max_frame_gap_ms = max(intervals) / 1e6
+    else:
+      actual_capture_hz = None
+      max_frame_gap_ms = None
     return {
       'schema': SCHEMA, 'collector_version': COLLECTOR_VERSION, 'enabled': self.enabled(),
       'session_id': self.session_id, 'ego_extension_hook_received': bool(self._ego_updates),
@@ -1055,6 +1104,12 @@ class MLCaseCollector:
       'input_devices': len(self._thread.fds) if self._thread else 0,
       'pre_sec': self.pre_s, 'post_sec': self.post_s,
       'sample_hz': self.sample_hz, 'context_hz': self.context_hz, 'idle_hz': self.idle_hz,
+      'actual_capture_hz': None if actual_capture_hz is None else round(actual_capture_hz, 3),
+      'max_frame_gap_ms': None if max_frame_gap_ms is None else round(max_frame_gap_ms, 3),
+      'capture_samples': int(self.capture_samples),
+      'capture_missed_slots': int(self.capture_missed_slots),
+      'capture_policy': 'real V51 snapshots only; no interpolation/duplicate frames',
+      'side_vision_fast_input': True,
       'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
       'writer_queue': self._writer.q.qsize(),
       'saved_cases': self.saved_cases, 'last_saved_file': self.last_saved_file,
@@ -1094,7 +1149,7 @@ class MLCaseCollector:
 
 
 def _key_test():
-  print('G80 V50 ML keypad test. Press F13..F18; Ctrl-C to stop.')
+  print('G80 V51 ML keypad test. Press F13..F18; Ctrl-C to stop.')
   print('F13 LEFT SAFE | F14 LEFT CHECK | F15 LEFT DANGER | F16 RIGHT SAFE | F17 RIGHT CHECK | F18 RIGHT DANGER')
   q = queue.SimpleQueue(); stop = threading.Event(); t = _InputThread(q, DEFAULT_KEYMAP, stop); t.start()
   try:
@@ -1113,4 +1168,4 @@ if __name__ == '__main__':
   if '--key-test' in sys.argv:
     _key_test()
   else:
-    print('This module is integrated into V50 live_service. Use --key-test to test the two keypads.')
+    print('This module is integrated into V51 live_service. Use --key-test to test the two keypads.')

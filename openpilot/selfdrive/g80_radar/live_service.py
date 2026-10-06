@@ -13,10 +13,10 @@ from openpilot.selfdrive.g80_radar.teacher_fusion import SCC_CONTROL_ADDR,DEFAUL
 from openpilot.selfdrive.g80_radar.android_packet import build_render_packet, PROTOCOL_VERSION
 from openpilot.selfdrive.g80_radar.camera_fusion import decode_model_leads,CameraRadarFusion,VehicleFootprintTracker
 from openpilot.selfdrive.g80_radar.shadow_leads import ShadowLeadVerifier,snapshot_production_radar_state
-from openpilot.selfdrive.g80_radar.shadow_logger import ShadowLogger, LOGGER_SERVICE_VERSION
+from openpilot.selfdrive.g80_radar.shadow_logger import LOGGER_SERVICE_VERSION
 from openpilot.selfdrive.g80_radar.front_standard_preview import StandardFrontPreview
 from openpilot.selfdrive.g80_radar.road_geometry import extract_road_model,road_model_with_age,path_as_tuples,annotate_objects
-from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG, RELEASE_NAME, COORDINATE_X_ORIGIN, EGO_DISPLAY_LENGTH_M, EGO_DISPLAY_CENTER_X_M, OBJECT_X_ADJUSTMENT_M, FUTURE_GAP_API_VERSION as BUILD_FUTURE_GAP_API_VERSION
+from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, BUILD_TAG, COORDINATE_X_ORIGIN, EGO_DISPLAY_LENGTH_M, EGO_DISPLAY_CENTER_X_M, OBJECT_X_ADJUSTMENT_M, FUTURE_GAP_API_VERSION as BUILD_FUTURE_GAP_API_VERSION, SIDE_VISION_API_VERSION as BUILD_SIDE_VISION_API_VERSION
 from openpilot.selfdrive.g80_radar.kalman_motion import KalmanMotionTracker, KALMAN_API_VERSION
 from openpilot.selfdrive.g80_radar.canonical_tracker import Canonical360Tracker
 from openpilot.selfdrive.g80_radar.imm_motion import ImmMotionTracker, IMM_API_VERSION
@@ -33,15 +33,64 @@ HTTP_PORT=int(os.getenv('G80_RADAR_HTTP_PORT','28992'))
 WEB_STATUS_PATH=Path(os.getenv('G80_RADAR_WEB_STATUS_PATH','/data/radar/g80_web_status.json'))
 STATE_PATH=Path(os.getenv('G80_RADAR_STATE_PATH','/dev/shm/g80_radar.json'))
 PUBLISH_HZ=float(os.getenv('G80_RADAR_PUBLISH_HZ','10'))
-CAN_DRAIN_MAX_MSGS=max(32,int(os.getenv('G80_CAN_DRAIN_MAX_MSGS','2000')))
-CAN_DRAIN_GUARD_MS=max(2.0,float(os.getenv('G80_CAN_DRAIN_GUARD_MS','8.0')))
-CAN_DRAIN_GUARD_S=CAN_DRAIN_GUARD_MS/1000.0
 state_lock=threading.Lock()
 browser_lock=threading.Lock()
 browser_last_poll_ns=0
 BROWSER_ACTIVE_NS=int(float(os.getenv('G80_BROWSER_ACTIVE_SEC','2.0'))*1e9)
 DEBUG_STATE_HZ=max(0.0,float(os.getenv('G80_DEBUG_STATE_HZ','0')))
 UI_STATE_HZ=max(2.0,float(os.getenv('G80_UI_STATE_HZ','8.0')))
+CAN_DRAIN_GUARD_S=max(0.002,float(os.getenv('G80_CAN_DRAIN_GUARD_MS','8.0'))/1000.0)
+SIDE_VISION_UDP_PORT=int(os.getenv('G80_SIDE_VISION_UDP_PORT','28993'))
+SIDE_VISION_FRESH_NS=int(float(os.getenv('G80_SIDE_VISION_FRESH_SEC','1.6'))*1e9)
+
+class _DisabledShadowLogger:
+  def status(self):
+    return {'enabled':False,'hard_disabled':True,'service_version':BUILD_VERSION,'files_created':0,'records':0,'event_records':0,'last_write_ns':0,'path':None,'last_error':'','policy':'V51 ML-only: continuous shadow log permanently disabled'}
+
+def _blank_side_vision(error='waiting_for_g80sidevision'):
+  return {'api_version':BUILD_SIDE_VISION_API_VERSION,'source':'G80_V51_SIDE_VISION','fusion_mode':'SHADOW_ONLY','enabled':False,'model_valid':False,'config_loaded':False,'camera_connected':False,'fresh':False,'inference_fresh':False,'usable':False,'age_ms':None,'inference_age_ms':None,'left':{'active':False,'raw_confidence':0.0,'score':0.0},'right':{'active':False,'raw_confidence':0.0,'score':0.0},'last_error':error,'setup_url_port':28994}
+
+def _drain_side_vision(sock,state,now_ns):
+  newest=None
+  if sock is not None:
+    for _ in range(16):
+      try:
+        dat,_addr=sock.recvfrom(65535)
+      except BlockingIOError:
+        break
+      except OSError:
+        break
+      try:
+        obj=json.loads(dat.decode('utf-8'))
+        if isinstance(obj,dict) and int(obj.get('api_version',0) or 0)==BUILD_SIDE_VISION_API_VERSION:
+          newest=obj
+      except Exception:
+        continue
+  if newest is not None:
+    state=newest
+  out=dict(state or _blank_side_vision())
+  pkt_ns=int(out.get('packet_mono_ns',0) or 0)
+  age_ns=(int(now_ns)-pkt_ns) if pkt_ns else None
+  fresh=bool(age_ns is not None and -50_000_000 <= age_ns <= SIDE_VISION_FRESH_NS)
+  out['age_ms']=None if age_ns is None else round(age_ns/1e6,1)
+  out['fresh']=fresh
+  inf_ns=int(out.get('last_inference_mono_ns',0) or 0)
+  inf_age_ns=(int(now_ns)-inf_ns) if inf_ns else None
+  try:
+    expected_interval_s=max(0.15,float(out.get('inference_interval_s',1.0) or 1.0))
+  except Exception:
+    expected_interval_s=1.0
+  inference_fresh_limit_ns=int(max(2.0, expected_interval_s*2.5+0.5)*1e9)
+  inference_fresh=bool(inf_age_ns is not None and -50_000_000 <= inf_age_ns <= inference_fresh_limit_ns)
+  out['inference_age_ms']=None if inf_age_ns is None else round(inf_age_ns/1e6,1)
+  out['inference_fresh']=inference_fresh
+  out['usable']=bool(fresh and inference_fresh and out.get('camera_connected') and out.get('enabled') and out.get('model_valid') and out.get('config_loaded'))
+  for side in ('left','right'):
+    sd=dict(out.get(side,{}) or {})
+    sd.setdefault('active',False);sd.setdefault('raw_confidence',0.0);sd.setdefault('score',0.0)
+    sd['effective_active']=bool(out['usable'] and sd.get('active'))
+    out[side]=sd
+  return out
 
 def mark_browser_active():
   global browser_last_poll_ns
@@ -60,11 +109,11 @@ def _optional_sub_sock(name):
   except Exception:
     return None
 
-latest_state={'version':BUILD_VERSION,'release':RELEASE_NAME,'sensor_fused_objects':[],'corner_fused_objects':[],'front_objects':[],'standard_front_preview':[],'filtered_objects':[],'raw_objects':[],'traffic_signal_probe':{}}
+latest_state={'version':BUILD_VERSION,'sensor_fused_objects':[],'corner_fused_objects':[],'front_objects':[],'standard_front_preview':[],'filtered_objects':[],'raw_objects':[],'traffic_signal_probe':{}}
 latest_state_json=json.dumps(latest_state,separators=(',',':')).encode()
 
 HTML=r'''<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><title>G80 V50R1 · Seven-Stage Radar Lab</title>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><title>G80 V51 · Seven-Stage Radar Lab</title>
 <style>
 :root{--bg:#07111a;--panel:#0c1d29;--line:#2b4859;--text:#e7f4fa;--muted:#91abba;--cyan:#28dae3;--navy:#236cff;--pink:#ff559e;--lime:#7fe16e;--orange:#ff982e;--gold:#f6c744;--red:#fb4967}
 *{box-sizing:border-box}html,body{margin:0;height:100%;width:100%;background:var(--bg);color:var(--text);font-family:Arial,'Noto Sans KR',sans-serif;overflow:hidden}
@@ -108,7 +157,7 @@ footer{flex:none;border-top:1px solid #284658;background:#07131c;padding:3px 11p
 @media(max-width:770px){.panel{width:210px}.brand strong{font-size:14px}.brand .sub{font-size:9px}.stagebar span{max-width:65vw}.signal{left:53%;min-height:76px;width:60vw;gap:7px;padding:7px 10px}.lamp{height:18px;width:18px;font-size:13px}.signal-text strong{font-size:12px}.big-arrow{height:70px;width:41px}}
 </style></head>
 <body>
-<header><div class="brand"><strong>G80 5-RADAR <span style="color:#2fdbf6">V50R1</span> · STAGE LAB</strong><div class="sub">7 STAGES · FG15 BSD + TARGET LANE · ML CASE ONLY · SHADOW LOG OFF</div></div><span class="conn" id="conn">● CONNECTING</span></header>
+<header><div class="brand"><strong>G80 5-RADAR <span style="color:#2fdbf6">V51</span> · STAGE LAB</strong><div class="sub">7 STAGES · LEGACY ROAD/VEHICLE VISUAL · FG15 BSD + TARGET LANE · SHADOW ONLY</div></div><span class="conn" id="conn">● CONNECTING</span></header>
 <div class="toolbar"><div class="tabRail" id="modes">
 <button data-mode="raw">RAW<span class="small">DECODE</span></button>
 <button data-mode="raw_filtered">RAW FILTERED<span class="small">VALIDITY ONLY</span></button>
@@ -117,7 +166,7 @@ footer{flex:none;border-top:1px solid #284658;background:#07131c;padding:3px 11p
 <button data-mode="all" class="active">360 + FRONT<span class="small">CANONICAL</span></button>
 <button data-mode="l1l2">L1 + L2<span class="small">SELECTED SHADOW</span></button>
 <button data-mode="std">STD<span class="small">RADARPOINT PREVIEW</span></button>
-</div><div class="control"><button data-range="short">SHORT</button><button data-range="long">LONG</button><button data-range="wide">WIDE</button><button data-range="drive" class="active">3-LANE</button><button id="signalToggle" class="warn">SIGNAL ON</button><button id="hud">HUD ↗</button><button id="fs">⛶</button></div></div>
+</div><div class="control"><button data-range="short">SHORT</button><button data-range="long">LONG</button><button data-range="wide">WIDE</button><button data-range="drive" class="active">3-LANE</button><button id="signalToggle" class="warn">SIGNAL ON</button><button id="camSetup">CAM SETUP ↗</button><button id="hud">HUD ↗</button><button id="fs">⛶</button></div></div>
 <div class="stagebar"><strong id="stageName">360 + FRONT</strong><span id="stageDesc">Canonical 360: front and corner radar with camera corroboration, once per Vxxxx</span></div>
 <div class="main"><div class="scene" id="scene"><canvas id="radar"></canvas><div class="stage-pill"><strong id="stageLabel">360 + FRONT · 0 objects</strong><div class="mini" id="stageNote">SOURCE MASK / TRACE KEY · SORT NEAREST FIRST</div></div>
 <div class="signal" id="signalPanel"><div class="lights"><span class="lamp red" id="lr"></span><span class="lamp yellow" id="ly"></span><span class="lamp arrow" id="la">➜</span><span class="lamp green" id="lg"></span></div><div class="signal-text"><strong id="sigTitle">SIGNAL ? · E2E DIAGNOSTIC</strong><span id="sigMeta">Waiting for model...</span><small>실제 신호등 색 분류 아님 · 모니터 전용</small></div></div>
@@ -199,7 +248,7 @@ function drawRoad(){const a=viewCfg(),rm=state?.road_model||{},fresh=!!rm.fresh&
 }
 function clampPx(v,lo,hi){return Math.max(lo,Math.min(hi,v))}
 function carSymbol(x,y,color,label,o,ego=false){const a=viewCfg();let [sx,sy]=loc(x,y),width,height;
- // V50 geometry review (inherited V50 geometry):
+ // V51-H geometry review:
  // - x/y radar coordinates stay untouched.
  // - DRIVE/WIDE body length follows the longitudinal scale with only a small readability floor.
  // - width is derived from body length, not lateral mppX, because WIDE deliberately stretches the road laterally.
@@ -220,12 +269,12 @@ function updateArrows(){const fg=state?.future_gap||{},di=fg.driver_intent||{};f
 function updateSignal(){qs('signalPanel').classList.toggle('off',!signalOn);qs('signalToggle').textContent=signalOn?'SIGNAL ON':'SIGNAL OFF';if(!state)return;const t=state.traffic_signal_probe||{},st=String(t.state||'UNKNOWN'),turn=String(t.turn_direction||'NONE');for(const id of ['lr','ly','la','lg'])qs(id).classList.remove('on');let text='SIGNAL UNKNOWN',color='#d7edf5';if(st==='GREEN_GO'){qs('lg').classList.add('on');text='GREEN / GO · E2E';color='#66eda0'}else if(st==='RED_CANDIDATE'){qs('ly').classList.add('on');text='RED ? · INFERRED STOP';color='#fbd38e'}else if(st.includes('STOP')||st==='WATCH'){qs('ly').classList.add('on');text=String(t.label||'STOP/HOLD · LIGHT ?');color='#ebd28d'}else if(st==='WAIT_LEAD'){text='LEAD AHEAD';}else if(st==='DRIVING'){text='DRIVING · LIGHT ?'}
  if(st==='GREEN_GO'&&['LEFT','RIGHT'].includes(turn)){qs('la').classList.add('on');qs('la').textContent=turn==='LEFT'?'←':'→'}else qs('la').textContent='↔';qs('sigTitle').textContent=text;qs('sigTitle').style.color=color;qs('sigMeta').textContent=`path ${n(t.path_horizon_m)}m · stop ${t.should_stop===true?'1':t.should_stop===false?'0':'?'} · SP green ${t.sunnypilot_green_alert?'1':'0'} · plan ${turn}`;
 }
-function updateUI(){const d=MODE_INFO[mode],audit=state.web_stage_stats||{},cnt=audit.counts||{},fg=state.future_gap||{},di=fg.driver_intent||{},sig=state.traffic_signal_probe||{},rm=state.road_model||{},performance=state.performance_stats||{},dg=state.diagnostics||{};
+function updateUI(){const d=MODE_INFO[mode],audit=state.web_stage_stats||{},cnt=audit.counts||{},fg=state.future_gap||{},di=fg.driver_intent||{},sig=state.traffic_signal_probe||{},rm=state.road_model||{},performance=state.performance_stats||{},sv=state.side_vision||{};
  qs('stageName').textContent=d[0];qs('stageDesc').textContent=d[1];qs('stageMeaning').textContent=d[1];qs('stageLabel').textContent=d[0]+' · '+visible.length+' objects';qs('stageNote').textContent= mode==='all'?'ONE V-ID PER OBJECT · FRONT ALREADY INCLUDED':mode==='raw_filtered'?'NO CROSS-SOURCE DEDUP · RAW VALIDITY':'MONITOR ONLY · SENSOR PROVENANCE';
  const modes=['raw','raw_filtered','corner_fused','front_fused','all','l1l2','std'];qs('stageCounts').innerHTML=modes.map(k=>`<div class="modecount ${k===mode?'chosen':''}"><span>${k==='raw_filtered'?'RAW FILT':k==='corner_fused'?'CORNER':k==='front_fused'?'FRONT':k==='all'?'360+FRONT':k==='l1l2'?'L1/L2':k.toUpperCase()}</span><b>${Number(cnt[k]??dataList(KEYS[k]).length)}</b></div>`).join('');
  const mismatches=state.web_stage_errors||[],miss=Number(audit.front_unmatched_inside_view_roi||0),oor=Number(audit.front_outside_view_roi||0);qs('stageAudit').innerHTML=`<b>RAW → FILTER:</b> ${cnt.raw??0} → ${cnt.raw_filtered??0} (실제 융합 입력 ${cnt.production_filtered??0})<br><b>FRONT ROI:</b> 캐노니컬 out ${oor}, 내부 trace 미연결 ${miss}<br><b>Canonical key 중복:</b> ${audit.canonical_duplicate_keys??0} · <b>계약:</b> <span style="color:${mismatches.length?'#fa8192':'#80e7a3'}">${mismatches.length?mismatches.join(', '):'OK'}</span>`;
  const left=fg.left?.decision||{},right=fg.right?.decision||{},s=fg.stats||{},fmt=v=>v==null?'--':n(v)+'m';const le=fg.left?.fg11_evidence||fg.left?.fg10_evidence||fg.left?.fg9_evidence||{},re=fg.right?.fg11_evidence||fg.right?.fg10_evidence||fg.right?.fg9_evidence||{};
- qs('telemetry').innerHTML=[['서버 버전',String(state.runtime_versions?.tag||'--').split('-').slice(0,2).join('-')],['FG/WEB',String(state.runtime_versions?.future_gap_api||'?')+' / '+String(state.version||'?')],['현재 모드',mode.toUpperCase()],['ROAD',rm.fresh?'FRESH '+n(rm.age_ms,0)+'ms':'STALE'],['Driver intent',String(di.state||'STANDBY')],['LEFT / RIGHT',(left.label||'--')+' / '+(right.label||'--')],['LEFT reason',(left.reasons||[]).join(', ')||'--'],['RIGHT reason',(right.reasons||[]).join(', ')||'--'],['NOW rear L/R',fmt(le.current_rear_gap_m)+' / '+fmt(re.current_rear_gap_m)],['2D CONFLICT L/R',fmt((fg.left?.fg12_evidence||fg.left?.fg11_evidence||{}).min_2d_conflict_time_s)+' / '+fmt((fg.right?.fg12_evidence||fg.right?.fg11_evidence||{}).min_2d_conflict_time_s)],['PRED rear L/R',fmt(le.predicted_rear_min_m)+' / '+fmt(re.predicted_rear_min_m)],['Core cycle',n(performance.processing_ms)+' ms'],['CAN drain',n(performance.input_drain_ms)+' ms'],['CAN lag',n(dg.last_transport_lag_ms)+' ms'],['Publish',n(performance.publish_interval_ms)+' ms'],['Publish late',n(performance.publish_lateness_ms)+' ms'],['Sched skips',String(performance.missed_publish_cycles_total??0)],['Shadow log',state.shadow_logger?.enabled?'LOGGING':'OFF']].map(([a,b])=>`<div class="metric"><span>${a}</span><b>${b}</b></div>`).join('');
+ qs('telemetry').innerHTML=[['서버 버전',String(state.runtime_versions?.tag||'--').split('-').slice(0,2).join('-')],['FG/WEB',String(state.runtime_versions?.future_gap_api||'?')+' / '+String(state.version||'?')],['현재 모드',mode.toUpperCase()],['ROAD',rm.fresh?'FRESH '+n(rm.age_ms,0)+'ms':'STALE'],['Driver intent',String(di.state||'STANDBY')],['LEFT / RIGHT',(left.label||'--')+' / '+(right.label||'--')],['SIDE CAM L/R',(sv.left?.effective_active?'CAR ':'clear ')+n(sv.left?.score,2)+' / '+(sv.right?.effective_active?'CAR ':'clear ')+n(sv.right?.score,2)],['SIDE CAM',sv.fresh?'FRESH '+n(sv.age_ms,0)+'ms · SHADOW':(sv.model_valid?'STALE / WAIT':'MODEL/CONFIG WAIT')],['LEFT reason',(left.reasons||[]).join(', ')||'--'],['RIGHT reason',(right.reasons||[]).join(', ')||'--'],['NOW rear L/R',fmt(le.current_rear_gap_m)+' / '+fmt(re.current_rear_gap_m)],['2D CONFLICT L/R',fmt((fg.left?.fg12_evidence||fg.left?.fg11_evidence||{}).min_2d_conflict_time_s)+' / '+fmt((fg.right?.fg12_evidence||fg.right?.fg11_evidence||{}).min_2d_conflict_time_s)],['PRED rear L/R',fmt(le.predicted_rear_min_m)+' / '+fmt(re.predicted_rear_min_m)],['Core cycle',n(performance.processing_ms)+' ms'],['CAN drain',n(performance.can_drain_ms)+' ms'],['Publish',n(performance.publish_interval_ms)+' ms'],['PUB late',n(performance.publish_late_ms)+' ms'],['Shadow log',state.shadow_logger?.enabled?'LOGGING':'OFF']].map(([a,b])=>`<div class="metric"><span>${a}</span><b>${b}</b></div>`).join('');
  qs('objTitle').textContent=d[0]+' · NEAREST';const rows=visible.slice().sort((a,b)=>Math.abs(Number(a.x))-Math.abs(Number(b.x))).slice(0,35);qs('objects').innerHTML=rows.length?rows.map(o=>{const color=col(o),p=origin(o),local=o.trace_local_key||o.key||'',c=String(o.canonical_key||''),badge=mode==='raw'||mode==='raw_filtered'?`${String(o.stage_origin||o.sensor||'')} · ${local}`:mode==='std'?String(o.preview_quality||'CANDIDATE'):mode==='l1l2'?String(o.shadow_validation_state||'SHADOW'):mask(o).join('+')||p;
  return `<div class="row"><span class="dot" style="background:${color}"></span><div><span class="label">${traceLabel(o).replaceAll('<','&lt;')}</span><div class="detail">${badge.replaceAll('<','&lt;')} ${mode!=='raw'&&mode!=='raw_filtered'&&o.canonical_key?` · ${String(o.trace_match_method||'')}`:''}</div></div><span class="value">${n(o.x)}m<br>${n(o.y)}y<br>${o.vx==null?'--':n(o.vx)+'m/s'}</span></div>`}).join(''):'<span class="desc">이 단계에서 표시할 객체가 없습니다.</span>';
  qs('reference').innerHTML=`<b style="color:#367dff">FRONT</b> · <b style="color:#1bdded">FL</b> · <b style="color:#ff61a8">FR</b> · <b style="color:#89e773">RL</b> · <b style="color:#ffa03d">RR</b><br>코너 색은 위치상의 사분면을 근거로 합니다. A/B 실제 센서 소유권이 4개 코너별로 확정됐다는 뜻은 아닙니다.<br><br>front fused는 abs(y)≤5.8m의 기존 내부 ROI로 제한됩니다. RAW FILTERED는 그룹1 미검증 후보를 제외하며 cross-sensor merge 전 단계를 관찰합니다.<br><br>STD 품질 및 E2E 신호 상태는 제어 검증용 표시입니다.`;
@@ -235,21 +284,21 @@ function setMode(k){if(!MODE_INFO[k])return;mode=k;document.querySelectorAll('[d
 function setRange(k){if(!LONG_RANGE[k])return;rangeMode=k;document.querySelectorAll('[data-range]').forEach(b=>b.classList.toggle('active',b.dataset.range===k));if(state)draw()}
 document.querySelectorAll('[data-mode]').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));
 document.querySelectorAll('[data-range]').forEach(b=>b.addEventListener('click',()=>setRange(b.dataset.range)));
-qs('signalToggle').onclick=()=>{signalOn=!signalOn;setPref('g80_signal',signalOn?'1':'0');updateSignal()};qs('hud').onclick=()=>window.open('/hud','_blank');qs('fs').onclick=async()=>{try{document.fullscreenElement?await document.exitFullscreen():await document.documentElement.requestFullscreen()}catch(_){}};
-let failures=0;async function poll(){try{const r=await fetch('/state',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);state=await r.json();lastRx=Date.now();failures=0;const rt=state.runtime_versions||{},bad=!!state.runtime_mismatch;const pf=state.performance_stats||{}, rel=state.release||('V'+(state.version||'?'));qs('conn').textContent=`● LIVE ${rel} FG${rt.future_gap_api||'?'} · CORE ${n(pf.processing_ms,1)}ms · PUB ${n(pf.publish_interval_ms,0)}ms${bad?' · RUNTIME MISMATCH':''}`;qs('conn').className='conn '+(bad?'bad':'good');visible=stageItems();updateUI();draw();for(const[k,v]of canonColor){if(Date.now()-v.seen>15000)canonColor.delete(k)}}catch(e){failures++;qs('conn').textContent='● WEB /STATE UNAVAILABLE '+failures;qs('conn').className='conn bad';for(const side of ['left','right']){qs(side+'Arrow').className='big-arrow off';qs(side+'Label').textContent=side.toUpperCase()+' CHECK DATA'}}setTimeout(poll,200)}
+qs('signalToggle').onclick=()=>{signalOn=!signalOn;setPref('g80_signal',signalOn?'1':'0');updateSignal()};qs('camSetup').onclick=()=>window.open('http://'+location.hostname+':'+String(state?.side_vision?.setup_url_port||28994)+'/','_blank');qs('hud').onclick=()=>window.open('/hud','_blank');qs('fs').onclick=async()=>{try{document.fullscreenElement?await document.exitFullscreen():await document.documentElement.requestFullscreen()}catch(_){}};
+let failures=0;async function poll(){try{const r=await fetch('/state',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);state=await r.json();lastRx=Date.now();failures=0;const rt=state.runtime_versions||{},bad=!!state.runtime_mismatch;qs('conn').textContent=`● LIVE V${state.version||'?'} FG${rt.future_gap_api||'?'} · ${n(state.performance_stats?.publish_interval_ms,0)}ms${bad?' · RUNTIME MISMATCH':''}`;qs('conn').className='conn '+(bad?'bad':'good');visible=stageItems();updateUI();draw();for(const[k,v]of canonColor){if(Date.now()-v.seen>15000)canonColor.delete(k)}}catch(e){failures++;qs('conn').textContent='● WEB /STATE UNAVAILABLE '+failures;qs('conn').className='conn bad';for(const side of ['left','right']){qs(side+'Arrow').className='big-arrow off';qs(side+'Label').textContent=side.toUpperCase()+' CHECK DATA'}}setTimeout(poll,200)}
 window.addEventListener('resize',()=>{if(state)draw()});updateSignal();poll();
 </script></body></html>
 '''
 
-HUD_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>G80 V50 Driver HUD</title><style>
+HUD_HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>G80 V51 Driver HUD</title><style>
 html,body{margin:0;width:100%;height:100%;background:#05090c;color:#fff;font-family:Arial,"Noto Sans KR",sans-serif;overflow:hidden}.wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center}.card{position:relative;width:96vw;height:82vh;border:4px solid #34454f;border-radius:28px;background:#0b1216;display:flex;align-items:center;justify-content:center;overflow:hidden}.center{z-index:3;min-width:40vw;max-width:52vw;text-align:center;padding:3vh 2vw;border-radius:22px;background:rgba(8,15,19,.80)}.dir{font-size:5vw;font-weight:900}.state{font-size:9vw;font-weight:1000}.gaps{font-size:2.6vw;font-weight:800;margin-top:12px}.reason{font-size:1.9vw;margin-top:10px}.phase{font-size:1.7vw;margin-top:8px;color:#d0e0e8}.note{margin-top:1.2vh;font-size:1.25vw;color:#9eb1ba}.sideArrow{position:absolute;top:53%;width:24vw;height:44vh;transform:translateY(-50%);opacity:.68;transition:all .12s;background:#455a64;filter:drop-shadow(0 8px 16px rgba(0,0,0,.55))}.sideArrow.left{left:2vw;clip-path:polygon(100% 0,0 50%,100% 100%,78% 50%)}.sideArrow.right{right:2vw;clip-path:polygon(0 0,100% 50%,0 100%,22% 50%)}.sideArrow.safe{background:#00c853}.sideArrow.check{background:#ffc400}.sideArrow.danger{background:#ff1744}.sideArrow.turn{background:#2979ff}.sideArrow.off{background:#455a64}.sideArrow.active{opacity:1;transform:translateY(-50%) scale(1.08);filter:drop-shadow(0 0 28px rgba(255,255,255,.72))}.sideArrow.pulse{animation:pulse .72s ease-in-out infinite alternate}@keyframes pulse{from{opacity:.72}to{opacity:1}}.sideLabel{position:absolute;bottom:3vh;font-size:1.5vw;font-weight:900;color:#d8e4e9;opacity:.82}.sideLabel.left{left:9vw}.sideLabel.right{right:9vw}.safeText{color:#69f0ae}.checkText{color:#ffd740}.dangerText{color:#ff5252}.turnText{color:#64b5f6}.standby{color:#aebec6}
 .hudSignal{position:absolute;z-index:8;top:2.2vh;left:50%;transform:translateX(-50%);width:66vw;min-height:14vh;border:3px solid #4b6472;border-radius:22px;background:rgba(5,14,20,.97);display:flex;align-items:center;justify-content:center;gap:2.0vw;padding:1.2vh 1.5vw;box-shadow:0 8px 26px rgba(0,0,0,.55)}.hSigHead{height:9.2vh;min-width:30vw;border:3px solid #687c88;border-radius:20px;background:#11191e;padding:.8vh 1vw;display:flex;align-items:center;justify-content:center;gap:1vw}.hBulb,.hArrow{width:6.1vh;height:6.1vh;border-radius:50%;background:#273036;border:2px solid #56646d;opacity:.42;display:flex;align-items:center;justify-content:center}.hBulb.red.on{background:#ff2638;border-color:#ff9ba3;opacity:1;box-shadow:0 0 2.0vh #ff2638}.hBulb.yellow.on{background:#ffd740;border-color:#fff2a7;opacity:1;box-shadow:0 0 2.0vh #ffd740}.hBulb.green.on{background:#00e676;border-color:#9effc9;opacity:1;box-shadow:0 0 2.0vh #00e676}.hArrow{font-size:4.5vh;font-weight:1000;color:#62747e}.hArrow.on{color:#8affc1;background:#0b4a31;border-color:#79ffb5;opacity:1;box-shadow:0 0 2.0vh rgba(0,230,118,.8)}.hSigText{min-width:28vw}.hSigMain{font-size:2.4vw;font-weight:1000;line-height:1.05}.hSigSub{font-size:1.15vw;font-weight:900;margin-top:.7vh;color:#d4e1e7}.hSigTiny{font-size:.82vw;color:#8198a4;margin-top:.45vh}.hGreen{color:#57f09a}.hRed{color:#ff6673}.hYellow{color:#ffe36b}.hGray{color:#a9bac3}
-</style></head><body><div class="wrap"><div class="card"><div class="hudSignal"><div class="hSigHead"><div id="hRed" class="hBulb red"></div><div id="hYellow" class="hBulb yellow"></div><div id="hArrow" class="hArrow">·</div><div id="hGreen" class="hBulb green"></div></div><div class="hSigText"><div id="hMain" class="hSigMain hGray">SIGNAL ? · MODEL STATE</div><div id="hSub" class="hSigSub">E2E probe waiting</div><div id="hTiny" class="hSigTiny">KR horizontal · * heuristic evidence</div></div></div><div id="leftA" class="sideArrow left off"></div><div id="rightA" class="sideArrow right off"></div><div class="sideLabel left">LEFT</div><div class="sideLabel right">RIGHT</div><div class="center"><div id="dir" class="dir standby">PREVIEW</div><div id="st" class="state standby">READY</div><div id="gap" class="gaps">LEFT -- · RIGHT --</div><div id="why" class="reason">삼각형 색으로 양쪽 상태 미리보기</div><div id="ph" class="phase">V50 FG15 BSD + TARGET LANE + RAW COMMIT LATCH + SIGNAL HUD</div></div></div><div class="note">신호표시는 E2E 진단용: RED?는 보수적 stop 후보, GREEN/GO는 stop→go edge이며 직접 램프 색 분류가 아닙니다. 화살표는 계획 회전방향입니다. 좌/우 삼각형도 SHADOW 비교용이며 제어 신호가 아닙니다.</div></div>
+</style></head><body><div class="wrap"><div class="card"><div class="hudSignal"><div class="hSigHead"><div id="hRed" class="hBulb red"></div><div id="hYellow" class="hBulb yellow"></div><div id="hArrow" class="hArrow">·</div><div id="hGreen" class="hBulb green"></div></div><div class="hSigText"><div id="hMain" class="hSigMain hGray">SIGNAL ? · MODEL STATE</div><div id="hSub" class="hSigSub">E2E probe waiting</div><div id="hTiny" class="hSigTiny">KR horizontal · * heuristic evidence</div></div></div><div id="leftA" class="sideArrow left off"></div><div id="rightA" class="sideArrow right off"></div><div class="sideLabel left">LEFT</div><div class="sideLabel right">RIGHT</div><div class="center"><div id="dir" class="dir standby">PREVIEW</div><div id="st" class="state standby">READY</div><div id="gap" class="gaps">LEFT -- · RIGHT --</div><div id="why" class="reason">삼각형 색으로 양쪽 상태 미리보기</div><div id="ph" class="phase">V51 FG15 BSD + TARGET LANE + RAW COMMIT LATCH + SIGNAL HUD</div></div></div><div class="note">신호표시는 E2E 진단용: RED?는 보수적 stop 후보, GREEN/GO는 stop→go edge이며 직접 램프 색 분류가 아닙니다. 화살표는 계획 회전방향입니다. 좌/우 삼각형도 SHADOW 비교용이며 제어 신호가 아닙니다.</div></div>
 <script>
 const leftA=document.getElementById('leftA'),rightA=document.getElementById('rightA'),dir=document.getElementById('dir'),st=document.getElementById('st'),gap=document.getElementById('gap'),why=document.getElementById('why'),ph=document.getElementById('ph'),hRed=document.getElementById('hRed'),hYellow=document.getElementById('hYellow'),hGreen=document.getElementById('hGreen'),hArrow=document.getElementById('hArrow'),hMain=document.getElementById('hMain'),hSub=document.getElementById('hSub'),hTiny=document.getElementById('hTiny');
 function cls(l){l=String(l||'');if(l.startsWith('SAFE'))return'safe';if(l.startsWith('DANGER'))return'danger';if(l.startsWith('CHECK')||l.startsWith('NO LANE'))return'check';if(l.startsWith('TURN'))return'turn';return'off'}function textCls(l){const c=cls(l);return c==='safe'?'safeText':c==='danger'?'dangerText':c==='check'?'checkText':c==='turn'?'turnText':'standby'}function reason(x){const m={'lane_change_commit_hold':'COMMIT HOLD','lane_change_rebase':'REBASE','intersection_turn_context':'TURN','commit_hold_hard_ttc_override':'TTC OVERRIDE','commit_hold_stable_hard_ttc_override':'STABLE TTC','lane_change_rebase_identity_guard':'REBASE ID GUARD','lane_change_commit_wait_for_lane':'WAIT LANE','turn_approach_no_target_lane':'TURN APPROACH','turn_wait_unconfirmed_lane':'TURN WAIT','intersection_turn_release_hold':'TURN HOLD','target_lane_absent':'NO TARGET LANE','target_lane_unconfirmed':'ROAD/LANE UNCERTAIN','front_gap<=5m':'FRONT GAP','rear_gap<=5m':'REAR GAP','boundary<=2m':'BOUNDARY','TTC<=3s':'TTC','stable_incoming_near':'INCOMING','front_gap<=12m':'FRONT GAP','rear_gap<=12m':'REAR GAP','boundary<=5m':'BOUNDARY','TTC<=5s':'TTC','outer_edge_close_watch':'EDGE WATCH','confirmed_outer_edge_forecast':'EDGE FORECAST','legacy_block_downgraded_by_fg10':'FG10 DOWNGRADE','legacy_block_downgraded_by_tts3':'TTS3 DOWNGRADE','side_conflict_now':'2D CONFLICT NOW','conflict_time<=3s':'2D≤3s','conflict_pending':'2D PENDING','conflict_3_5s_watch':'2D 3-5s','longitudinal_only_watch':'LONG ONLY','lateral_only_watch':'LAT ONLY','road_uncertain_2d_urgent':'2D URGENT','time_to_side<=3s':'TTS≤3s','side_overlap_now':'SIDE NOW','time_to_side_pending':'TTS PENDING','time_to_side_3_5s_watch':'TTS 3-5s','boundary_time_to_side_watch':'EDGE TTS','near_target_lane_watch':'NEAR WATCH','model_forecast_watch':'MODEL WATCH','road_uncertain_central_emergency':'CENTRAL EMERGENCY','road_uncertain_tts_urgent':'TTS URGENT'};return m[x]||String(x||'').replaceAll('_',' ').toUpperCase()}
 function signalHud(t){t=t||{};const state=t.state||'UNKNOWN',go=Math.round(100*Number(t.go_score||0)),stop=Math.round(100*Number(t.stop_score||0));hRed.classList.remove('on');hYellow.classList.remove('on');hGreen.classList.remove('on');hArrow.classList.remove('on');hMain.className='hSigMain hGray';if(state==='GREEN_GO'){hGreen.classList.add('on');hMain.className='hSigMain hGreen';hMain.textContent=`GREEN / GO · EVID ${go}`}else if(state==='RED_CANDIDATE'){hRed.classList.add('on');hMain.className='hSigMain hRed';hMain.textContent=`RED ? · E2E STOP · ${stop}`}else if(state==='STOP_HOLD'){hYellow.classList.add('on');hMain.className='hSigMain hYellow';hMain.textContent=`STOP/HOLD · LIGHT ? · ${stop}`}else if(state==='WAIT_LEAD'){hYellow.classList.add('on');hMain.className='hSigMain hYellow';hMain.textContent='LEAD AHEAD · SIGNAL UNKNOWN'}else if(state==='WATCH'){hYellow.classList.add('on');hMain.className='hSigMain hYellow';hMain.textContent='STOPPED · SIGNAL ?'}else if(state==='DRIVING'){hMain.textContent='DRIVING · SIGNAL MONITOR'}else{hMain.textContent='SIGNAL ? · MODEL STALE'}const td=t.turn_direction||'none';if(td==='left'){hArrow.textContent='←';if(state==='GREEN_GO')hArrow.classList.add('on')}else if(td==='right'){hArrow.textContent='→';if(state==='GREEN_GO')hArrow.classList.add('on')}else hArrow.textContent='·';const h=t.path_horizon_m==null?'--':Number(t.path_horizon_m).toFixed(1),j=t.horizon_jump_m==null?'--':Number(t.horizon_jump_m).toFixed(1),hold=t.stop_hold_s==null?'--':Number(t.stop_hold_s).toFixed(1);hSub.textContent=`PATH ${h}m · JUMP +${j}m · ARM ${t.stop_armed?1:0} · HOLD ${hold}s · STOP ${t.should_stop?1:0}`;hTiny.textContent=`${t.green_trigger_source&&t.green_trigger_source!=='none'?'GO '+t.green_trigger_source+' · ':''}RED? candidate only · arrow=turn path · no direct lamp classifier`}
-async function tick(){try{const s=await(await fetch('/state',{cache:'no-store'})).json(),fg=s.future_gap||{},d=fg.driver_intent||{},ll=fg.left?.decision?.label||'--',rr=fg.right?.decision?.label||'--';signalHud(s.traffic_signal_probe||{});let lc=cls(ll),rc=cls(rr);if(d.active){if(d.maneuver_context==='TURN'){if(d.side==='left')lc='turn';if(d.side==='right')rc='turn'}else{const ac=cls(d.label||'CHECK ?');if(d.side==='left')lc=ac;if(d.side==='right')rc=ac}}leftA.className=`sideArrow left ${lc}${d.active&&d.side==='left'?' active':''}${d.active&&d.side==='left'&&d.phase==='COMMIT_HOLD'?' pulse':''}`;rightA.className=`sideArrow right ${rc}${d.active&&d.side==='right'?' active':''}${d.active&&d.side==='right'&&d.phase==='COMMIT_HOLD'?' pulse':''}`;if(!d.active){dir.textContent='PREVIEW';dir.className='dir standby';st.textContent='READY';st.className='state standby';gap.textContent=`LEFT ${ll} · RIGHT ${rr}`;why.textContent='양쪽 삼각형 색을 먼저 확인';ph.textContent='V50 FG15 BSD + TARGET LANE MONITOR · BLINKER OFF';}else if(d.maneuver_context==='TURN'||d.state==='TURN'){dir.textContent=d.side==='left'?'← LEFT':'RIGHT →';dir.className='dir turnText';st.textContent=(d.phase==='TURN_WAIT'||d.phase==='TURN_APPROACH')?'TURN ?':'TURN';st.className='state turnText';gap.textContent=`${(Number(fg.ego?.v_ego_mps||0)*3.6).toFixed(1)} km/h · steering ${Number(d.steering_angle_deg||0).toFixed(0)}°`;why.textContent='교차로/저속 회전으로 판단 · lane-change 판단 숨김';ph.textContent=d.phase||'TURN CONTEXT';}else{const l=d.label||'CHECK ?';dir.textContent=d.side==='left'?'← LEFT':'RIGHT →';dir.className='dir '+textCls(l);st.textContent=l;st.className='state '+textCls(l);const f=d.front_clearance_m==null?'--':Number(d.front_clearance_m).toFixed(1),r=d.rear_clearance_m==null?'--':Number(d.rear_clearance_m).toFixed(1);const tts=d.time_to_side_s==null?'--':Number(d.time_to_side_s).toFixed(1);gap.textContent=`NOW F ${f} m · R ${r} m · 2D ${tts}s`;why.textContent=(d.reasons||[]).slice(0,3).map(reason).join(' · ')||'GAP DIAGNOSTIC ONLY';ph.textContent=(d.phase||'PRECHECK')+(d.hold_remaining_s==null?'':` · HOLD ${Number(d.hold_remaining_s).toFixed(1)}s`);}}catch(e){leftA.className='sideArrow left off';rightA.className='sideArrow right off';st.textContent='CHECK DATA';st.className='state checkText';why.textContent='STATE CONNECTION LOST';}setTimeout(tick,100)}tick();
+async function tick(){try{const s=await(await fetch('/state',{cache:'no-store'})).json(),fg=s.future_gap||{},d=fg.driver_intent||{},ll=fg.left?.decision?.label||'--',rr=fg.right?.decision?.label||'--';signalHud(s.traffic_signal_probe||{});let lc=cls(ll),rc=cls(rr);if(d.active){if(d.maneuver_context==='TURN'){if(d.side==='left')lc='turn';if(d.side==='right')rc='turn'}else{const ac=cls(d.label||'CHECK ?');if(d.side==='left')lc=ac;if(d.side==='right')rc=ac}}leftA.className=`sideArrow left ${lc}${d.active&&d.side==='left'?' active':''}${d.active&&d.side==='left'&&d.phase==='COMMIT_HOLD'?' pulse':''}`;rightA.className=`sideArrow right ${rc}${d.active&&d.side==='right'?' active':''}${d.active&&d.side==='right'&&d.phase==='COMMIT_HOLD'?' pulse':''}`;if(!d.active){dir.textContent='PREVIEW';dir.className='dir standby';st.textContent='READY';st.className='state standby';gap.textContent=`LEFT ${ll} · RIGHT ${rr}`;why.textContent='양쪽 삼각형 색을 먼저 확인';ph.textContent='V51 FG15 BSD + TARGET LANE MONITOR · BLINKER OFF';}else if(d.maneuver_context==='TURN'||d.state==='TURN'){dir.textContent=d.side==='left'?'← LEFT':'RIGHT →';dir.className='dir turnText';st.textContent=(d.phase==='TURN_WAIT'||d.phase==='TURN_APPROACH')?'TURN ?':'TURN';st.className='state turnText';gap.textContent=`${(Number(fg.ego?.v_ego_mps||0)*3.6).toFixed(1)} km/h · steering ${Number(d.steering_angle_deg||0).toFixed(0)}°`;why.textContent='교차로/저속 회전으로 판단 · lane-change 판단 숨김';ph.textContent=d.phase||'TURN CONTEXT';}else{const l=d.label||'CHECK ?';dir.textContent=d.side==='left'?'← LEFT':'RIGHT →';dir.className='dir '+textCls(l);st.textContent=l;st.className='state '+textCls(l);const f=d.front_clearance_m==null?'--':Number(d.front_clearance_m).toFixed(1),r=d.rear_clearance_m==null?'--':Number(d.rear_clearance_m).toFixed(1);const tts=d.time_to_side_s==null?'--':Number(d.time_to_side_s).toFixed(1);gap.textContent=`NOW F ${f} m · R ${r} m · 2D ${tts}s`;why.textContent=(d.reasons||[]).slice(0,3).map(reason).join(' · ')||'GAP DIAGNOSTIC ONLY';ph.textContent=(d.phase||'PRECHECK')+(d.hold_remaining_s==null?'':` · HOLD ${Number(d.hold_remaining_s).toFixed(1)}s`);}}catch(e){leftA.className='sideArrow left off';rightA.className='sideArrow right off';st.textContent='CHECK DATA';st.className='state checkText';why.textContent='STATE CONNECTION LOST';}setTimeout(tick,100)}tick();
 </script></body></html>'''
 
 class H(BaseHTTPRequestHandler):
@@ -257,7 +306,7 @@ class H(BaseHTTPRequestHandler):
   def do_GET(self):
     path=self.path.split('?')[0]
     if path=='/health':
-      b=json.dumps({'ok':True,'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'port':HTTP_PORT,'pid':os.getpid()},separators=(',',':')).encode()
+      b=json.dumps({'ok':True,'build':BUILD_VERSION,'tag':BUILD_TAG,'port':HTTP_PORT,'pid':os.getpid()},separators=(',',':')).encode()
       self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
     elif path=='/state':
       mark_browser_active()
@@ -280,7 +329,7 @@ def _web_status(state:str, error:str=''):
     tmp=WEB_STATUS_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps({
       'state':state,'host':HTTP_HOST,'port':HTTP_PORT,'pid':os.getpid(),
-      'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'error':error,'mono_ns':time.monotonic_ns()
+      'build':BUILD_VERSION,'tag':BUILD_TAG,'error':error,'mono_ns':time.monotonic_ns()
     },separators=(',',':')))
     tmp.replace(WEB_STATUS_PATH)
   except Exception:
@@ -475,7 +524,7 @@ def _ui_obj(o):
 
 _UI_TOP_KEYS = (
   'ml_case_collector','version','mono_ns','runtime_versions','runtime_mismatch','coordinate_frame','road_model','rear_teacher_match_stats',
-  'canonical_tracker_stats','view_consistency_stats','web_stage_stats','web_stage_errors','kalman_motion_stats','imm_motion_stats','future_gap','traffic_signal_probe','ego_state','camera_fusion_stats',
+  'canonical_tracker_stats','view_consistency_stats','web_stage_stats','web_stage_errors','kalman_motion_stats','imm_motion_stats','future_gap','traffic_signal_probe','ego_state','side_vision','camera_fusion_stats',
   'shadow_leads','corner_front_associations','zones','teacher_rear','scc_teacher','scc_front_match','corner_fusion_stats',
   'standard_front_preview_stats','shadow_logger','performance_stats','camera_fusion_matches'
 )
@@ -511,29 +560,30 @@ def main():
     atexit.register(ml_case_collector.close)
   except Exception as e:
     ml_collector_error = repr(e)
-  tracks=TrackStore(ttl_s=.75,continuity_s=.30);corner_fuser=CornerFusionTracker();corner_vehicle_tracker=VehicleFootprintTracker('VC');scc_matcher=SccFrontTeacherMatcher();camera_fuser=CameraRadarFusion();canonical_tracker=Canonical360Tracker('V',ttl_s=1.5);shadow_verifier=ShadowLeadVerifier();shadow_logger=ShadowLogger();front_preview=StandardFrontPreview();motion_tracker=KalmanMotionTracker('KF');imm_tracker=ImmMotionTracker();future_gap=FutureGapEvaluator();signal_probe=TrafficSignalProbe();camera_leads=[];model_path=[];road_model={};model_path_recv_ns=0;v_ego=0.0;a_ego=0.0;steering_angle_deg=0.0;left_blinker=False;right_blinker=False;v_ego_recv_ns=0;production=None;rear_teacher=[];rear_teacher_by_bus={};scc_teacher=None;scc_teacher_by_bus={};SCC_BUS=int(os.getenv('G80_SCC_BUS',str(DEFAULT_SCC_BUS)))
+  tracks=TrackStore(ttl_s=.75,continuity_s=.30);corner_fuser=CornerFusionTracker();corner_vehicle_tracker=VehicleFootprintTracker('VC');scc_matcher=SccFrontTeacherMatcher();camera_fuser=CameraRadarFusion();canonical_tracker=Canonical360Tracker('V',ttl_s=1.5);shadow_verifier=ShadowLeadVerifier();shadow_logger=_DisabledShadowLogger();front_preview=StandardFrontPreview();motion_tracker=KalmanMotionTracker('KF');imm_tracker=ImmMotionTracker();future_gap=FutureGapEvaluator();signal_probe=TrafficSignalProbe();camera_leads=[];model_path=[];road_model={};model_path_recv_ns=0;v_ego=0.0;a_ego=0.0;steering_angle_deg=0.0;left_blinker=False;right_blinker=False;v_ego_recv_ns=0;production=None;rear_teacher=[];rear_teacher_by_bus={};scc_teacher=None;scc_teacher_by_bus={};SCC_BUS=int(os.getenv('G80_SCC_BUS',str(DEFAULT_SCC_BUS)))
   udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1)
+  vision_rx=None;vision_rx_error=''
+  try:
+    vision_rx=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);vision_rx.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);vision_rx.bind(('127.0.0.1',SIDE_VISION_UDP_PORT));vision_rx.setblocking(False)
+  except OSError as e:
+    vision_rx_error=repr(e);vision_rx=None
+  side_vision_state=_blank_side_vision(vision_rx_error or 'waiting_for_g80sidevision')
   bsd_monitor=BsdMonitor()
   radar_recv={'corner_A':0,'corner_B':0,'front':0}
   carstate_valid=False
   diag={'corner_A_frames':0,'corner_B_frames':0,'corner_decoded_total':0,'corner_rear_total':0,'corner_front_total':0,'corner_A_by_bus':{},'corner_B_by_bus':{},'scc_frames_by_bus':{},'scc_teacher_updates':0,'model_frames':0,'camera_leads_latest':0,'model_transport_lag_ms':None,'last_transport_lag_ms':None}
-  period=1.0/max(PUBLISH_HZ,1.0)
-  # Never let continuous CAN backlog monopolize the 10 Hz publication deadline.
-  # Keep a small guard for model/carState reads + fusion; unconsumed CAN remains queued.
-  can_guard_s=min(CAN_DRAIN_GUARD_S, period*0.45)
-  next_pub=time.monotonic();next_debug_write=0.0;next_ui_update=0.0;next_web_stage_audit=0.0;web_stage_stats={};web_stage_errors=[];last_pub_ns=0;last_processing_ms=0.0;last_udp_ms=0.0;last_ui_ms=0.0;last_ui_kb=0.0;last_stage_ms={}
-  input_drain_accum_ms=0.0;input_msgs_accum=0;input_frames_accum=0;can_deadline_breaks_total=0;can_deadline_hit_since_pub=False;missed_publish_cycles_total=0;last_scheduler_skips=0
+  period=1.0/max(PUBLISH_HZ,1.0);next_pub=time.monotonic();next_debug_write=0.0;next_ui_update=0.0;next_web_stage_audit=0.0;web_stage_stats={};web_stage_errors=[];last_pub_ns=0;last_processing_ms=0.0;last_udp_ms=0.0;last_ui_ms=0.0;last_ui_kb=0.0;last_stage_ms={};last_can_drain_ms=0.0;last_can_msgs=0;can_guard_breaks=0;publish_late_count=0;scheduler_skips=0;last_publish_late_ms=0.0
   while True:
-    processed=0;processed_frames=0;deadline_break=False;drain_t0=time.perf_counter()
-    for _ in range(CAN_DRAIN_MAX_MSGS):
-      # R1 deadline guard: do not pull another queued CAN Event when publication is due.
-      # Because the socket is non-conflated, messages not pulled here remain for the next loop.
-      if time.monotonic() >= (next_pub-can_guard_s):
-        deadline_break=True
+    processed=0;guard_hit=False;can_drain_t0=time.perf_counter()
+    can_deadline=next_pub-CAN_DRAIN_GUARD_S
+    for _ in range(2000):
+      # V50R1/V51: never let a large CAN backlog consume the publication slot.
+      # Unread CAN remains queued for the following outer-loop iteration.
+      if time.monotonic() >= can_deadline:
+        guard_hit=True
         break
       msg=messaging.recv_one_or_none(can_sock)
       if msg is None: break
-      processed_frames += len(msg.can)
       recv_ns=time.monotonic_ns();can_log_ns=int(msg.logMonoTime);diag['last_transport_lag_ms']=round((recv_ns-can_log_ns)/1e6,3)
       for f in msg.can:
         bus,addr,dat=int(f.src),int(f.address),bytes(f.dat)
@@ -568,12 +618,9 @@ def main():
               e['bus']=bus;e['recv_ns']=recv_ns
             rear_teacher_by_bus[bus]=rt
       processed+=1
-    input_drain_accum_ms += (time.perf_counter()-drain_t0)*1000.0
-    input_msgs_accum += processed
-    input_frames_accum += processed_frames
-    if deadline_break and not can_deadline_hit_since_pub:
-      can_deadline_breaks_total += 1
-      can_deadline_hit_since_pub=True
+    last_can_drain_ms=(time.perf_counter()-can_drain_t0)*1000.0;last_can_msgs=processed
+    if guard_hit:
+      can_guard_breaks+=1
 
     mmsg=messaging.recv_one_or_none(model_sock)
     if mmsg is not None:
@@ -590,10 +637,10 @@ def main():
     csmsg=messaging.recv_one_or_none(carstate_sock)
     if csmsg is not None:
       cs_recv_ns=time.monotonic_ns()
-      # ML_COLLECTOR_V3_EGO_HOOK
+      # V51 collector: keep high-value ego dynamics synchronized with 10 Hz cases.
       try:
         if ml_case_collector is not None:
-          ml_case_collector.update_ego(csmsg.carState, cs_recv_ns, int(csmsg.logMonoTime), bool(csmsg.valid))
+          ml_case_collector.update_ego(csmsg.carState,cs_recv_ns,int(csmsg.logMonoTime),bool(csmsg.valid))
       except Exception:
         pass
       bsd_monitor.refresh_support(cs_recv_ns)
@@ -622,11 +669,12 @@ def main():
     if rsmsg is not None:
       production=snapshot_production_radar_state(rsmsg,time.monotonic_ns())
 
+    side_vision_state=_drain_side_vision(vision_rx,side_vision_state,time.monotonic_ns())
     now=time.monotonic()
     if now>=next_pub:
-      publish_lateness_ms=max(0.0,(now-next_pub)*1000.0)
-      cycle_input_drain_ms=input_drain_accum_ms;cycle_input_msgs=input_msgs_accum;cycle_input_frames=input_frames_accum
-      input_drain_accum_ms=0.0;input_msgs_accum=0;input_frames_accum=0;can_deadline_hit_since_pub=False
+      last_publish_late_ms=max(0.0,(now-next_pub)*1000.0)
+      if last_publish_late_ms>10.0:
+        publish_late_count+=1
       now_ns=time.monotonic_ns()
       scc_teacher=choose_scc_teacher(scc_teacher_by_bus,SCC_BUS,now_ns)
       fresh_rear={}
@@ -640,7 +688,7 @@ def main():
         rear_teacher=usable[0] if usable else (next(iter(fresh_rear.values())) if fresh_rear else [])
       pub_start=time.perf_counter(); stage_ms={}
       ui_active=browser_is_active(now_ns); debug_due=DEBUG_STATE_HZ>0.0 and now>=next_debug_write
-      # V50: monitor-only stage checks run only on browser frames or a 2Hz
+      # V51: monitor-only stage checks run only on browser frames or a 2Hz
       # shadow-audit heartbeat; never duplicate the raw gates at 10Hz off-screen.
       web_audit_due=debug_due or (ui_active and now>=next_ui_update) or now>=next_web_stage_audit
       st=time.perf_counter()
@@ -707,9 +755,9 @@ def main():
                         'object_x_preserved':True,'note':'ego pictogram front edge is x=0; decoded object x is unchanged'}
       # Core state is always produced because radar fusion/teacher logic and the
       # Android UDP stream must remain live even with no browser connected.
-      runtime_versions={'build':BUILD_VERSION,'release':RELEASE_NAME,'tag':BUILD_TAG,'logger':LOGGER_SERVICE_VERSION,'kalman_api':KALMAN_API_VERSION,'imm_api':IMM_API_VERSION,'future_gap_api':FUTURE_GAP_API_VERSION,'android_protocol':PROTOCOL_VERSION}
-      runtime_mismatch=(BUILD_VERSION!=50 or LOGGER_SERVICE_VERSION!=BUILD_VERSION or KALMAN_API_VERSION!=4 or IMM_API_VERSION!=3 or FUTURE_GAP_API_VERSION!=15 or BUILD_FUTURE_GAP_API_VERSION!=15 or PROTOCOL_VERSION!=21)
-      core={'version':BUILD_VERSION,'release':RELEASE_NAME,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'objects':sensor_fused_view,
+      runtime_versions={'build':BUILD_VERSION,'tag':BUILD_TAG,'logger':LOGGER_SERVICE_VERSION,'kalman_api':KALMAN_API_VERSION,'imm_api':IMM_API_VERSION,'future_gap_api':FUTURE_GAP_API_VERSION,'android_protocol':PROTOCOL_VERSION,'side_vision_api':BUILD_SIDE_VISION_API_VERSION}
+      runtime_mismatch=(BUILD_VERSION!=51 or LOGGER_SERVICE_VERSION!=BUILD_VERSION or KALMAN_API_VERSION!=4 or IMM_API_VERSION!=3 or FUTURE_GAP_API_VERSION!=15 or BUILD_FUTURE_GAP_API_VERSION!=15 or PROTOCOL_VERSION!=21 or BUILD_SIDE_VISION_API_VERSION!=1)
+      core={'version':BUILD_VERSION,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'objects':sensor_fused_view,
             'sensor_fused_objects':sensor_fused_view,'all_fused_objects':sensor_fused_view,'canonical360_objects':sensor_fused_view,
             'radar_fused_objects':radar_all_view,
             'web_stage_stats':web_stage_stats,'web_stage_errors':web_stage_errors,
@@ -718,7 +766,7 @@ def main():
             'standard_front_preview':std_points_view,'standard_front_preview_stats':stdp['stats'],
             'camera_leads':camera_leads_view,'camera_fusion_matches':camf['camera_matches'],
             'road_model':road_view,'coordinate_frame':coordinate_frame,'rear_teacher_match_stats':rear_teacher_match_stats,
-            'canonical_tracker_stats':canonical_stats,'view_consistency_stats':view_consistency_stats,'kalman_motion_stats':dict(kalman_stats,canonical_identity_input=True),'imm_motion_stats':imm_stats,'future_gap':future_gap_state,'traffic_signal_probe':traffic_signal_state,'ego_state':{'vEgo':v_ego,'aEgo':a_ego,'steeringAngleDeg':steering_angle_deg,'leftBlinker':left_blinker,'rightBlinker':right_blinker},'corner_kalman_motion_stats':corner_kalman_stats,'front_kalman_motion_stats':front_kalman_stats,
+            'canonical_tracker_stats':canonical_stats,'view_consistency_stats':view_consistency_stats,'kalman_motion_stats':dict(kalman_stats,canonical_identity_input=True),'imm_motion_stats':imm_stats,'future_gap':future_gap_state,'traffic_signal_probe':traffic_signal_state,'ego_state':{'vEgo':v_ego,'aEgo':a_ego,'steeringAngleDeg':steering_angle_deg,'leftBlinker':left_blinker,'rightBlinker':right_blinker},'side_vision':side_vision_state,'corner_kalman_motion_stats':corner_kalman_stats,'front_kalman_motion_stats':front_kalman_stats,
             'camera_fusion_stats':dict(camf['stats'],corner_vehicle_objects_before=corner_vehicle_stats['vehicle_objects_before'],corner_vehicle_objects_after=corner_vehicle_stats['vehicle_objects_after'],corner_vehicle_duplicates_merged=corner_vehicle_stats['vehicle_duplicates_merged']),'shadow_leads':shadow,
             'corner_front_associations':assocs,'zones':zones,
             'teacher_rear':rear_teacher,'scc_teacher':scc_teacher or {},
@@ -735,10 +783,9 @@ def main():
       except Exception as e:
         core['ml_case_collector'] = {'enabled': False, 'last_error': repr(e)}
       interval_ms=None if last_pub_ns==0 else (now_ns-last_pub_ns)/1e6
-      core_processing_ms=(time.perf_counter()-pub_start)*1000.0
-      core['performance_stats']={'processing_ms':round(core_processing_ms,2),'publish_work_ms':round(last_processing_ms,2),'publish_interval_ms':None if interval_ms is None else round(interval_ms,2),'publish_lateness_ms':round(publish_lateness_ms,2),'target_hz':PUBLISH_HZ,'input_drain_ms':round(cycle_input_drain_ms,2),'can_messages_drained':cycle_input_msgs,'can_frames_drained':cycle_input_frames,'can_drain_guard_ms':round(can_guard_s*1000.0,2),'can_deadline_breaks_total':can_deadline_breaks_total,'missed_publish_cycles_last':last_scheduler_skips,'missed_publish_cycles_total':missed_publish_cycles_total,'local_kf_replicas_disabled':True,'imm_target_hz':imm_stats.get('target_hz',2.5),'stage_ms':{k:round(v,2) for k,v in stage_ms.items()},'udp_json_ms':round(last_udp_ms,2),'ui_json_ms':round(last_ui_ms,2),'logger_event_policy':'V50R1 ML-only: deadline-aware CAN drain; shadow log hard-disabled; labelled ML cases only; RAM dict capture + background JSON/gzip'}
+      core['performance_stats']={'processing_ms':round(last_processing_ms,2),'publish_interval_ms':None if interval_ms is None else round(interval_ms,2),'target_hz':PUBLISH_HZ,'can_drain_ms':round(last_can_drain_ms,2),'can_msgs_this_loop':int(last_can_msgs),'can_drain_guard_ms':round(CAN_DRAIN_GUARD_S*1000.0,2),'can_drain_guard_breaks':int(can_guard_breaks),'publish_late_ms':round(last_publish_late_ms,2),'publish_late_count':int(publish_late_count),'scheduler_skips':int(scheduler_skips),'last_can_transport_lag_ms':diag.get('last_transport_lag_ms'),'local_kf_replicas_disabled':True,'imm_target_hz':imm_stats.get('target_hz',2.5),'stage_ms':{k:round(v,2) for k,v in stage_ms.items()},'udp_json_ms':round(last_udp_ms,2),'ui_json_ms':round(last_ui_ms,2),'logger_event_policy':'V51 ML-only: shadow/golden hard-off; 10Hz labelled/auto-lane-change cases; side vision SHADOW only'}
 
-      # V50 ML-only: continuous shadow logging is hard-disabled. No shadow file I/O occurs.
+      # V51: continuous shadow/golden disk logging is hard-disabled.
       core['shadow_logger']=shadow_logger.status()
 
       # Android/render protocol stays active independently of the browser.
@@ -748,7 +795,6 @@ def main():
       except OSError:
         pass
       last_udp_ms=(time.perf_counter()-udp_t0)*1000.0
-      core['performance_stats']['udp_json_ms']=round(last_udp_ms,2)
 
       # V35: compact browser state is cached at 8 Hz.  The core loop remains
       # independent; duplicate canonical arrays are not serialized four times.
@@ -765,19 +811,19 @@ def main():
           'diagnostics':dict(diag,ui_sleeping=not ui_active),
           'browser_active':ui_active,
           'notes':{
-            'ui':'v50r1-deadline-can-drain-web8h-ml-only-fg15-bsd-target-lane-source-lock-hud-kr',
+            'ui':'v51h-web8h-log-tuned-vehicle-geometry-rear-room-fg15-bsd-target-lane-source-lock-hud-kr-goldenv2',
             'display_scale':'SHORT/LONG 1:1 + WIDE + DRIVE perspective; source-traceable Canonical C4-road overlay',
-            'browser_policy':'8Hz cached seven-stage browser data; 10Hz publish protected by deadline-aware CAN drain; no control changes',
+            'browser_policy':'8Hz cached seven-stage browser data; RAW FILTERED does not cross-source dedup; no control changes',
             'udp':'Android final sensor-fusion packet on 28991',
             'control':'disabled',
             'integration':'NOT connected to RadarInterface/radarTracks/radard',
             'future_front':'plain-dict RadarPoint preview only',
-            'future_gap':'FG12 synchronized 3s longitudinal+lateral conflict + raw commit latch + FG8 adaptive turn; seven-stage audit',
+            'future_gap':'FG15 BSD + target-lane + synchronized conflict evaluation + raw commit latch; seven-stage audit',
             'identity':'Canonical360Tracker is the only global Vxxxx authority; diagnostic views are traced back to Vxxxx when possible',
-            'motion_prediction':'Selective KF4 max10 + dormant preserve; IMM3 max6@2.5Hz; FG8 consumes cached IMM/KF trajectories',
+            'motion_prediction':'Selective KF4 + dormant preserve; IMM3 cached trajectories consumed by FG15',
             'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,
             'shadow_control':'NEVER publishes radarTracks/radarState / NEVER CAN TX',
-            'debug_state_hz':DEBUG_STATE_HZ,'ui_state_hz':UI_STATE_HZ,'shadow_log_dir':None,'ml_case_dir':'/data/radar/ml_cases_v50'
+            'debug_state_hz':DEBUG_STATE_HZ,'ui_state_hz':UI_STATE_HZ,'shadow_log_dir':'OFF','side_vision':'StarPilot-derived driver-camera side-window classifier; SHADOW only; setup port 28994'
           }
         })
         out['performance_stats']=dict(out.get('performance_stats',{}),ui_json_kb=round(last_ui_kb,2),ui_state_hz=UI_STATE_HZ)
@@ -793,9 +839,9 @@ def main():
           latest_state.clear();latest_state.update(out);latest_state_json=b
         next_ui_update=now+1.0/max(UI_STATE_HZ,1.0)
       elif not ui_active and now>=next_ui_update:
-        compact={'version':BUILD_VERSION,'release':RELEASE_NAME,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'browser_active':False,
+        compact={'version':BUILD_VERSION,'mono_ns':now_ns,'runtime_versions':runtime_versions,'runtime_mismatch':runtime_mismatch,'browser_active':False,
                  'performance_stats':dict(core['performance_stats'],ui_json_kb=round(last_ui_kb,2),ui_state_hz=UI_STATE_HZ),
-                 'ml_case_collector':core.get('ml_case_collector',{}),'shadow_logger':core.get('shadow_logger',{}),'diagnostics':dict(diag,ui_sleeping=True)}
+                 'ml_case_collector':core.get('ml_case_collector',{}),'side_vision':core.get('side_vision',{}),'shadow_logger':core.get('shadow_logger',{}),'diagnostics':dict(diag,ui_sleeping=True)}
         b=json.dumps(compact,separators=(',',':')).encode()
         last_ui_kb=len(b)/1024.0
         with state_lock:
@@ -806,12 +852,11 @@ def main():
       last_processing_ms=(time.perf_counter()-pub_start)*1000.0
       interval_ms=None if last_pub_ns==0 else (now_ns-last_pub_ns)/1e6
       last_pub_ns=now_ns
-      # Fixed-phase R1 scheduler. If a publish itself overruns one or more deadlines,
-      # skip those expired slots explicitly and expose the count in /state.
-      next_pub+=period;end_now=time.monotonic();last_scheduler_skips=0
+      # Fixed-phase scheduler: preserve the 100 ms phase and count skipped slots.
+      next_pub+=period;end_now=time.monotonic()
       if next_pub<end_now:
-        last_scheduler_skips=(int((end_now-next_pub)/period)+1)
-        missed_publish_cycles_total += last_scheduler_skips
-        next_pub += last_scheduler_skips*period
+        skipped=(int((end_now-next_pub)/period)+1)
+        scheduler_skips+=skipped
+        next_pub += skipped*period
     if processed==0: time.sleep(.002)
 if __name__=='__main__': main()
