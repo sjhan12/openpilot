@@ -42,6 +42,45 @@ def nv12_to_rgb(raw_image: np.ndarray, width: int, height: int, y_plane_rows: in
   return np.stack((r, g, b), axis=-1).clip(0, 255).astype(np.uint8)
 
 
+
+def nv12_buffer_to_rgb(data, width: int, height: int, stride: int, uv_offset: int) -> np.ndarray:
+  """Convert a VisionIPC NV12 buffer directly, respecting stride/uv_offset.
+
+  This is the preferred snapshot path: it avoids reshaping the entire DMA buffer
+  and does not depend on OpenCV/Pillow.
+  """
+  width = int(width); height = int(height); stride = int(stride); uv_offset = int(uv_offset)
+  if width <= 0 or height <= 0 or stride < width or uv_offset <= 0:
+    raise ValueError(f"invalid VisionIPC geometry w={width} h={height} stride={stride} uv_offset={uv_offset}")
+  flat = np.frombuffer(data, dtype=np.uint8)
+  if uv_offset > flat.size:
+    raise ValueError(f"uv_offset beyond buffer: {uv_offset}>{flat.size}")
+  y_rows = uv_offset // stride
+  if y_rows < height:
+    raise ValueError(f"short Y plane rows={y_rows} height={height}")
+  y = flat[:uv_offset].reshape((-1, stride))[:height, :width].astype(np.int16, copy=False)
+
+  uv_rows_needed = (height + 1) // 2
+  uv_bytes_needed = stride * uv_rows_needed
+  if uv_offset + uv_bytes_needed > flat.size:
+    # Qualcomm buffers can have a padded UV plane; only active rows are required.
+    uv_bytes_needed = flat.size - uv_offset
+  uv_rows = uv_bytes_needed // stride
+  if uv_rows < height // 2:
+    raise ValueError(f"short UV plane rows={uv_rows} need={height//2}")
+  uv = flat[uv_offset:uv_offset + uv_rows * stride].reshape((-1, stride))[:height//2, :width]
+  u_small = uv[:, 0:width:2].astype(np.int16, copy=False)
+  v_small = uv[:, 1:width:2].astype(np.int16, copy=False)
+  u = np.repeat(np.repeat(u_small, 2, axis=0), 2, axis=1)[:height, :width]
+  v = np.repeat(np.repeat(v_small, 2, axis=0), 2, axis=1)[:height, :width]
+
+  c = y - 16; d = u - 128; e = v - 128
+  r = (298 * c + 409 * e + 128) >> 8
+  g = (298 * c - 100 * d - 208 * e + 128) >> 8
+  b = (298 * c + 516 * d + 128) >> 8
+  return np.stack((r, g, b), axis=-1).clip(0, 255).astype(np.uint8)
+
+
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
   body = tag + payload
   return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)

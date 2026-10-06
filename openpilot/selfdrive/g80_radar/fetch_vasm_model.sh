@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${OPENPILOT_ROOT:-/data/openpilot}"
+if [[ -n "${OPENPILOT_ROOT:-}" ]]; then
+  ROOT="$OPENPILOT_ROOT"
+elif [[ -d /data/openpilot/openpilot/selfdrive ]]; then
+  ROOT=/data/openpilot/openpilot
+else
+  ROOT=/data/openpilot
+fi
 DEST="${G80_SIDE_VISION_MODEL:-$ROOT/selfdrive/g80_radar/assets/v_asm_model.onnx}"
 TMP="${DEST}.tmp.$$"
 COMMIT="0122e4069b627948b219e419d2e84b5f22773c43"

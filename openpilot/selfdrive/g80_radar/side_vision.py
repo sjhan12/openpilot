@@ -34,7 +34,7 @@ except Exception:
   get_nv12_info = None
 from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, SIDE_VISION_API_VERSION
 from openpilot.selfdrive.g80_radar.side_vision_inference import SideVisionInference, V_ASM_MODEL_PATH
-from openpilot.selfdrive.g80_radar.side_vision_image import nv12_to_rgb, write_png_atomic
+from openpilot.selfdrive.g80_radar.side_vision_image import nv12_to_rgb, nv12_buffer_to_rgb, write_png_atomic
 from openpilot.selfdrive.g80_radar.vision_cpu_throttle import device_cpu_throttle_factor
 
 try:
@@ -118,7 +118,7 @@ document.getElementById('undo').onclick=()=>{const p=side==='right'?right:left;p
 document.getElementById('refresh').onclick=async()=>{await fetch('/request_snapshot',{method:'POST'});setTimeout(()=>loadSnapshot(true),600)};
 document.getElementById('save').onclick=async()=>{if(!img||(!left.length&&!right.length)){alert('snapshot과 polygon이 필요합니다');return}const sx=nativeW/cv.width,sy=nativeH/cv.height,sc=p=>p.map(q=>[Math.round(q[0]*sx),Math.round(q[1]*sy)]);const c={width:nativeW,height:nativeH,poly_left:left.length>=3?sc(left):[],poly_right:right.length>=3?sc(right):[],confidence_threshold:Number(document.getElementById('conf').value),smooth_sec:Number(document.getElementById('smooth').value)};const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});alert(r.ok?'저장 완료':'저장 실패')};
 document.getElementById('delete').onclick=async()=>{await fetch('/config',{method:'DELETE'});left=[];right=[];draw()};
-async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};statusEl.innerHTML=`model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}</span>  <span class="right">RIGHT active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}</span>\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
+async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};statusEl.innerHTML=`model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} snapshot=${s.snapshot_available?'OK':(s.snapshot_pending?'PENDING':'NONE')} frames=${s.frames_received||0} ${s.camera_width||0}x${s.camera_height||0} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}</span>  <span class="right">RIGHT active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}</span>\nmodel_error=${s.model_error||'-'}\nsnapshot_error=${s.snapshot_error||'-'}\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
 loadSnapshot(true);poll();
 </script></body></html>'''
 
@@ -153,6 +153,18 @@ class SideVisionDaemon:
     self.snapshot_request = threading.Event()
     self.snapshot_lock = threading.Lock()
     self.snapshot_available = SNAPSHOT_PATH.is_file()
+    self.snapshot_requested_count = 0
+    self.snapshot_attempt_count = 0
+    self.snapshot_success_count = 0
+    self.snapshot_last_error = ''
+    self.snapshot_last_ms = 0.0
+    self.frames_received = 0
+    self.last_frame_mono_ns = 0
+    self.last_frame_id = -1
+    self.camera_width = 0
+    self.camera_height = 0
+    self.camera_stride = 0
+    self.camera_last_error = ''
     self.auto_snapshot_requested = False
     self._snapshot_driver_view_owned = False
     self._snapshot_driver_view_started_at = 0.0
@@ -178,10 +190,7 @@ class SideVisionDaemon:
     if not force and now - self.model_last_try < MODEL_RETRY_INTERVAL:
       return
     self.model_last_try = now
-    if not self.inference.load():
-      self.last_error = self.inference.last_error
-    elif self.last_error.startswith('Missing model') or self.last_error.startswith('Failed to load model'):
-      self.last_error = ''
+    self.inference.load()
 
   def _reload_config(self, force=False):
     try:
@@ -238,13 +247,13 @@ class SideVisionDaemon:
               b = SNAPSHOT_PATH.read_bytes(); self.send_response(200); self.send_header('Content-Type','image/png' if SNAPSHOT_PATH.suffix.lower()=='.png' else 'application/octet-stream'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
             except OSError:
               pass
-          owner.snapshot_request.set(); self._send_json({'pending': True, 'message': 'Waiting for next driver-camera frame'}, 202); return
+          owner.snapshot_requested_count += 1; owner.snapshot_request.set(); self._send_json({'pending': True, 'message': 'Waiting for next driver-camera frame'}, 202); return
         self._send_json({'error':'not found'},404)
 
       def do_POST(self):
         p = self._path()
         if p == '/request_snapshot':
-          owner.snapshot_request.set(); self._send_json({'ok':True}); return
+          owner.snapshot_requested_count += 1; owner.snapshot_request.set(); self._send_json({'ok':True,'request_count':owner.snapshot_requested_count}); return
         if p == '/config':
           try:
             n = min(int(self.headers.get('Content-Length','0') or 0), 128000)
@@ -294,6 +303,7 @@ class SideVisionDaemon:
       return self.camera_connected
     except Exception as e:
       self.camera_connected = False
+      self.camera_last_error = f'{e!r}'
       self.last_error = f'camera connect: {e!r}'
       return False
 
@@ -319,18 +329,29 @@ class SideVisionDaemon:
     self._snapshot_driver_view_owned = False
     self._snapshot_driver_view_started_at = 0.0
 
-  def _capture_snapshot(self, raw_image: np.ndarray, width: int, height: int, y_plane_rows: int):
+  def _capture_snapshot(self, buffer):
+    t0 = time.perf_counter_ns()
+    self.snapshot_attempt_count += 1
     try:
-      # No cv2/Pillow dependency: polygon setup must work on a stock AGNOS image.
-      rgb = nv12_to_rgb(raw_image, width, height, y_plane_rows)
+      width = int(self.client.width); height = int(self.client.height); stride = int(self.client.stride)
+      uv_offset = int(getattr(buffer, 'uv_offset', 0) or 0)
+      if uv_offset <= 0:
+        y_rows = _nv12_y_rows(width, height, stride)
+        uv_offset = int(y_rows * stride)
+      rgb = nv12_buffer_to_rgb(buffer.data, width, height, stride, uv_offset)
       write_png_atomic(SNAPSHOT_PATH, rgb)
       self.snapshot_available = True
+      self.snapshot_success_count += 1
+      self.snapshot_last_error = ''
       self.snapshot_request.clear()
       self._release_driver_view_for_snapshot()
     except Exception as e:
+      self.snapshot_last_error = repr(e)
       self.last_error = f'snapshot: {e!r}'
-      self.snapshot_request.clear()
-      self._release_driver_view_for_snapshot()
+      # Keep request armed for a later fresh frame; do not silently lose the click.
+    finally:
+      self.snapshot_last_ms = (time.perf_counter_ns() - t0) / 1e6
+
 
   def _config_values(self):
     conf = _clamp(self.config.get('confidence_threshold',0.94),0.80,1.00,0.94)
@@ -369,7 +390,21 @@ class SideVisionDaemon:
       'config_path': str(CONFIG_PATH),
       'snapshot_available': bool(SNAPSHOT_PATH.is_file()),
       'snapshot_path': str(SNAPSHOT_PATH),
+      'snapshot_pending': bool(self.snapshot_request.is_set()),
+      'snapshot_requested_count': int(self.snapshot_requested_count),
+      'snapshot_attempt_count': int(self.snapshot_attempt_count),
+      'snapshot_success_count': int(self.snapshot_success_count),
+      'snapshot_last_ms': round(float(self.snapshot_last_ms), 2),
+      'snapshot_error': str(self.snapshot_last_error),
       'camera_connected': bool(self.camera_connected),
+      'camera_width': int(self.camera_width),
+      'camera_height': int(self.camera_height),
+      'camera_stride': int(self.camera_stride),
+      'frames_received': int(self.frames_received),
+      'last_frame_id': int(self.last_frame_id),
+      'last_frame_mono_ns': int(self.last_frame_mono_ns),
+      'camera_error': str(self.camera_last_error),
+      'model_error': str(self.inference.last_error),
       'onroad': bool(self.onroad),
       'last_inference_mono_ns': int(self.last_inference_mono_ns),
       'inference_ms': round(float(self.inference_ms), 2),
@@ -377,7 +412,7 @@ class SideVisionDaemon:
       'throttle_factor': round(float(self.throttle_factor), 3),
       'left': {'active': bool(self.inference.left_active), 'raw_confidence': round(float(self.inference.left_confidence),4), 'score': round(float(self.inference.left_score),4)},
       'right': {'active': bool(self.inference.right_active), 'raw_confidence': round(float(self.inference.right_confidence),4), 'score': round(float(self.inference.right_score),4)},
-      'last_error': str(self.last_error or self.inference.last_error or ''),
+      'last_error': str(self.last_error or ''),
       'setup_url_port': SIDE_VISION_HTTP_PORT,
       'note': 'Camera evidence is logged/displayed only in V51; it does not modify FutureGap or vehicle control.',
       'packet_mono_ns': time.monotonic_ns(),
@@ -437,34 +472,42 @@ class SideVisionDaemon:
           time.sleep(0.08)
           continue
 
-        # Drain to the newest driver-camera buffer before inference.
+        # Snapshot requests use a bounded blocking receive. This is more reliable
+        # during offroad camerad startup than polling only with timeout_ms=0.
         buffer = None
-        while True:
-          b = self.client.recv(timeout_ms=0)
-          if b is None:
-            break
-          buffer = b
+        if self.snapshot_request.is_set():
+          buffer = self.client.recv(timeout_ms=1200)
+        else:
+          while True:
+            b = self.client.recv(timeout_ms=0)
+            if b is None:
+              break
+            buffer = b
         if buffer is None:
           self._send_status()
           time.sleep(0.02)
           continue
 
-        raw = np.frombuffer(buffer.data, dtype=np.uint8).reshape((len(buffer.data) // self.client.stride, self.client.stride))
-        if self.client.stride != self.client.width:
-          raw = raw[:, :self.client.width]
-
-        uv_offset = int(getattr(buffer, 'uv_offset', 0) or 0)
-        y_plane_rows = (uv_offset // int(self.client.stride)) if uv_offset > 0 else _nv12_y_rows(self.client.width, self.client.height, self.client.stride)
+        self.frames_received += 1
+        self.last_frame_mono_ns = time.monotonic_ns()
+        self.last_frame_id = int(getattr(self.client, 'frame_id', -1) or -1)
+        self.camera_width = int(self.client.width); self.camera_height = int(self.client.height); self.camera_stride = int(self.client.stride)
 
         if self.snapshot_request.is_set():
           exposure_ready = self.onroad or not self._snapshot_driver_view_owned or (now - self._snapshot_driver_view_started_at >= 1.2)
           if exposure_ready:
-            self._capture_snapshot(raw, self.client.width, self.client.height, y_plane_rows)
+            self._capture_snapshot(buffer)
 
         if not (self.onroad and enabled and self.config_loaded and self.inference.valid):
-          self._send_status()
+          self._send_status(force=True)
           time.sleep(0.03)
           continue
+
+        raw = np.frombuffer(buffer.data, dtype=np.uint8).reshape((len(buffer.data) // self.client.stride, self.client.stride))
+        if self.client.stride != self.client.width:
+          raw = raw[:, :self.client.width]
+        uv_offset = int(getattr(buffer, 'uv_offset', 0) or 0)
+        y_plane_rows = (uv_offset // int(self.client.stride)) if uv_offset > 0 else _nv12_y_rows(self.client.width, self.client.height, self.client.stride)
 
         interval = self._inference_interval(now)
         if self.last_inference_at and now - self.last_inference_at < interval - 0.015:
