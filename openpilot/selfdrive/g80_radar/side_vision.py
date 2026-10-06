@@ -17,8 +17,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-import cv2
+import site
 import numpy as np
+
+# Optional Python packages installed on /data are visible without touching the AGNOS system partition.
+PYDEPS = os.getenv('G80_SIDE_VISION_PYDEPS', '/data/g80_pydeps')
+if os.path.isdir(PYDEPS):
+  site.addsitedir(PYDEPS)
 
 from openpilot.cereal import messaging
 from openpilot.common.params import Params
@@ -29,6 +34,7 @@ except Exception:
   get_nv12_info = None
 from openpilot.selfdrive.g80_radar.build_info import BUILD_VERSION, SIDE_VISION_API_VERSION
 from openpilot.selfdrive.g80_radar.side_vision_inference import SideVisionInference, V_ASM_MODEL_PATH
+from openpilot.selfdrive.g80_radar.side_vision_image import nv12_to_rgb, write_png_atomic
 from openpilot.selfdrive.g80_radar.vision_cpu_throttle import device_cpu_throttle_factor
 
 try:
@@ -41,7 +47,7 @@ SIDE_VISION_UDP_PORT = int(os.getenv('G80_SIDE_VISION_UDP_PORT', '28993'))
 SIDE_VISION_HTTP_HOST = os.getenv('G80_SIDE_VISION_HTTP_HOST', '0.0.0.0')
 SIDE_VISION_HTTP_PORT = int(os.getenv('G80_SIDE_VISION_HTTP_PORT', '28994'))
 CONFIG_PATH = Path(os.getenv('G80_SIDE_VISION_CONFIG', '/data/radar/g80_side_vision_config.json'))
-SNAPSHOT_PATH = Path(os.getenv('G80_SIDE_VISION_SNAPSHOT', '/data/radar/g80_side_vision_snapshot.jpg'))
+SNAPSHOT_PATH = Path(os.getenv('G80_SIDE_VISION_SNAPSHOT', '/data/radar/g80_side_vision_snapshot.png'))
 DISABLE_MARKER = Path(os.getenv('G80_SIDE_VISION_DISABLE_MARKER', '/data/radar/DISABLE_G80_SIDE_VISION'))
 
 BASE_INTERVAL = float(os.getenv('G80_SIDE_VISION_BASE_INTERVAL', '1.0'))
@@ -112,7 +118,7 @@ document.getElementById('undo').onclick=()=>{const p=side==='right'?right:left;p
 document.getElementById('refresh').onclick=async()=>{await fetch('/request_snapshot',{method:'POST'});setTimeout(()=>loadSnapshot(true),600)};
 document.getElementById('save').onclick=async()=>{if(!img||(!left.length&&!right.length)){alert('snapshot과 polygon이 필요합니다');return}const sx=nativeW/cv.width,sy=nativeH/cv.height,sc=p=>p.map(q=>[Math.round(q[0]*sx),Math.round(q[1]*sy)]);const c={width:nativeW,height:nativeH,poly_left:left.length>=3?sc(left):[],poly_right:right.length>=3?sc(right):[],confidence_threshold:Number(document.getElementById('conf').value),smooth_sec:Number(document.getElementById('smooth').value)};const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});alert(r.ok?'저장 완료':'저장 실패')};
 document.getElementById('delete').onclick=async()=>{await fetch('/config',{method:'DELETE'});left=[];right=[];draw()};
-async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};statusEl.innerHTML=`model=${s.model_valid?'OK':'MISSING/ERROR'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}</span>  <span class="right">RIGHT active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}</span>\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
+async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};statusEl.innerHTML=`model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}</span>  <span class="right">RIGHT active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}</span>\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
 loadSnapshot(true);poll();
 </script></body></html>'''
 
@@ -229,7 +235,7 @@ class SideVisionDaemon:
         if p == '/snapshot':
           if SNAPSHOT_PATH.is_file():
             try:
-              b = SNAPSHOT_PATH.read_bytes(); self.send_response(200); self.send_header('Content-Type','image/jpeg'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
+              b = SNAPSHOT_PATH.read_bytes(); self.send_response(200); self.send_header('Content-Type','image/png' if SNAPSHOT_PATH.suffix.lower()=='.png' else 'application/octet-stream'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
             except OSError:
               pass
           owner.snapshot_request.set(); self._send_json({'pending': True, 'message': 'Waiting for next driver-camera frame'}, 202); return
@@ -315,18 +321,9 @@ class SideVisionDaemon:
 
   def _capture_snapshot(self, raw_image: np.ndarray, width: int, height: int, y_plane_rows: int):
     try:
-      y = raw_image[:height, :width]
-      uv = raw_image[y_plane_rows:y_plane_rows + height // 2, :width]
-      nv12 = np.vstack([y, uv])
-      rgb = cv2.cvtColor(nv12, cv2.COLOR_YUV2RGB_NV12)
-      bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-      ok, enc = cv2.imencode('.jpg', bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-      if not ok:
-        raise RuntimeError('JPEG encode failed')
-      SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-      tmp = SNAPSHOT_PATH.with_suffix('.jpg.tmp')
-      tmp.write_bytes(bytes(enc))
-      os.replace(tmp, SNAPSHOT_PATH)
+      # No cv2/Pillow dependency: polygon setup must work on a stock AGNOS image.
+      rgb = nv12_to_rgb(raw_image, width, height, y_plane_rows)
+      write_png_atomic(SNAPSHOT_PATH, rgb)
       self.snapshot_available = True
       self.snapshot_request.clear()
       self._release_driver_view_for_snapshot()
@@ -362,6 +359,8 @@ class SideVisionDaemon:
       'fusion_mode': 'SHADOW_ONLY',
       'enabled': enabled,
       'model_valid': bool(self.inference.valid),
+      'inference_backend': str(getattr(self.inference, 'backend', 'none')),
+      'cv2_available': bool(getattr(self.inference, 'cv2_available', False)),
       'model_path': str(self.inference.model_path),
       'model_expected_git_blob': EXPECTED_MODEL_GIT_BLOB,
       'model_source_commit': STAR_PILOT_MODEL_COMMIT,
@@ -396,7 +395,6 @@ class SideVisionDaemon:
       self.last_error = f'udp status: {e!r}'
 
   def run(self):
-    cv2.setNumThreads(1)
     last_param_refresh = 0.0
     while True:
       loop_t0 = time.monotonic()
