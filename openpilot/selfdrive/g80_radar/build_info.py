@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 51
-BUILD_TAG = 'v51r1-v50r1-can-deadline-collector9-autolc10hz-sidevision-shadow-starpilot-vasm'
+BUILD_TAG = 'v51r2-v50r1-can-deadline-collector9-autolc10hz-sidevision-shadow-cv2-data-tmpfix'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
