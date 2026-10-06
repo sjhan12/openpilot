@@ -48,8 +48,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "g80_v51_ml_case_v1"
-COLLECTOR_VERSION = 9
+SCHEMA = "g80_v51_ml_case_v2"
+COLLECTOR_VERSION = 10
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -162,6 +162,22 @@ def _compact_object(o: dict) -> dict:
     'raw_address','raw_slot','stage_origin','stage_gate','preview_quality',
   )
   return {k: _plain(o.get(k)) for k in keys if k in o and o.get(k) is not None}
+
+
+def _compact_object_fast(o: dict) -> dict:
+  """10 Hz ML object snapshot: keep scalar KF/IMM state, omit bulky trajectories.
+
+  Full trajectories remain in the 2 Hz context snapshot, so no information is
+  lost from labelled cases while the realtime-ish radar loop avoids repeatedly
+  deep-copying per-object prediction arrays.
+  """
+  out = _compact_object(o)
+  out.pop('kalman_trajectory', None)
+  # These lists can be large in dense traffic and are provenance/debug rather
+  # than current-time model inputs. They are retained in context_detail at 2 Hz.
+  out.pop('vehicle_cluster_keys', None)
+  out.pop('canonical_domain_history', None)
+  return out
 
 
 def _compact_frame(core: dict, raw_objects, filtered_objects, now_ns: int) -> dict:
@@ -353,8 +369,9 @@ def _fast_frame(core: dict, now_ns: int) -> dict:
     'coordinate_frame': _plain(core.get('coordinate_frame', {})),
     'ego_state': _plain(core.get('ego_state', {})),
     'road_model': _compact_road_model(core.get('road_model', {})),
-    # Canonical360 is the intended ML object input. Keep the rich per-object fields/trajectories.
-    'sensor_fused_objects': [_compact_object(o) for o in (core.get('sensor_fused_objects', []) or [])],
+    # Canonical360 is the intended 10 Hz ML input. Keep scalar KF/IMM state at 10 Hz;
+    # full trajectories/provenance remain in context_detail at 2 Hz.
+    'sensor_fused_objects': [_compact_object_fast(o) for o in (core.get('sensor_fused_objects', []) or [])],
     # V51: StarPilot-derived side-window vision is a 10 Hz feature snapshot,
     # but remains SHADOW evidence and is not allowed to rewrite FG labels here.
     'side_vision': _plain(core.get('side_vision', {})),

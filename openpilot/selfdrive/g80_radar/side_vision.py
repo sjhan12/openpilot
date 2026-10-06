@@ -55,6 +55,7 @@ FOLLOWUP_INTERVAL = float(os.getenv('G80_SIDE_VISION_FOLLOWUP_INTERVAL', '0.30')
 FOLLOWUP_WINDOW = float(os.getenv('G80_SIDE_VISION_FOLLOWUP_WINDOW', '1.0'))
 PARAM_REFRESH_INTERVAL = 2.0
 STATUS_INTERVAL = 0.25
+SNAPSHOT_MAX_ATTEMPTS = max(1, int(os.getenv('G80_SIDE_VISION_SNAPSHOT_MAX_ATTEMPTS','3')))
 MODEL_RETRY_INTERVAL = 5.0
 AFFINITY_CORES = [0, 1, 2]
 EXPECTED_MODEL_GIT_BLOB = '6a1ea709681ce256927e0cf36e53defad5ce94d8'
@@ -348,7 +349,12 @@ class SideVisionDaemon:
     except Exception as e:
       self.snapshot_last_error = repr(e)
       self.last_error = f'snapshot: {e!r}'
-      # Keep request armed for a later fresh frame; do not silently lose the click.
+      # Do not spin on a permanently failing full-frame RGB/PNG conversion.
+      # Retry a few fresh frames, then clear the request and wait for a new click.
+      if self.snapshot_attempt_count >= SNAPSHOT_MAX_ATTEMPTS:
+        self.snapshot_request.clear()
+        self._release_driver_view_for_snapshot()
+        self.last_error = f'snapshot aborted after {self.snapshot_attempt_count} attempts: {e!r}'
     finally:
       self.snapshot_last_ms = (time.perf_counter_ns() - t0) / 1e6
 
