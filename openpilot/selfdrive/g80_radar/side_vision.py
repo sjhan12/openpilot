@@ -106,9 +106,9 @@ def _atomic_json(path: Path, value: dict):
 SETUP_HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>G80 V51 SIDE VISION</title><style>
 body{margin:0;background:#071018;color:#e8f4fa;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1050px;margin:auto;padding:18px}.card{background:#0b1c27;border:1px solid #345164;border-radius:12px;padding:14px;margin-bottom:12px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input{background:#112b3c;color:#e8f4fa;border:1px solid #4b7288;border-radius:8px;padding:9px 11px}button.active{background:#186ab2}.ok{color:#61e29a}.warn{color:#ffd266}.bad{color:#ff7183}canvas{width:100%;height:auto;border:1px solid #456476;border-radius:8px;background:#02070a;cursor:crosshair}.small{font-size:12px;color:#a9c1ce;line-height:1.5}.status{font-family:monospace;font-size:12px;white-space:pre-wrap}.pill{display:inline-block;padding:3px 8px;border:1px solid #416276;border-radius:999px;margin:2px}.left{color:#6fd7ff}.right{color:#ff93c4}</style></head><body><div class="wrap">
 <div class="card"><h2>G80 V51 · SIDE VISION SETUP</h2><div class="small">StarPilot V-ASM 방식을 G80용으로 분리 이식한 SHADOW 센서입니다. FutureGap/조향 제어에는 직접 연결하지 않습니다. 아래 LEFT는 차량 좌측(운전석 쪽), RIGHT는 차량 우측(조수석 쪽)을 뜻합니다. cabin raw image는 화면상 좌우가 거울처럼 보이지 않을 수 있으므로 화면 위치가 아니라 실제 차량 좌/우 창문 기준으로 지정하십시오.</div><div id="status" class="status"></div></div>
-<div class="card"><div class="row"><button id="refresh">SNAPSHOT 새로 요청</button><button data-side="left">LEFT 창문 지정</button><button data-side="right">RIGHT 창문 지정</button><button id="undo">UNDO</button><button id="clear">CLEAR</button><button id="save">SAVE</button><button id="delete">CONFIG DELETE</button></div><div class="row" style="margin-top:8px"><label>confidence <input id="conf" type="number" min="0.80" max="1.00" step="0.01" value="0.94"></label><label>smoothing(s) <input id="smooth" type="number" min="0.01" max="0.50" step="0.01" value="0.20"></label></div><div class="small" style="margin-top:8px">창문 유리 영역을 3점 이상 클릭하십시오. A/B pillar와 실내는 가급적 제외합니다. 저장 뒤 daemon이 자동으로 config를 다시 읽습니다.</div></div>
+<div class="card"><div class="row"><button id="refresh">SNAPSHOT 새로 요청</button><button id="offroadTest">OFFROAD CAMERA TEST · OFF</button><button data-side="left">LEFT 창문 지정</button><button data-side="right">RIGHT 창문 지정</button><button id="undo">UNDO</button><button id="clear">CLEAR</button><button id="save">SAVE</button><button id="delete">CONFIG DELETE</button></div><div class="row" style="margin-top:8px"><label>confidence <input id="conf" type="number" min="0.80" max="1.00" step="0.01" value="0.94"></label><label>smoothing(s) <input id="smooth" type="number" min="0.01" max="0.50" step="0.01" value="0.20"></label></div><div class="small" style="margin-top:8px">창문 유리 영역을 3점 이상 클릭하십시오. A/B pillar와 실내는 가급적 제외합니다. 저장 뒤 daemon이 자동으로 config를 다시 읽습니다. OFFROAD CAMERA TEST는 주차 상태에서만 cabin camera와 V-ASM inference를 연속 실행하며, 차량이 ONROAD가 되면 자동 해제됩니다.</div></div>
 <div class="card"><canvas id="cv"></canvas></div></div><script>
-const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),statusEl=document.getElementById('status');let img=null,side=null,left=[],right=[],nativeW=0,nativeH=0;
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),statusEl=document.getElementById('status'),testBtn=document.getElementById('offroadTest');let img=null,side=null,left=[],right=[],nativeW=0,nativeH=0,lastState=null;
 function draw(){if(!img)return;ctx.clearRect(0,0,cv.width,cv.height);ctx.drawImage(img,0,0,cv.width,cv.height);drawPoly(left,'#67d7ff','LEFT');drawPoly(right,'#ff80bd','RIGHT')}
 function drawPoly(p,c,t){if(!p.length)return;ctx.strokeStyle=c;ctx.fillStyle=c+'33';ctx.lineWidth=3;ctx.beginPath();p.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));if(p.length>=3){ctx.closePath();ctx.fill()}ctx.stroke();ctx.fillStyle=c;ctx.font='bold 15px Arial';p.forEach(q=>{ctx.beginPath();ctx.arc(q[0],q[1],5,0,Math.PI*2);ctx.fill()});ctx.fillText(t,p[0][0]+7,p[0][1]-7)}
 async function loadConfig(){try{const r=await fetch('/config',{cache:'no-store'});const c=await r.json();document.getElementById('conf').value=c.confidence_threshold??0.94;document.getElementById('smooth').value=c.smooth_sec??0.20;if(img&&c.width&&c.height){const sx=cv.width/c.width,sy=cv.height/c.height;left=(c.poly_left||[]).map(q=>[q[0]*sx,q[1]*sy]);right=(c.poly_right||[]).map(q=>[q[0]*sx,q[1]*sy]);draw()}}catch(e){}}
@@ -117,9 +117,10 @@ cv.onclick=e=>{if(!img||!side)return;const r=cv.getBoundingClientRect(),x=(e.cli
 document.querySelectorAll('[data-side]').forEach(b=>b.onclick=()=>{side=b.dataset.side;document.querySelectorAll('[data-side]').forEach(x=>x.classList.toggle('active',x===b))});
 document.getElementById('undo').onclick=()=>{const p=side==='right'?right:left;p.pop();draw()};document.getElementById('clear').onclick=()=>{if(side==='left')left=[];else if(side==='right')right=[];else{left=[];right=[]}draw()};
 document.getElementById('refresh').onclick=async()=>{await fetch('/request_snapshot',{method:'POST'});setTimeout(()=>loadSnapshot(true),600)};
+testBtn.onclick=async()=>{const want=!(lastState&&lastState.offroad_test_enabled);const r=await fetch('/offroad_test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:want})});const d=await r.json().catch(()=>({}));if(!r.ok)alert(d.error||'OFFROAD CAMERA TEST 전환 실패');};
 document.getElementById('save').onclick=async()=>{if(!img||(!left.length&&!right.length)){alert('snapshot과 polygon이 필요합니다');return}const sx=nativeW/cv.width,sy=nativeH/cv.height,sc=p=>p.map(q=>[Math.round(q[0]*sx),Math.round(q[1]*sy)]);const c={width:nativeW,height:nativeH,poly_left:left.length>=3?sc(left):[],poly_right:right.length>=3?sc(right):[],confidence_threshold:Number(document.getElementById('conf').value),smooth_sec:Number(document.getElementById('smooth').value)};const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});alert(r.ok?'저장 완료':'저장 실패')};
 document.getElementById('delete').onclick=async()=>{await fetch('/config',{method:'DELETE'});left=[];right=[];draw()};
-async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};const ready=!!(s.model_valid&&s.config_loaded&&s.onroad);const st=!s.model_valid?'MODEL WAIT':(!s.config_loaded?'CONFIG WAIT':(!s.onroad?'OFFROAD':(!s.camera_connected?'CAMERA WAIT':'READY')));const lf=ready?`active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}`:'active=-- raw=-- score=--';const rf=ready?`active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}`:'active=-- raw=-- score=--';statusEl.innerHTML=`state=${st} model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} snapshot=${s.snapshot_available?'OK':(s.snapshot_pending?'PENDING':'NONE')} frames=${s.frames_received||0} ${s.camera_width||0}x${s.camera_height||0} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT ${lf}</span>  <span class="right">RIGHT ${rf}</span>\nmodel_error=${s.model_error||'-'}\nsnapshot_error=${s.snapshot_error||'-'}\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
+async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();lastState=s;const L=s.left||{},R=s.right||{},test=!!s.offroad_test_enabled,run=!!(s.onroad||test);const inferred=Number(s.last_inference_mono_ns||0)>0,ready=!!(s.model_valid&&s.config_loaded&&run&&s.camera_connected&&inferred);const st=!s.model_valid?'MODEL WAIT':(!s.config_loaded?'CONFIG WAIT':(test&&!s.onroad?(!s.camera_connected?'TEST CAMERA WAIT':(!inferred?'TEST INFERENCE WAIT':'TEST READY')):(!s.onroad?'OFFROAD':(!s.camera_connected?'CAMERA WAIT':(!inferred?'INFERENCE WAIT':'READY')))));testBtn.textContent=test?'OFFROAD CAMERA TEST · ON':'OFFROAD CAMERA TEST · OFF';testBtn.classList.toggle('active',test);testBtn.disabled=!!s.onroad;testBtn.title=s.onroad?'ONROAD에서는 자동 해제되며 사용할 수 없습니다.':'주차 상태에서 cabin camera + V-ASM inference를 연속 실행';const lf=ready?`active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}`:'active=-- raw=-- score=--';const rf=ready?`active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}`:'active=-- raw=-- score=--';statusEl.innerHTML=`state=${st} model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} snapshot=${s.snapshot_available?'OK':(s.snapshot_pending?'PENDING':'NONE')} frames=${s.frames_received||0} ${s.camera_width||0}x${s.camera_height||0} onroad=${s.onroad?'1':'0'} offroad_test=${test?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT ${lf}</span>  <span class="right">RIGHT ${rf}</span>\nmodel_error=${s.model_error||'-'}\nsnapshot_error=${s.snapshot_error||'-'}\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
 loadSnapshot(true);poll();
 </script></body></html>'''
 
@@ -148,6 +149,8 @@ class SideVisionDaemon:
     self.current_interval = BASE_INTERVAL
     self.camera_connected = False
     self.onroad = False
+    self.offroad_test_enabled = False
+    self.offroad_test_started_at = 0.0
     self.last_error = ''
     self.last_status_send = 0.0
     self.last_status_log = 0.0
@@ -255,6 +258,15 @@ class SideVisionDaemon:
         p = self._path()
         if p == '/request_snapshot':
           owner.snapshot_requested_count += 1; owner.snapshot_request.set(); self._send_json({'ok':True,'request_count':owner.snapshot_requested_count}); return
+        if p == '/offroad_test':
+          try:
+            n = min(int(self.headers.get('Content-Length','0') or 0), 4096)
+            data = json.loads(self.rfile.read(n).decode('utf-8')) if n else {}
+            want = bool(data.get('enabled', not owner.offroad_test_enabled)) if isinstance(data, dict) else (not owner.offroad_test_enabled)
+            ok, msg = owner._set_offroad_test(want)
+            self._send_json({'ok':ok,'enabled':owner.offroad_test_enabled,'message':msg}, 200 if ok else 409); return
+          except Exception as e:
+            self._send_json({'error':str(e)},400); return
         if p == '/config':
           try:
             n = min(int(self.headers.get('Content-Length','0') or 0), 128000)
@@ -286,6 +298,25 @@ class SideVisionDaemon:
         owner.last_error = f'http: {e!r}'
 
     threading.Thread(target=serve, name='g80-side-vision-http', daemon=True).start()
+
+  def _set_offroad_test(self, enabled: bool):
+    enabled = bool(enabled)
+    if enabled and self.onroad:
+      return False, 'OFFROAD CAMERA TEST is available only while parked/offroad'
+    if enabled == self.offroad_test_enabled:
+      return True, 'already enabled' if enabled else 'already disabled'
+    self.offroad_test_enabled = enabled
+    self.inference.reset_state()
+    self.last_inference_at = 0.0
+    self.last_inference_at_side = {'left': 0.0, 'right': 0.0}
+    self.followup_until = 0.0
+    if enabled:
+      self.offroad_test_started_at = time.monotonic()
+      self._ensure_driver_view_for_snapshot(self.offroad_test_started_at)
+      return True, 'offroad camera inference test enabled'
+    self.offroad_test_started_at = 0.0
+    self._release_driver_view_for_snapshot()
+    return True, 'offroad camera inference test disabled'
 
   def _connect_camera(self) -> bool:
     try:
@@ -321,6 +352,10 @@ class SideVisionDaemon:
       self.last_error = f'driver-view snapshot start: {e!r}'
 
   def _release_driver_view_for_snapshot(self):
+    # OFFROAD CAMERA TEST deliberately keeps cabin camerad alive until the user
+    # turns the test off (or the car transitions onroad).
+    if self.offroad_test_enabled and not self.onroad:
+      return
     if not self._snapshot_driver_view_owned:
       return
     try:
@@ -386,7 +421,7 @@ class SideVisionDaemon:
       'fusion_mode': 'SHADOW_ONLY',
       'enabled': enabled,
       'model_valid': bool(self.inference.valid),
-      'inference_ready': bool(enabled and self.onroad and self.config_loaded and self.inference.valid),
+      'inference_ready': bool(enabled and (self.onroad or self.offroad_test_enabled) and self.config_loaded and self.inference.valid),
       'inference_backend': str(getattr(self.inference, 'backend', 'none')),
       'cv2_available': bool(getattr(self.inference, 'cv2_available', False)),
       'model_path': str(self.inference.model_path),
@@ -413,6 +448,9 @@ class SideVisionDaemon:
       'camera_error': str(self.camera_last_error),
       'model_error': str(self.inference.last_error),
       'onroad': bool(self.onroad),
+      'offroad_test_enabled': bool(self.offroad_test_enabled),
+      'offroad_test_active': bool(self.offroad_test_enabled and not self.onroad),
+      'offroad_test_started_mono_s': round(float(self.offroad_test_started_at), 3) if self.offroad_test_started_at else 0.0,
       'last_inference_mono_ns': int(self.last_inference_mono_ns),
       'inference_ms': round(float(self.inference_ms), 2),
       'inference_interval_s': round(float(self.current_interval), 3),
@@ -453,6 +491,17 @@ class SideVisionDaemon:
         except Exception:
           self.onroad = False
 
+        # OFFROAD CAMERA TEST is intentionally parked-only. Do not let a test
+        # request survive into a drive; onroad uses the normal shadow path.
+        if self.onroad and self.offroad_test_enabled:
+          self.offroad_test_enabled = False
+          self.offroad_test_started_at = 0.0
+          self._release_driver_view_for_snapshot()
+          self.inference.reset_state()
+          self.last_inference_at = 0.0
+          self.last_inference_at_side = {'left': 0.0, 'right': 0.0}
+          self.followup_until = 0.0
+
         enabled = bool(self.enabled_env and not DISABLE_MARKER.exists())
         need_snapshot = bool(self.snapshot_request.is_set() or (self.onroad and not self.config_loaded and not SNAPSHOT_PATH.is_file() and not self.auto_snapshot_requested))
         if need_snapshot:
@@ -460,15 +509,19 @@ class SideVisionDaemon:
           self.snapshot_request.set()
           if not self.onroad:
             self._ensure_driver_view_for_snapshot(now)
+        if self.offroad_test_enabled and not self.onroad:
+          self._ensure_driver_view_for_snapshot(now)
 
         # Snapshot setup may temporarily request the cabin stream while parked.
-        # Normal inference remains strictly onroad.
-        need_camera = bool(need_snapshot or (self.onroad and enabled and self.config_loaded and self.inference.valid))
+        # V51r6 OFFROAD CAMERA TEST may also run the same SHADOW inference path
+        # while parked; it never feeds FutureGap or control.
+        inference_allowed = bool(self.onroad or self.offroad_test_enabled)
+        need_camera = bool(need_snapshot or (inference_allowed and enabled and self.config_loaded and self.inference.valid))
         if not need_camera:
           # Do not leave a stale CONNECTED state from a prior snapshot/client.
           # If inference is not runnable (MODEL/CONFIG/OFF), report camera as inactive.
           self.camera_connected = False
-          if not self.onroad:
+          if not inference_allowed:
             self.inference.reset_state()
             self.followup_until = 0.0
             self._release_driver_view_for_snapshot()
@@ -507,7 +560,7 @@ class SideVisionDaemon:
           if exposure_ready:
             self._capture_snapshot(buffer)
 
-        if not (self.onroad and enabled and self.config_loaded and self.inference.valid):
+        if not (inference_allowed and enabled and self.config_loaded and self.inference.valid):
           self._send_status(force=True)
           time.sleep(0.03)
           continue
