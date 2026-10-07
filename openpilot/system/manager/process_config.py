@@ -138,6 +138,7 @@ procs = [
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
   PythonProcess("g80radard", "openpilot.selfdrive.g80_radar.live_service", always_run),
   PythonProcess("g80sidevision", "openpilot.selfdrive.g80_radar.side_vision", always_run),
+  PythonProcess("g80frontcornervision", "openpilot.selfdrive.g80_radar.front_corner_vision", always_run),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
   PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
   PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=COMMA_HARDWARE),
