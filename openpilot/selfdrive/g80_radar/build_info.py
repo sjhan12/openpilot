@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 51
-BUILD_TAG = 'v51r7-v50r1-nv12-uv-offset-fix-offroad-camera-test-autolc10hz-sidevision-shadow'
+BUILD_TAG = 'v51r8-v50r1-sidecam-arrow-status-nv12fix-offroadtest-autolc10hz-shadow'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
