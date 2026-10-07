@@ -119,7 +119,7 @@ document.getElementById('undo').onclick=()=>{const p=side==='right'?right:left;p
 document.getElementById('refresh').onclick=async()=>{await fetch('/request_snapshot',{method:'POST'});setTimeout(()=>loadSnapshot(true),600)};
 document.getElementById('save').onclick=async()=>{if(!img||(!left.length&&!right.length)){alert('snapshot과 polygon이 필요합니다');return}const sx=nativeW/cv.width,sy=nativeH/cv.height,sc=p=>p.map(q=>[Math.round(q[0]*sx),Math.round(q[1]*sy)]);const c={width:nativeW,height:nativeH,poly_left:left.length>=3?sc(left):[],poly_right:right.length>=3?sc(right):[],confidence_threshold:Number(document.getElementById('conf').value),smooth_sec:Number(document.getElementById('smooth').value)};const r=await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});alert(r.ok?'저장 완료':'저장 실패')};
 document.getElementById('delete').onclick=async()=>{await fetch('/config',{method:'DELETE'});left=[];right=[];draw()};
-async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};statusEl.innerHTML=`model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} snapshot=${s.snapshot_available?'OK':(s.snapshot_pending?'PENDING':'NONE')} frames=${s.frames_received||0} ${s.camera_width||0}x${s.camera_height||0} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}</span>  <span class="right">RIGHT active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}</span>\nmodel_error=${s.model_error||'-'}\nsnapshot_error=${s.snapshot_error||'-'}\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
+async function poll(){try{const r=await fetch('/state',{cache:'no-store'}),s=await r.json();const L=s.left||{},R=s.right||{};const ready=!!(s.model_valid&&s.config_loaded&&s.onroad);const st=!s.model_valid?'MODEL WAIT':(!s.config_loaded?'CONFIG WAIT':(!s.onroad?'OFFROAD':(!s.camera_connected?'CAMERA WAIT':'READY')));const lf=ready?`active=${L.active?'1':'0'} raw=${Number(L.raw_confidence||0).toFixed(3)} score=${Number(L.score||0).toFixed(3)}`:'active=-- raw=-- score=--';const rf=ready?`active=${R.active?'1':'0'} raw=${Number(R.raw_confidence||0).toFixed(3)} score=${Number(R.score||0).toFixed(3)}`:'active=-- raw=-- score=--';statusEl.innerHTML=`state=${st} model=${s.model_valid?'OK':'MISSING/ERROR'} backend=${s.inference_backend||'none'} cv2=${s.cv2_available?'YES':'NO'} config=${s.config_loaded?'OK':'NEEDED'} camera=${s.camera_connected?'CONNECTED':'WAIT'} snapshot=${s.snapshot_available?'OK':(s.snapshot_pending?'PENDING':'NONE')} frames=${s.frames_received||0} ${s.camera_width||0}x${s.camera_height||0} onroad=${s.onroad?'1':'0'} throttle=${Number(s.throttle_factor||1).toFixed(2)}x\n<span class="left">LEFT ${lf}</span>  <span class="right">RIGHT ${rf}</span>\nmodel_error=${s.model_error||'-'}\nsnapshot_error=${s.snapshot_error||'-'}\n${s.last_error||''}`;}catch(e){}setTimeout(poll,1000)}
 loadSnapshot(true);poll();
 </script></body></html>'''
 
@@ -386,6 +386,7 @@ class SideVisionDaemon:
       'fusion_mode': 'SHADOW_ONLY',
       'enabled': enabled,
       'model_valid': bool(self.inference.valid),
+      'inference_ready': bool(enabled and self.onroad and self.config_loaded and self.inference.valid),
       'inference_backend': str(getattr(self.inference, 'backend', 'none')),
       'cv2_available': bool(getattr(self.inference, 'cv2_available', False)),
       'model_path': str(self.inference.model_path),
@@ -464,8 +465,10 @@ class SideVisionDaemon:
         # Normal inference remains strictly onroad.
         need_camera = bool(need_snapshot or (self.onroad and enabled and self.config_loaded and self.inference.valid))
         if not need_camera:
+          # Do not leave a stale CONNECTED state from a prior snapshot/client.
+          # If inference is not runnable (MODEL/CONFIG/OFF), report camera as inactive.
+          self.camera_connected = False
           if not self.onroad:
-            self.camera_connected = False
             self.inference.reset_state()
             self.followup_until = 0.0
             self._release_driver_view_for_snapshot()
