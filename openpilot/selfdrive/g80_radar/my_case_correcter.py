@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""G80 V51 event-triggered ML case collector.
+"""G80 V52R1 event-triggered ML case collector.
 
 Design goals
 ------------
@@ -17,9 +17,9 @@ Design goals
 * AUTO_SAFE_CANDIDATE requires ACTIVE-phase evidence and no hard hazard. Partial
   or hazardous executions are AUTO_REVIEW, never silently promoted to SAFE.
 * Background JSON/gzip writes are chunk-yielded to reduce GIL/CPU bursts.
-* Runs inside V51 g80radard/live_service so training data is exactly the V51
+* Runs inside V52R1 g80radard/live_service so training data is exactly the V52R1
   state that a later inference module can consume.
-* Collector failures must never stop V51 radar monitoring.
+* Collector failures must never stop V52R1 radar monitoring.
 
 Default key map (Linux EV_KEY codes):
   F13 183 = LEFT SAFE
@@ -48,8 +48,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "g80_v51_ml_case_v2"
-COLLECTOR_VERSION = 10
+SCHEMA = "g80_v52r1_ml_case_v1"
+COLLECTOR_VERSION = 11
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -375,6 +375,8 @@ def _fast_frame(core: dict, now_ns: int) -> dict:
     # V51: StarPilot-derived side-window vision is a 10 Hz feature snapshot,
     # but remains SHADOW evidence and is not allowed to rewrite FG labels here.
     'side_vision': _plain(core.get('side_vision', {})),
+    # V52R1: WIDE ROAD front-left/front-right ROI classifier, SHADOW only.
+    'front_corner_vision': _plain(core.get('front_corner_vision', {})),
     'future_gap_summary': _compact_future_gap(core.get('future_gap', {})),
     'scc_teacher': _plain(core.get('scc_teacher', {})),
     'teacher_rear': _plain(core.get('teacher_rear', [])),
@@ -829,6 +831,7 @@ class MLCaseCollector:
       'saw_danger': False, 'saw_bsd_block': False, 'saw_hard_override': False,
       'saw_emergency_decel': False, 'min_a_ego': 99.0, 'max_abs_steer_deg': 0.0,
       'saw_side_vision_active': False, 'max_side_vision_score': 0.0,
+      'saw_front_corner_vision_active': False, 'max_front_corner_vision_score': 0.0,
       'samples': 0,
     }
     # Disarm immediately. Re-arming happens only after this whole maneuver has
@@ -922,6 +925,20 @@ class MLCaseCollector:
     except Exception:
       pass
 
+    # V52R1 front-corner WIDE ROAD vision is also observational only.
+    # Match lane-change side to FL/FR and record correlation; never use it to
+    # promote/demote AUTO_SAFE labels until a dedicated front-corner model is validated.
+    fcv = core.get('front_corner_vision', {}) or {}
+    fcv_key = 'fl' if side_key == 'left' else 'fr'
+    fcv_side = fcv.get(fcv_key, {}) or {}
+    try:
+      if bool(fcv.get('usable')) and bool(fcv_side.get('effective_active', fcv_side.get('active'))):
+        c['saw_front_corner_vision_active'] = True
+      score = float(fcv_side.get('score') or fcv_side.get('raw_confidence') or 0.0)
+      c['max_front_corner_vision_score'] = max(float(c['max_front_corner_vision_score']), score)
+    except Exception:
+      pass
+
     if now_ns < p.end_ns:
       return
 
@@ -952,6 +969,9 @@ class MLCaseCollector:
       'saw_side_vision_active': bool(c['saw_side_vision_active']),
       'max_side_vision_score': round(float(c['max_side_vision_score']), 4),
       'side_vision_policy': 'logged for correlation only; excluded from AUTO_SAFE promotion in V51',
+      'saw_front_corner_vision_active': bool(c['saw_front_corner_vision_active']),
+      'max_front_corner_vision_score': round(float(c['max_front_corner_vision_score']), 4),
+      'front_corner_vision_policy': 'WIDE ROAD FL/FR SHADOW correlation only; side V-ASM reused temporarily; excluded from AUTO_SAFE promotion in V52R1',
       'min_a_ego_mps2': None if c['min_a_ego'] > 90 else round(float(c['min_a_ego']), 3),
       'max_abs_steering_deg': round(float(c['max_abs_steer_deg']), 2),
       'max_commit_age_s': round(float(c['max_commit_age_s']), 3),
@@ -1125,8 +1145,9 @@ class MLCaseCollector:
       'max_frame_gap_ms': None if max_frame_gap_ms is None else round(max_frame_gap_ms, 3),
       'capture_samples': int(self.capture_samples),
       'capture_missed_slots': int(self.capture_missed_slots),
-      'capture_policy': 'real V51 snapshots only; no interpolation/duplicate frames',
+      'capture_policy': 'real V52R1 snapshots only; no interpolation/duplicate frames',
       'side_vision_fast_input': True,
+      'front_corner_vision_fast_input': True,
       'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
       'writer_queue': self._writer.q.qsize(),
       'saved_cases': self.saved_cases, 'last_saved_file': self.last_saved_file,

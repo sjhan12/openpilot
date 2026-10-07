@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 51
-BUILD_TAG = 'v51r8-v50r1-sidecam-arrow-status-nv12fix-offroadtest-autolc10hz-shadow'
+BUILD_VERSION = 52
+BUILD_TAG = 'v52r1-v50r1-front-corner-vision-shadow-widecam-reuse-vasm-sidecam-autolc10hz'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
 FUTURE_GAP_API_VERSION = 15
 ANDROID_PROTOCOL_VERSION = 21
 SIDE_VISION_API_VERSION = 2
+FRONT_CORNER_VISION_API_VERSION = 1
 
 COORDINATE_X_ORIGIN = 'ego_front_bumper_display_reference'
 EGO_DISPLAY_LENGTH_M = 4.8
