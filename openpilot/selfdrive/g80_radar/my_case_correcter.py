@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""G80 V52R1 event-triggered ML case collector.
+"""G80 V52R2 event-triggered ML case collector.
 
 Design goals
 ------------
@@ -17,9 +17,9 @@ Design goals
 * AUTO_SAFE_CANDIDATE requires ACTIVE-phase evidence and no hard hazard. Partial
   or hazardous executions are AUTO_REVIEW, never silently promoted to SAFE.
 * Background JSON/gzip writes are chunk-yielded to reduce GIL/CPU bursts.
-* Runs inside V52R1 g80radard/live_service so training data is exactly the V52R1
+* Runs inside V52R2 g80radard/live_service so training data is exactly the V52R2
   state that a later inference module can consume.
-* Collector failures must never stop V52R1 radar monitoring.
+* Collector failures must never stop V52R2 radar monitoring.
 
 Default key map (Linux EV_KEY codes):
   F13 183 = LEFT SAFE
@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "g80_v52r1_ml_case_v1"
-COLLECTOR_VERSION = 11
+COLLECTOR_VERSION = 12
 
 EV_KEY = 0x01
 KEY_F13 = 183
@@ -605,9 +605,15 @@ class MLCaseCollector:
     self.last_context_ns = 0
     # Measure actual ML snapshot cadence; never synthesize duplicate frames.
     self.capture_intervals_ns = deque(maxlen=128)
+    self.capture_active_intervals_ns = deque(maxlen=128)
     self.capture_samples = 0
+    # Missed-slot diagnostics apply only while the collector is in ACTIVE 10 Hz mode.
+    # V52R1 counted intentional 2 Hz idle gaps as four missed 10 Hz slots, which made
+    # check_v52r1.sh look broken while parked/offroad even though AUTO-LC switched to
+    # 10 Hz as soon as a blinker/maneuver was present.
     self.capture_missed_slots = 0
     self.capture_max_gap_ns = 0
+    self.last_sample_mode = None
     self.session_id = uuid.uuid4().hex
     self._ego_extra = {k: None for k in EGO_EXTRA_FIELDS}
     self._ego_present = {k: False for k in EGO_EXTRA_FIELDS}
@@ -1062,20 +1068,26 @@ class MLCaseCollector:
           self.ring.clear()
         return
 
-      interval_ns = self.idle_interval_ns if self._idle_state(core) else self.min_interval_ns
+      idle_mode = self._idle_state(core)
+      interval_ns = self.idle_interval_ns if idle_mode else self.min_interval_ns
+      sample_mode = 'IDLE_2HZ' if idle_mode else 'ACTIVE_10HZ'
       if self.last_sample_ns and now_ns - self.last_sample_ns < interval_ns * 0.85:
         self._finish_due(now_ns)
         return
-      # Keep the existing low-overhead sampling path. Measure the real cadence
-      # delivered by live_service instead of interpolating/duplicating stale frames.
+      # Measure the real cadence delivered by live_service instead of
+      # interpolating/duplicating stale frames. Intentional IDLE_2HZ gaps are not
+      # counted as missing 10 Hz training snapshots.
       if self.last_sample_ns:
         gap_ns = max(0, now_ns - self.last_sample_ns)
         self.capture_intervals_ns.append(gap_ns)
         self.capture_max_gap_ns = max(self.capture_max_gap_ns, gap_ns)
-        nominal_slots = max(1, int(round(gap_ns / max(self.min_interval_ns, 1))))
-        if nominal_slots > 1:
-          self.capture_missed_slots += nominal_slots - 1
+        if sample_mode == 'ACTIVE_10HZ' and self.last_sample_mode == 'ACTIVE_10HZ':
+          self.capture_active_intervals_ns.append(gap_ns)
+          nominal_slots = max(1, int(round(gap_ns / max(self.min_interval_ns, 1))))
+          if nominal_slots > 1:
+            self.capture_missed_slots += nominal_slots - 1
       self.last_sample_ns = now_ns
+      self.last_sample_mode = sample_mode
       self.capture_samples += 1
 
       frame = _fast_frame(core, now_ns)
@@ -1133,6 +1145,12 @@ class MLCaseCollector:
     else:
       actual_capture_hz = None
       max_frame_gap_ms = None
+    active_intervals = list(self.capture_active_intervals_ns)
+    if active_intervals:
+      active_avg_gap_ns = sum(active_intervals) / len(active_intervals)
+      actual_active_hz = (1e9 / active_avg_gap_ns) if active_avg_gap_ns > 0 else None
+    else:
+      actual_active_hz = None
     return {
       'schema': SCHEMA, 'collector_version': COLLECTOR_VERSION, 'enabled': self.enabled(),
       'session_id': self.session_id, 'ego_extension_hook_received': bool(self._ego_updates),
@@ -1141,11 +1159,13 @@ class MLCaseCollector:
       'input_devices': len(self._thread.fds) if self._thread else 0,
       'pre_sec': self.pre_s, 'post_sec': self.post_s,
       'sample_hz': self.sample_hz, 'context_hz': self.context_hz, 'idle_hz': self.idle_hz,
+      'capture_mode': self.last_sample_mode or 'WAIT',
       'actual_capture_hz': None if actual_capture_hz is None else round(actual_capture_hz, 3),
+      'actual_active_hz': None if actual_active_hz is None else round(actual_active_hz, 3),
       'max_frame_gap_ms': None if max_frame_gap_ms is None else round(max_frame_gap_ms, 3),
       'capture_samples': int(self.capture_samples),
       'capture_missed_slots': int(self.capture_missed_slots),
-      'capture_policy': 'real V52R1 snapshots only; no interpolation/duplicate frames',
+      'capture_policy': 'real V52R2 snapshots only; ACTIVE=10Hz, intentional IDLE=2Hz; no interpolation/duplicate frames',
       'side_vision_fast_input': True,
       'front_corner_vision_fast_input': True,
       'ram_frames': len(self.ring), 'pending_cases': len(self.pending),
