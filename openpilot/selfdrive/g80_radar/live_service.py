@@ -169,11 +169,11 @@ body{display:flex;flex-direction:column;min-width:0}
 header{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:11px 15px 7px;gap:10px;background:#06121b;border-bottom:1px solid var(--line)}
 .brand strong{font-size:17px;letter-spacing:.2px;color:white}.brand .sub{font-size:10px;letter-spacing:.5px;color:var(--cyan);font-weight:700;margin-top:3px}
 .conn{font-size:11px;color:var(--muted);white-space:nowrap;font-weight:bold}.conn.good{color:#8eebac}.conn.bad{color:var(--red)}
-.toolbar{display:flex;align-items:center;padding:7px 12px;gap:10px;background:#071822;border-bottom:1px solid var(--line);min-width:0}
-.tabRail{display:flex;gap:7px;flex:1 1 auto;overflow-x:auto;scrollbar-width:thin;min-width:0;white-space:nowrap}
+.toolbar{display:flex;flex-direction:column;align-items:stretch;padding:7px 12px;gap:6px;background:#071822;border-bottom:1px solid var(--line);min-width:0}
+.tabRail{display:flex;gap:7px;width:100%;overflow-x:auto;scrollbar-width:thin;min-width:0;white-space:nowrap}
 .tabRail button,.control button{background:#102838;color:#b6d1df;border:1px solid #365465;border-radius:10px;padding:10px 13px;font-size:11px;font-weight:800;letter-spacing:.12px;cursor:pointer;flex:none}
 .tabRail button.active{background:#1257aa;color:#fff;border-color:#3dc0ff;box-shadow:inset 0 0 0 1px #4c99f9,0 0 14px #085d7d5e}
-.tabRail button .small{display:block;font-size:9px;color:inherit;opacity:.72;margin-top:3px}.control{display:flex;gap:5px;align-items:center}
+.tabRail button .small{display:block;font-size:9px;color:inherit;opacity:.72;margin-top:3px}.control{display:flex;gap:5px;align-items:center;width:100%;justify-content:flex-end;overflow-x:auto;scrollbar-width:thin;white-space:nowrap}
 .control button{padding:8px 10px;font-size:10px}.control button.active{color:#fff;background:#1b5578;border-color:#65c7ec}.control .warn{border-color:#57744a;color:#a7ed9b}
 .stagebar{display:flex;align-items:baseline;gap:12px;padding:7px 16px;background:#0b202c;border-bottom:1px solid #264453;min-height:38px}
 .stagebar strong{color:var(--cyan);font-size:14px;flex:none}.stagebar span{font-size:10.5px;color:#c1d6e1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
