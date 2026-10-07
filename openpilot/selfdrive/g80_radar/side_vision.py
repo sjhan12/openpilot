@@ -96,6 +96,49 @@ def _nv12_y_rows(width: int, height: int, stride: int) -> int:
   return aligned if aligned < 2 * int(height) else int(height)
 
 
+def _visionipc_nv12_compact(data, width: int, height: int, stride: int, uv_offset: int = 0) -> tuple[np.ndarray, int]:
+  """Build the compact NV12 view expected by SideVisionInference.
+
+  VisionIPC/Qualcomm buffers can contain stride padding, aligned Y rows and
+  trailing guard/kernel bytes.  The whole DMA buffer therefore must *not* be
+  reshaped as ``(-1, stride)``.  Copy only the physical Y plane and the active
+  UV rows, strip horizontal stride padding, and preserve the padded Y row count
+  so the inference crop can locate the UV plane correctly.
+  """
+  width = int(width); height = int(height); stride = int(stride); uv_offset = int(uv_offset or 0)
+  if width <= 0 or height <= 0 or stride < width:
+    raise ValueError(f'invalid VisionIPC geometry w={width} h={height} stride={stride}')
+  if width & 1 or height & 1:
+    raise ValueError(f'NV12 requires even active dimensions, got {width}x{height}')
+
+  flat = np.frombuffer(data, dtype=np.uint8)
+  if uv_offset <= 0:
+    y_rows = _nv12_y_rows(width, height, stride)
+    uv_offset = y_rows * stride
+  else:
+    if uv_offset % stride != 0:
+      raise ValueError(f'uv_offset not stride aligned: uv_offset={uv_offset} stride={stride}')
+    y_rows = uv_offset // stride
+  if y_rows < height:
+    raise ValueError(f'short Y plane rows={y_rows} active_height={height}')
+
+  y_bytes = y_rows * stride
+  uv_rows = height // 2
+  uv_bytes = uv_rows * stride
+  need = uv_offset + uv_bytes
+  if y_bytes > flat.size or need > flat.size:
+    raise ValueError(f'short VisionIPC buffer size={flat.size} need={need} uv_offset={uv_offset}')
+
+  # Do not include trailing guard bytes.  Horizontal DMA padding is also
+  # removed because SideVisionInference uses active-image x coordinates.
+  y_src = flat[:y_bytes].reshape((y_rows, stride))[:, :width]
+  uv_src = flat[uv_offset:uv_offset + uv_bytes].reshape((uv_rows, stride))[:, :width]
+  raw = np.empty((y_rows + uv_rows, width), dtype=np.uint8)
+  raw[:y_rows] = y_src
+  raw[y_rows:] = uv_src
+  return raw, y_rows
+
+
 def _atomic_json(path: Path, value: dict):
   path.parent.mkdir(parents=True, exist_ok=True)
   tmp = path.with_suffix(path.suffix + '.tmp')
@@ -565,11 +608,13 @@ class SideVisionDaemon:
           time.sleep(0.03)
           continue
 
-        raw = np.frombuffer(buffer.data, dtype=np.uint8).reshape((len(buffer.data) // self.client.stride, self.client.stride))
-        if self.client.stride != self.client.width:
-          raw = raw[:, :self.client.width]
+        # V51r7: Qualcomm/VisionIPC buffers contain aligned planes plus trailing
+        # guard bytes.  Reshaping the entire buffer by stride caused e.g.
+        # 2,428,928 bytes to fail against (1725, 1408).  Extract only Y + active
+        # UV rows using uv_offset, strip stride padding, and ignore guard bytes.
         uv_offset = int(getattr(buffer, 'uv_offset', 0) or 0)
-        y_plane_rows = (uv_offset // int(self.client.stride)) if uv_offset > 0 else _nv12_y_rows(self.client.width, self.client.height, self.client.stride)
+        raw, y_plane_rows = _visionipc_nv12_compact(
+          buffer.data, self.client.width, self.client.height, self.client.stride, uv_offset)
 
         interval = self._inference_interval(now)
         if self.last_inference_at and now - self.last_inference_at < interval - 0.015:
@@ -595,6 +640,7 @@ class SideVisionDaemon:
         self.last_inference_at = now
         self.last_inference_at_side[self.current_side] = now
         self.last_inference_mono_ns = time.monotonic_ns()
+        self.last_error = ''
         if l_active or r_active:
           self.followup_until = now + FOLLOWUP_WINDOW
         idx = sides.index(self.current_side)
