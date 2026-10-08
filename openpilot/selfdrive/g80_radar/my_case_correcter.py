@@ -377,6 +377,9 @@ def _fast_frame(core: dict, now_ns: int) -> dict:
     'side_vision': _plain(core.get('side_vision', {})),
     # V52R1: WIDE ROAD front-left/front-right ROI classifier, SHADOW only.
     'front_corner_vision': _plain(core.get('front_corner_vision', {})),
+    'lane_change_shadow': _plain(core.get('lane_change_shadow', {})),
+    'vasm_warning': _plain(core.get('vasm_warning', {})),
+    'shadow_lead_interface': _plain(core.get('shadow_lead_interface', {})),
     'future_gap_summary': _compact_future_gap(core.get('future_gap', {})),
     'scc_teacher': _plain(core.get('scc_teacher', {})),
     'teacher_rear': _plain(core.get('teacher_rear', [])),

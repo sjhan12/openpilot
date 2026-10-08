@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 52
-BUILD_TAG = 'v52r2-v50r1-model-restore-ui-fix-front-corner-shadow-autolc10hz'
+BUILD_TAG = 'v52r7-separate-l2-cutin-stop-shadow'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3

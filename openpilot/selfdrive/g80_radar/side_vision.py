@@ -148,7 +148,7 @@ def _atomic_json(path: Path, value: dict):
 
 SETUP_HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>G80 V52 SIDE VISION</title><style>
 body{margin:0;background:#071018;color:#e8f4fa;font-family:Arial,"Noto Sans KR",sans-serif}.wrap{max-width:1050px;margin:auto;padding:18px}.card{background:#0b1c27;border:1px solid #345164;border-radius:12px;padding:14px;margin-bottom:12px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input{background:#112b3c;color:#e8f4fa;border:1px solid #4b7288;border-radius:8px;padding:9px 11px}button.active{background:#186ab2}.ok{color:#61e29a}.warn{color:#ffd266}.bad{color:#ff7183}canvas{width:100%;height:auto;border:1px solid #456476;border-radius:8px;background:#02070a;cursor:crosshair}.small{font-size:12px;color:#a9c1ce;line-height:1.5}.status{font-family:monospace;font-size:12px;white-space:pre-wrap}.pill{display:inline-block;padding:3px 8px;border:1px solid #416276;border-radius:999px;margin:2px}.left{color:#6fd7ff}.right{color:#ff93c4}</style></head><body><div class="wrap">
-<div class="card"><h2>G80 V52 · SIDE VISION SETUP</h2><div class="small">StarPilot V-ASM 방식을 G80용으로 분리 이식한 SHADOW 센서입니다. FutureGap/조향 제어에는 직접 연결하지 않습니다. 아래 LEFT는 차량 좌측(운전석 쪽), RIGHT는 차량 우측(조수석 쪽)을 뜻합니다. cabin raw image는 화면상 좌우가 거울처럼 보이지 않을 수 있으므로 화면 위치가 아니라 실제 차량 좌/우 창문 기준으로 지정하십시오.</div><div id="status" class="status"></div></div>
+<div class="card"><h2>G80 V52 · SIDE VISION SETUP</h2><div class="small">StarPilot V-ASM 방식을 G80용으로 분리 이식한 SHADOW 센서입니다. FG15/조향 제어는 변경하지 않으며, G80 웹 HUD 경고 강화에만 연결됩니다. 아래 LEFT는 차량 좌측(운전석 쪽), RIGHT는 차량 우측(조수석 쪽)을 뜻합니다. cabin raw image는 화면상 좌우가 거울처럼 보이지 않을 수 있으므로 화면 위치가 아니라 실제 차량 좌/우 창문 기준으로 지정하십시오.</div><div id="status" class="status"></div></div>
 <div class="card"><div class="row"><button id="refresh">SNAPSHOT 새로 요청</button><button id="offroadTest">OFFROAD CAMERA TEST · OFF</button><button data-side="left">LEFT 창문 지정</button><button data-side="right">RIGHT 창문 지정</button><button id="undo">UNDO</button><button id="clear">CLEAR</button><button id="save">SAVE</button><button id="delete">CONFIG DELETE</button></div><div class="row" style="margin-top:8px"><label>confidence <input id="conf" type="number" min="0.80" max="1.00" step="0.01" value="0.94"></label><label>smoothing(s) <input id="smooth" type="number" min="0.01" max="0.50" step="0.01" value="0.20"></label></div><div class="small" style="margin-top:8px">창문 유리 영역을 3점 이상 클릭하십시오. A/B pillar와 실내는 가급적 제외합니다. 저장 뒤 daemon이 자동으로 config를 다시 읽습니다. OFFROAD CAMERA TEST는 주차 상태에서만 cabin camera와 V-ASM inference를 연속 실행하며, 차량이 ONROAD가 되면 자동 해제됩니다.</div></div>
 <div class="card"><canvas id="cv"></canvas></div></div><script>
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),statusEl=document.getElementById('status'),testBtn=document.getElementById('offroadTest');let img=null,side=null,left=[],right=[],nativeW=0,nativeH=0,lastState=null;
@@ -495,11 +495,12 @@ class SideVisionDaemon:
       'offroad_test_active': bool(self.offroad_test_enabled and not self.onroad),
       'offroad_test_started_mono_s': round(float(self.offroad_test_started_at), 3) if self.offroad_test_started_at else 0.0,
       'last_inference_mono_ns': int(self.last_inference_mono_ns),
+      'per_side_inference_clock': 'time.monotonic_ns',
       'inference_ms': round(float(self.inference_ms), 2),
       'inference_interval_s': round(float(self.current_interval), 3),
       'throttle_factor': round(float(self.throttle_factor), 3),
-      'left': {'active': bool(self.inference.left_active), 'raw_confidence': round(float(self.inference.left_confidence),4), 'score': round(float(self.inference.left_score),4)},
-      'right': {'active': bool(self.inference.right_active), 'raw_confidence': round(float(self.inference.right_confidence),4), 'score': round(float(self.inference.right_score),4)},
+      'left': {'last_inference_mono_ns': int(self.last_inference_at_side['left'] * 1e9) if self.last_inference_at_side['left'] else 0, 'active': bool(self.inference.left_active), 'raw_confidence': round(float(self.inference.left_confidence),4), 'score': round(float(self.inference.left_score),4)},
+      'right': {'last_inference_mono_ns': int(self.last_inference_at_side['right'] * 1e9) if self.last_inference_at_side['right'] else 0, 'active': bool(self.inference.right_active), 'raw_confidence': round(float(self.inference.right_confidence),4), 'score': round(float(self.inference.right_score),4)},
       'last_error': str(self.last_error or ''),
       'setup_url_port': SIDE_VISION_HTTP_PORT,
       'note': 'Side-camera evidence is logged/displayed only in V52 SHADOW; it does not modify FutureGap or vehicle control.',

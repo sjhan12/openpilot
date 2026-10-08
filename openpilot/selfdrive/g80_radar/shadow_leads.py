@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-G80 V35 receive-only shadow leadOne/leadTwo verifier.
+G80 V52R7 receive-only shadow lead verifier.
+L1: main path lead; L2: second forward path vehicle only.
+CUT-IN and STOP HAZARD independently tracked (never consumed as leadTwo).
 
 HARD SEPARATION:
 - NEVER publishes radarState
@@ -44,6 +46,15 @@ DUP_DY_M = 2.1
 DUP_DV_MPS = 3.0
 LEAD_REID_MAX_AGE_S = 0.65
 RADAR_ONLY_MAX_DREL_M = 100.0
+
+# Carrotpilot's original radard independently matches C4 leadsV3[0]/[1].
+# Here C4 lead #1 is only used as a *shadow* corroboration for an already
+# measured radar object; no fabricated vision-only radar target is emitted.
+L2_VISION_MAX_AGE_NS = 350_000_000
+L2_VISION_MIN_PROB = 0.50
+L2_RADAR_NEXT_MIN_GAP_M = 5.0
+L2_RADAR_NEXT_MIN_HISTORY_S = 0.35
+L2_RADAR_NEXT_MAX_RANGE_M = 100.0
 
 # V33: a sticky previous L1 must yield when a substantially closer ego-path
 # vehicle is independently confirmed by both SCC and camera. Strong SCC+CAM
@@ -177,6 +188,8 @@ class ShadowLeadVerifier:
     self.last_l2_key = None
     self.last_l1_state = None
     self.last_l2_state = None
+    self.last_cutin_key = None
+    self.last_cutin_state = None
     self.l1_takeover_key = None
     self.l1_takeover_since_s = 0.0
     # Separate dwell state: strong SCC-confirmed takeover and teacher-camera
@@ -322,8 +335,87 @@ class ShadowLeadVerifier:
       return False
     return abs(float(shadow['dRel'])-float(stock['dRel'])) <= 5.0 and abs(float(shadow['yRel'])-float(stock['yRel'])) <= 2.0
 
+  @staticmethod
+  def _model_second(camera_leads, now_ns):
+    """Fresh C4 modelV2.leadsV3[1] (not an independently verified vehicle)."""
+    for lead in camera_leads or ():
+      if lead.get('camera_id') != 1:
+        continue
+      if not _age_ok(lead.get('recv_ns',0), now_ns, L2_VISION_MAX_AGE_NS):
+        continue
+      if _finite(lead.get('prob'),0.0) < L2_VISION_MIN_PROB:
+        continue
+      x=_finite(lead.get('x'),math.nan)
+      y=_finite(lead.get('y'),math.nan)
+      if math.isfinite(x) and math.isfinite(y) and 2.0 <= x <= L2_RADAR_NEXT_MAX_RANGE_M:
+        return lead
+    return None
+
+  @staticmethod
+  def _match_second_vision(model2, eligible, l1c):
+    """Carrotpilot-style distance/lateral/velocity association, shadow only.
+
+    Keep correspondence strict: a model detection is not a new radar track.
+    Physical candidates must already satisfy path and temporal gating.
+    """
+    if model2 is None:
+      return None
+    x=float(model2['x']); y=float(model2['y'])
+    vx=_finite(model2.get('vx'),None)
+    x_std=max(1.0,_finite(model2.get('x_std'),3.0))
+    y_std=max(.5,_finite(model2.get('y_std'),.8))
+    v_std=max(1.0,_finite(model2.get('v_std'),2.0))
+    dx_gate=min(15.0,max(5.0,2.5*x_std))
+    dy_gate=min(2.5,max(1.2,2.0*y_std))
+    dv_gate=min(12.0,max(4.0,2.5*v_std))
+    hits=[]
+    for c in eligible:
+      if not c['physical'] or c['far_unconfirmed']:
+        continue
+      if l1c is None or c['key']==l1c['key'] or ShadowLeadVerifier._same_physical(c,l1c):
+        continue
+      # A C4 second lead is not necessarily the second car on the same road.
+      # Only classify as L2 if it is an independently measured path car AHEAD of L1.
+      if c['x'] < l1c['x'] + L2_RADAR_NEXT_MIN_GAP_M:
+        continue
+      dx=abs(c['x']-x);dy=abs(c['y']-y)
+      if dx>dx_gate or dy>dy_gate:
+        continue
+      speed_cost=0.0
+      if vx is not None and c['vx'] is not None:
+        dv=abs(c['vx']-vx)
+        if dv>dv_gate:continue
+        speed_cost=(dv/dv_gate)**2
+      cost=(dx/dx_gate)**2+(dy/dy_gate)**2+speed_cost
+      hits.append((cost,0 if c['evidence']['front'] else 1,c['x'],c))
+    return min(hits,key=lambda z:z[:3])[3] if hits else None
+
+  @staticmethod
+  def _forward_next(eligible,l1c):
+    """Observed second forward vehicle, never a predicted or synthetic lead."""
+    if l1c is None:return None
+    front=[]
+    for c in eligible:
+      if not c['physical'] or c['far_unconfirmed']:
+        continue
+      if c['key']==l1c['key'] or ShadowLeadVerifier._same_physical(c,l1c):
+        continue
+      if not (l1c['x']+L2_RADAR_NEXT_MIN_GAP_M <= c['x'] <= L2_RADAR_NEXT_MAX_RANGE_M):
+        continue
+      if abs(c['dpath'])>1.25:
+        continue
+      if c['stationary'] is True and not c['stationary_supported']:
+        continue
+      if not (c['evidence']['front'] or c['evidence']['camera'] or c['evidence']['scc']):
+        continue
+      if c['motion']['span_s']<L2_RADAR_NEXT_MIN_HISTORY_S:
+        continue
+      front.append(c)
+    return min(front,key=lambda c:c['x']) if front else None
+
   def update(self, objects, model_path, v_ego, now_ns,
-             production=None, model_path_recv_ns=0, v_ego_recv_ns=0, scc_teacher=None):
+             production=None, model_path_recv_ns=0, v_ego_recv_ns=0, scc_teacher=None,
+             camera_leads=None):
     now_s = float(now_ns) * 1e-9
     path_valid = bool(model_path) and _age_ok(model_path_recv_ns, now_ns, PATH_MAX_AGE_NS)
     v_ego_valid = _age_ok(v_ego_recv_ns, now_ns, VEGO_MAX_AGE_NS)
@@ -542,36 +634,43 @@ class ShadowLeadVerifier:
       else: reason='physical_in_path'
       lead1 = self._lead_dict(l1c,'leadOne',reason,100.0-l1c['x'])
 
+    # V52R7: independent semantic streams. L2 can ONLY mean the second
+    # physical vehicle in the currently projected ego path, farther than L1.
+    # The latest dPath CUT-IN concept is preserved in cutInLead, NOT leadTwo.
     duplicate_suppressed = 0
     cutins = []
     for c in candidates:
-      if not c['cutin_confirmed']:
+      if not c['cutin_confirmed'] or c['far_unconfirmed']:
         continue
-      if l1c is not None and c['key']==l1c['key']:
-        continue
-      if l1c is not None and self._same_physical(c,l1c):
+      if l1c is not None and (c['key']==l1c['key'] or self._same_physical(c,l1c)):
         duplicate_suppressed += 1
-        continue
-      if l1c is not None and c['x'] >= l1c['x']-.5:
         continue
       cutins.append(c)
 
-    l2c = None
-    l2reason = None
-    l2_reidentified = False
-    if cutins:
-      l2c = next((c for c in cutins if c['key']==self.last_l2_key),None)
-      if l2c is None:
-        l2c = self._reidentify(cutins,self.last_l2_state,now_s)
-        if l2c is not None:
-          l2c['reidentified']=True
-          l2_reidentified=True
-      if l2c is None:
-        l2c = max(cutins,key=lambda c:(c['cutin_score'],-c['x']))
-      l2reason = 'physical_dpath_cutin'
+    # Stable independent CUT-IN identity. Always select a current fresh object,
+    # and never transfer its identity into the L2 hysteresis state.
+    cutin_c = next((c for c in cutins if c['key']==self.last_cutin_key),None)
+    if cutin_c is None:
+      cutin_c = self._reidentify(cutins,self.last_cutin_state,now_s)
+    if cutin_c is None and cutins:
+      cutin_c = max(cutins,key=lambda c:(c['cutin_score'],-c['x']))
+    self.last_cutin_key = cutin_c['key'] if cutin_c else None
+    self.last_cutin_state = ({'x':cutin_c['x'],'y':cutin_c['y'],'vx':cutin_c.get('vx'),
+                              't':now_s,'key':cutin_c['key']} if cutin_c else None)
+    cutin_lead = (self._lead_dict(cutin_c,'cutInLead','physical_dpath_cutin',
+                                 100.0*cutin_c['cutin_score']) if cutin_c else None)
+    if cutin_lead:
+      cutin_lead['selectionMode']='PHYSICAL_CUTIN'
+      cutin_lead['relativeToLeadOne']=('closer' if l1c is not None and cutin_c['x'] < l1c['x']
+                                      else 'farther_or_no_primary')
 
-    if l2c is None and l1c is not None and l1c['stationary'] is False and l1c['cutout_score'] >= .55:
-      moving_equiv = l1c['x']+(l1c['vlead']**2)/(2.0*2.5) if l1c['vlead'] is not None else l1c['x']
+    # Existing stopped vehicle *behind a cutting-out lead* is still important,
+    # but is a separate hazard hypothesis, NEVER L2. Vehicle motion is relative
+    # to G80; this does not require the G80 itself to be stopped.
+    stop_c = None
+    if l1c is not None and l1c['stationary'] is False and l1c['cutout_score'] >= .55:
+      moving_equiv = (l1c['x'] + (l1c['vlead']**2)/(2.0*2.5)
+                      if l1c['vlead'] is not None else l1c['x'])
       shadows = []
       for c in candidates:
         if c['key']==l1c['key'] or not c['stationary_supported']:
@@ -579,16 +678,52 @@ class ShadowLeadVerifier:
         if self._same_physical(c,l1c):
           duplicate_suppressed += 1
           continue
-        if c['x'] >= l1c['x']+STATIONARY_SHADOW_MIN_GAP_M and c['x'] < moving_equiv:
+        if l1c['x']+STATIONARY_SHADOW_MIN_GAP_M <= c['x'] < moving_equiv:
           shadows.append(c)
       if shadows:
-        l2c = min(shadows,key=lambda c:c['x'])
-        l2reason = 'stationary_shadow_behind_cutout'
+        stop_c = min(shadows,key=lambda c:c['x'])
+    stop_hazard = (self._lead_dict(stop_c,'stopHazard',
+                                  'stopped_vehicle_revealed_after_l1_cutout',
+                                  100.0*max(.0,l1c['cutout_score'])) if stop_c else None)
+    if stop_hazard:
+      stop_hazard['selectionMode']='STOP_HAZARD'
+      stop_hazard['notASecondLead']=True
+
+    model2 = self._model_second(camera_leads,now_ns) if path_valid else None
+    model2_match = self._match_second_vision(model2,eligible,l1c) if path_valid else None
+    next_front = self._forward_next(eligible,l1c) if path_valid else None
+    l2c = None
+    l2reason = None
+    l2_reidentified = False
+
+    # Choose the NEAREST valid measured second forward vehicle, not simply
+    # the specific radar object that modelV2.leadsV3[1] happens to match.
+    # The model's second lead is a hypothesis; it can correspond to the 3rd
+    # forward vehicle or to an adjacent CUT-IN instead of the nearest L1+1.
+    if next_front is not None:
+      l2c=next_front
+      l2reason=('c4_model2_matched_second_forward_radar'
+                if model2_match is not None and self._same_physical(model2_match,next_front)
+                else 'radar_second_forward_measured')
+    elif model2_match is not None:
+      l2c=model2_match
+      l2reason='c4_model2_matched_second_forward_radar'
 
     self.last_l2_key = l2c['key'] if l2c else None
     if l2c is not None:
       self.last_l2_state={'x':l2c['x'],'y':l2c['y'],'vx':l2c.get('vx'),'t':now_s,'key':l2c['key']}
     lead2 = self._lead_dict(l2c,'leadTwo',l2reason,80.0-l2c['x']) if l2c else None
+    if lead2:
+      lead2['selectionMode']='MODEL2_RADAR' if l2reason=='c4_model2_matched_second_forward_radar' else 'NEXT_FORWARD_RADAR'
+      lead2['visionSecondLeadProb']=None if model2 is None else round(float(model2['prob']),3)
+      lead2['definition']='SECOND_FORWARD_PATH_VEHICLE_ONLY'
+    next_front_diag = (self._lead_dict(next_front,'nextForward','physical_radar_next',100.0-next_front['x'])
+                       if next_front is not None else {'status':False})
+    vision_second_diag = ({'status':True,'prob':round(float(model2['prob']),3),
+                           'dRel':round(float(model2['x']),3),'yRel':round(float(model2['y']),3),
+                           'matchedRadar':model2_match is not None,
+                           'matchedKey':model2_match['key'] if model2_match else None}
+                          if model2 is not None else {'status':False})
 
     prod1 = production.get('leadOne',{'status':False}) if production_valid else {'status':False}
     prod2 = production.get('leadTwo',{'status':False}) if production_valid else {'status':False}
@@ -610,16 +745,21 @@ class ShadowLeadVerifier:
         'far_unconfirmed':bool(c.get('far_unconfirmed',False)),
         'reidentified':bool(c.get('reidentified',False)),
         'shadow_role':'L1' if lead1 and lead1.get('key')==c['key'] else ('L2' if lead2 and lead2.get('key')==c['key'] else ''),
+        'cutin_lead':bool(cutin_lead and cutin_lead.get('key')==c['key']),
+        'stop_hazard':bool(stop_hazard and stop_hazard.get('key')==c['key']),
       })
 
     path_age = None if not model_path_recv_ns else round((int(now_ns)-int(model_path_recv_ns))/1e6,1)
     vego_age = None if not v_ego_recv_ns else round((int(now_ns)-int(v_ego_recv_ns))/1e6,1)
 
     return {
-      'version':3,'mode':'shadow_only','control_connected':False,'publishes_radarState':False,'can_tx':False,
+      'version':4,'mode':'shadow_only','control_connected':False,'publishes_radarState':False,'can_tx':False,
       'leadOne':lead1 or {'status':False,'validationState':'unavailable','role':'leadOne','controlConnected':False},
       'leadTwo':lead2 or {'status':False,'validationState':'unavailable','role':'leadTwo','controlConnected':False},
+      'cutInLead':cutin_lead or {'status':False,'role':'cutInLead','controlConnected':False},
+      'stopHazard':stop_hazard or {'status':False,'role':'stopHazard','controlConnected':False},
       'stockLeadOne':prod1,'stockLeadTwo':prod2,
+      'nextForward':next_front_diag,'visionLeadTwo':vision_second_diag,
       'comparison':{
         'production_valid':production_valid,'production_age_ms':prod_age,
         'leadOne_agrees_stock':self._agree(lead1,prod1),'leadTwo_agrees_stock':self._agree(lead2,prod2),
@@ -636,6 +776,10 @@ class ShadowLeadVerifier:
         'duplicate_suppressed_count':duplicate_suppressed,
         'far_unconfirmed_rejected_count':sum(1 for c in candidates if c.get('far_unconfirmed')),
         'leadOne_reidentified':l1_reidentified,'leadTwo_reidentified':l2_reidentified,
+        'cutin_lead_valid':cutin_lead is not None,'stop_hazard_valid':stop_hazard is not None,
+        'model_lead2_valid':model2 is not None,'model_lead2_radar_matched':model2_match is not None,
+        'model_lead2_is_selected_l2':bool(l2c and model2_match and self._same_physical(l2c,model2_match)),
+        'radar_next_forward_valid':next_front is not None,'lead2_selection_reason':l2reason or 'NO_ELIGIBLE_L2',
         'leadOne_strong_handoff':l1_strong_handoff,'leadOne_handoff_from':l1_handoff_from,'leadOne_handoff_to':l1_handoff_to,
         'leadOne_handoff_gain_m':None if l1_handoff_gain_m is None else round(float(l1_handoff_gain_m),3),
         'leadOne_takeover_pending_key':self.l1_takeover_key,
@@ -648,7 +792,9 @@ class ShadowLeadVerifier:
         'shadow only: never drives radarState/planner/CAN',
         'cut-in lateral rate derives from dPath position history',
         'stationary confirmation requires fresh path/vEgo plus cross-sensor support',
-        'leadTwo is a cut-in/stationary-shadow candidate, not simply the second-nearest car',
+        'L2 exclusively a second measured in-path vehicle farther than L1; never CUT-IN or stopped shadow',
+        'CUT-IN is an independent dPath-inspired hypothesis; STOP HAZARD independently indicates stopped target after L1 cut-out',
+        'camera-only model lead2 is diagnostic and never creates a physical radar track',
         'unconfirmed radar-only objects beyond 100 m are not promoted to leadOne',
         'V35: SCC teacher + camera path-near recovery can override a grossly disagreeing sticky L1 after persistence',
       ],
