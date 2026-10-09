@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V53R1 read-only radar/V-ASM advisory risk overlay.
+"""V53R2 read-only radar/V-ASM advisory risk overlay.
 
 Not a safety-rated sensor-fusion implementation.  This module never modifies
 FG15, the vehicle controller, CAN, radarState, or planning outputs.  Its output
@@ -76,7 +76,7 @@ class VASMWarningEvaluator:
   def update(self, future_gap: dict, cabin: dict, wide: dict, now_ns: int, enabled: bool = True) -> dict:
     fg = future_gap or {}
     now_ns = int(now_ns)
-    out = {'version': 'V53R1_RADAR_FIRST_VASM_CHECK_ONLY', 'mono_ns': now_ns,
+    out = {'version': 'V53R2_RADAR_FIRST_VASM_CHECK_ONLY', 'mono_ns': now_ns,
            'mode': 'ACTIVE_HUD_ADVISORY', 'writes_fg15': False,
            'writes_vehicle_control': False, 'camera_can_clear_risk': False,
            'camera_only_danger_allowed': False, 'camera_danger_upgrade_allowed': False, 'enabled': bool(enabled), 'left': {}, 'right': {}}

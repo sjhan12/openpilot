@@ -32,5 +32,23 @@ for port in 28992 28994 28995; do
     echo "[$port] /state reachable"
   else echo "[$port] /state unavailable (may be OFFROAD or process stopped)"; fi
 done
+echo '--- LIVE timing and runtime compatibility (if available) ---'
+python3 - <<'PY_RUNTIME'
+import json
+from urllib.request import urlopen
+try:
+  with urlopen('http://127.0.0.1:28992/state', timeout=2) as r:
+    st=json.load(r)
+  ps=st.get('performance_stats') or {}
+  print('BUILD:', (st.get('runtime_versions') or {}).get('tag'))
+  print('RUNTIME MISMATCH:', st.get('runtime_mismatch'), st.get('runtime_mismatch_reasons', []))
+  for key in ('publish_interval_ms', 'publish_p95_ms', 'publish_p99_ms', 'publish_max_ms',
+              'over_150ms_count', 'over_200ms_count', 'scheduler_skips', 'processing_ms',
+              'can_drain_ms', 'ui_json_ms', 'previous_worst_stage', 'previous_worst_stage_ms'):
+    print(f'{key}: {ps.get(key)}')
+  print('stage_ms:', ps.get('stage_ms'))
+except Exception as exc:
+  print('No live timing data (OFFROAD/service not running):', exc)
+PY_RUNTIME
 echo 'NOTE: diagnostics only; this script does not enable any driving control.'
 exit "$missing"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 BUILD_VERSION = 53
-BUILD_TAG = 'v53r1-check-only-road-uncertain-separate'
+BUILD_TAG = 'v53r2-runtime-compatibility-and-cadence-audit'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3
