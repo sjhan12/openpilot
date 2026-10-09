@@ -13,7 +13,7 @@ from openpilot.selfdrive.g80_radar.teacher_fusion import SCC_CONTROL_ADDR,DEFAUL
 from openpilot.selfdrive.g80_radar.android_packet import build_render_packet, PROTOCOL_VERSION
 from openpilot.selfdrive.g80_radar.camera_fusion import decode_model_leads,CameraRadarFusion,VehicleFootprintTracker
 from openpilot.selfdrive.g80_radar.shadow_leads import ShadowLeadVerifier,snapshot_production_radar_state
-from openpilot.selfdrive.g80_radar.cut_event_shadow_v52r5 import make_cut_event_shadow
+from openpilot.selfdrive.g80_radar.cut_event_shadow import make_cut_event_shadow
 from openpilot.selfdrive.g80_radar.shadow_logger import LOGGER_SERVICE_VERSION
 from openpilot.selfdrive.g80_radar.front_standard_preview import StandardFrontPreview
 from openpilot.selfdrive.g80_radar.road_geometry import extract_road_model,road_model_with_age,path_as_tuples,annotate_objects
@@ -25,8 +25,8 @@ from openpilot.selfdrive.g80_radar.future_gap import FutureGapEvaluator, FUTURE_
 from openpilot.selfdrive.g80_radar.traffic_signal_probe import TrafficSignalProbe
 from openpilot.selfdrive.g80_radar.my_case_correcter import MLCaseCollector
 from openpilot.selfdrive.g80_radar.bsd_monitor import BsdMonitor
-from openpilot.selfdrive.g80_radar.lane_change_shadow_v52r3 import build_lane_change_shadow, build_shadow_lead_interface
-from openpilot.selfdrive.g80_radar.vasm_warning_v52r4 import VASMWarningEvaluator
+from openpilot.selfdrive.g80_radar.lane_change_shadow import build_lane_change_shadow, build_shadow_lead_interface
+from openpilot.selfdrive.g80_radar.vasm_warning import VASMWarningEvaluator
 from openpilot.selfdrive.g80_radar.web_views import diagnostic_raw_filtered, annotate_raw, selected_shadow_leads, make_stage_audit, validate_stage_contract
 
 UDP_HOST=os.getenv('G80_RADAR_UDP_HOST','255.255.255.255')
