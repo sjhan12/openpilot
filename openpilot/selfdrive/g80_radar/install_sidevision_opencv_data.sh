@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# G80 SideVision / FrontCorner OpenCV installer (V52R7 distribution).
+# G80 SideVision / FrontCorner OpenCV installer (V53R1 distribution).
 # Restores the V52R2 /data-only installation scheme; no system pip/NumPy changes.
 # Usage: bash install_sidevision_opencv_data.sh [--install|--check|--repair|--force]
 set -euo pipefail
@@ -55,7 +55,7 @@ for name in ('v_asm_model.onnx', 'front_corner_v_asm_model.onnx'):
 PY
 }
 
-printf '%s\n' '=== G80 V52R7 OpenCV private /data install ==='
+printf '%s\n' '=== G80 V53R1 OpenCV private /data install ==='
 printf 'TARGET=%s\nTMPDIR=%s\nVERSION=%s\n' "$TARGET" "$TMPROOT" "$OPENCV_VER"
 df -h / /data 2>/dev/null || true
 

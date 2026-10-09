@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-BUILD_VERSION = 52
-BUILD_TAG = 'v52r7-separate-l2-cutin-stop-shadow'
+BUILD_VERSION = 53
+BUILD_TAG = 'v53r1-check-only-road-uncertain-separate'
 LOGGER_FORMAT_VERSION = 25
 KALMAN_API_VERSION = 4
 IMM_API_VERSION = 3

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""V52R4 read-only radar/V-ASM advisory risk overlay.
+"""V53R1 read-only radar/V-ASM advisory risk overlay.
 
 Not a safety-rated sensor-fusion implementation.  This module never modifies
 FG15, the vehicle controller, CAN, radarState, or planning outputs.  Its output
-is used to strengthen the separate G80 web/HUD warning and diagnostic UDP only.
+is used only for G80 web/HUD advisory warnings and diagnostics.
 """
 from __future__ import annotations
 
@@ -15,9 +15,6 @@ SIDE_AGE_MAX_MS = 2600.0
 FRONT_AGE_MAX_MS = 2000.0
 SIDE_SCORE_MIN = 0.78
 FRONT_SCORE_MIN = 0.82
-RED_RADAR_GAP_M = 9.0
-RED_RADAR_TTC_S = 3.0
-RED_RADAR_2D_S = 3.0
 
 
 def _finite(value):
@@ -55,28 +52,14 @@ def _observe(camera: dict, key: str, age_limit_ms: float, score_limit: float, so
           'inference_mono_ns': stamp if ready else 0}
 
 
-def _radar_watch(side_data: dict):
-  """Require a fresh measured radar hazard; never use camera-only objects."""
+def _radar_evidence(side_data: dict):
+  """Diagnostic only; FG15 is the sole arbiter of red radar warnings."""
   e = (side_data.get('fg12_evidence') or side_data.get('fg11_evidence') or {})
   if not isinstance(e, dict):
     return None
-  for o in (e.get('observations') or []):
-    if not isinstance(o, dict) or not o.get('fresh'):
-      continue
-    source = [str(x).upper() for x in (o.get('source_mask') or [])]
-    if not source or not any(x in source for x in ('FRONT', 'FL', 'FR', 'RL', 'RR', 'CORNER')):
-      continue
-    if not (o.get('current_core') or o.get('current_boundary') or o.get('stable_incoming')):
-      continue
-    gap = _finite(o.get('current_gap_m'))
-    ttc = _finite(o.get('ttc_linear_s'))
-    two_d = _finite(o.get('conflict_entry_s'))
-    if (o.get('closing') and gap is not None and gap <= RED_RADAR_GAP_M and
-        ((ttc is not None and 0 < ttc <= RED_RADAR_TTC_S) or
-         (two_d is not None and 0 <= two_d <= RED_RADAR_2D_S))):
-      return {'key': str(o.get('key') or ''), 'gap_m': gap, 'ttc_s': ttc,
-              'two_d_s': two_d, 'source_mask': source}
-  return None
+  obs = e.get('observations') or []
+  fresh = [o for o in obs if isinstance(o, dict) and o.get('fresh')]
+  return {'fresh_observations': len(fresh), 'min_2d_conflict_time_s': e.get('min_2d_conflict_time_s')}
 
 
 @dataclass
@@ -93,10 +76,10 @@ class VASMWarningEvaluator:
   def update(self, future_gap: dict, cabin: dict, wide: dict, now_ns: int, enabled: bool = True) -> dict:
     fg = future_gap or {}
     now_ns = int(now_ns)
-    out = {'version': 'V52R4_RADAR_FIRST_VASM_WARNING', 'mono_ns': now_ns,
+    out = {'version': 'V53R1_RADAR_FIRST_VASM_CHECK_ONLY', 'mono_ns': now_ns,
            'mode': 'ACTIVE_HUD_ADVISORY', 'writes_fg15': False,
            'writes_vehicle_control': False, 'camera_can_clear_risk': False,
-           'camera_only_danger_allowed': False, 'enabled': bool(enabled), 'left': {}, 'right': {}}
+           'camera_only_danger_allowed': False, 'camera_danger_upgrade_allowed': False, 'enabled': bool(enabled), 'left': {}, 'right': {}}
     intent = fg.get('driver_intent') or {}
     turn = str(intent.get('maneuver_context') or '').upper() == 'TURN' or str(intent.get('state') or '').upper() == 'TURN'
     committed = bool(intent.get('active') and intent.get('committed'))
@@ -123,24 +106,46 @@ class VASMWarningEvaluator:
           state.positive_frames = 1
         state.last_seen_stamp = stamp
         state.last_positive_ns = now_ns
-      radar = _radar_watch(sd)
+      radar = _radar_evidence(sd)
       adjusted = base
-      reason = 'FG15_UNCHANGED'
-      # A turn is never reinterpreted as a lane change, and unknown/NO LANE are
-      # preserved. V-ASM alone cannot establish adjacent lane occupancy.
-      if enabled and not turn and not committed and _rank(base) and positive:
-        if _rank(base) == 1:
+      reason = 'NONE'
+      evidence_type = 'FG15'
+      base_upper = str(base).upper()
+      road_status = str((sd.get('lane_availability') or {}).get('status') or 'UNKNOWN').upper()
+      # Distinguish unknown adjacent lane from a vehicle conflict. This does
+      # NOT change FG15 road gate, nor does it authorize lane changing.
+      if base_upper.startswith('CHECK ROAD'):
+        adjusted = 'ROAD ?'
+        reason = 'ROAD_GEOMETRY_UNCERTAIN'
+        evidence_type = 'ROAD_UNCERTAIN'
+      elif base_upper.startswith('NO LANE'):
+        evidence_type = 'ROAD_ABSENT'
+      elif base_upper.startswith('DANGER'):
+        # Existing radar/BSD DANGER remains red irrespective of V-ASM CLEAR.
+        evidence_type = 'RADAR_OR_BSD_DANGER'
+        reason = 'FG15_BSD_DANGER_PRESERVED' if 'BSD' in base_upper else 'FG15_DANGER_PRESERVED'
+      elif base_upper.startswith('CHECK'):
+        evidence_type = 'RADAR_CHECK'
+        if enabled and positive and not turn and not committed and 'DATA' not in base_upper:
+          # Camera supports an EXISTING CHECK; no red upgrade, no 1:1 radar match.
+          adjusted = 'CHECK CAM+RADAR'
+          reason = 'CAMERA_SUPPORTS_CHECK'
+      elif base_upper.startswith('SAFE'):
+        evidence_type = 'RADAR_SAFE'
+        if enabled and positive and not turn and not committed and road_status == 'CONFIRMED':
           adjusted = 'CHECK CAM'
-          reason = 'CABIN_VASM_CAUTION'
-        elif (str(base).upper().startswith('CHECK') and 'DATA' not in str(base).upper() and
-              state.positive_frames >= 2 and radar is not None):
-          adjusted = 'DANGER CAM+RADAR'
-          reason = 'CAMERA_AND_FRESH_RADAR_NEAR_CONFLICT'
+          reason = 'CAMERA_CAUTION_ONLY'
+      # Never use V-ASM negative evidence to clear a radar DANGER/CHECK.
       changed = adjusted != base
+      camera_caution = bool(adjusted.startswith('CHECK CAM') and positive)
       out[side] = {'radar_label': base, 'warning_label': adjusted,
-                   'changed': changed, 'upgrade': reason if changed else 'NONE',
+                   'changed': changed, 'upgrade': reason if reason == 'CAMERA_CAUTION_ONLY' else 'NONE',
+                   'display_reason': reason, 'evidence_type': evidence_type,
+                   'road_gate': road_status, 'road_uncertain': evidence_type == 'ROAD_UNCERTAIN',
+                   'camera_caution': camera_caution, 'risk_increased_by_camera': reason == 'CAMERA_CAUTION_ONLY',
                    'cabin': cabin_o, 'wide': wide_o,
                    'cabin_confirmed_frames': state.positive_frames,
-                   'radar_near_conflict': radar,
-                   'advisory_only': True}
+                   'radar_evidence': radar,
+                   'radar_near_conflict': None, # no independent red classification
+                   'advisory_only': True, 'control_eligible': False}
     return out
